@@ -1,0 +1,13 @@
+[Unit]
+Description=exp-scheduler GPU task queue
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/exp-scheduler serve
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
