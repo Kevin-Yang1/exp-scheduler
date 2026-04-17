@@ -15,12 +15,15 @@ const nodes = {
   profilePreview: document.getElementById("profile-preview"),
   profileForm: document.getElementById("profile-form"),
   profileMessage: document.getElementById("profile-message"),
-  profileList: document.getElementById("profile-list"),
+  manageProfileSelect: document.getElementById("manage-profile-select"),
+  editProfileBtn: document.getElementById("edit-profile-btn"),
+  deleteProfileBtn: document.getElementById("delete-profile-btn"),
   profileSubmitButton: document.getElementById("profile-submit-button"),
   profileCancelButton: document.getElementById("profile-cancel-button"),
   profileScanButton: document.getElementById("profile-scan-button"),
+  discoverySelect: document.getElementById("discovery-select"),
+  importDiscoveryBtn: document.getElementById("import-discovery-btn"),
   discoveryMessage: document.getElementById("discovery-message"),
-  discoveryList: document.getElementById("discovery-list"),
   queueList: document.getElementById("queue-list"),
   runningList: document.getElementById("running-list"),
   historyList: document.getElementById("history-list"),
@@ -81,6 +84,12 @@ function taskMeta(task) {
   const meta = [];
   if (task.profile_name) meta.push(`环境: ${task.profile_name}`);
   if (task.cwd) meta.push(`目录: ${task.cwd}`);
+  if ((task.attempt_count || 0) > 0) {
+    meta.push(`尝试次数: ${task.attempt_count || 0}`);
+  }
+  if (task.next_retry_at) {
+    meta.push(`下次重试: ${formatTime(task.next_retry_at)}`);
+  }
   if (task.assigned_gpu !== null && task.assigned_gpu !== undefined) {
     meta.push(`GPU: ${task.assigned_gpu}`);
   }
@@ -106,6 +115,7 @@ function renderTaskCard(task, kind) {
   name.textContent = task.name;
   command.textContent = task.command;
   badge.textContent = task.status;
+  badge.dataset.status = task.status;
   notes.textContent = task.notes || "";
   taskMeta(task).forEach((item) => {
     const span = document.createElement("span");
@@ -288,127 +298,68 @@ function renderQueueToggle() {
 }
 
 function renderProfiles() {
-  nodes.profileList.innerHTML = "";
+  nodes.manageProfileSelect.innerHTML = '<option value="">＋ 新建模板 (保持下方表单为空新增)</option>';
+  
   if (!state.profiles.length) {
-    nodes.profileList.className = "stack-list empty-state";
-    nodes.profileList.textContent = "暂无环境配置";
+    nodes.editProfileBtn.classList.add("hidden");
+    nodes.deleteProfileBtn.classList.add("hidden");
     return;
   }
-  nodes.profileList.className = "stack-list";
+  
   state.profiles.forEach((profile) => {
-    const card = document.createElement("article");
-    card.className = "profile-card";
-
-    const top = document.createElement("div");
-    top.className = "profile-topline";
-
-    const titleWrap = document.createElement("div");
-    const title = document.createElement("h3");
-    title.className = "profile-name";
-    title.textContent = profile.name;
-    titleWrap.appendChild(title);
-
-    const shell = document.createElement("p");
-    shell.className = "profile-shell";
-    shell.textContent = profile.shell_setup || "无额外激活命令";
-    titleWrap.appendChild(shell);
-
-    const badge = document.createElement("span");
-    badge.className = "task-badge";
-    badge.textContent = `${Object.keys(profile.env || {}).length} 个变量`;
-
-    top.append(titleWrap, badge);
-
-    const meta = document.createElement("div");
-    meta.className = "profile-meta";
-    const cwd = document.createElement("div");
-    cwd.textContent = `默认目录: ${profile.cwd || "未设置"}`;
-    const updatedAt = document.createElement("div");
-    updatedAt.textContent = `更新于: ${formatTime(profile.updated_at)}`;
-    meta.append(cwd, updatedAt);
-    if (profile.notes) {
-      const notes = document.createElement("div");
-      notes.textContent = `备注: ${profile.notes}`;
-      meta.appendChild(notes);
-    }
-
-    const actions = document.createElement("div");
-    actions.className = "profile-actions";
-    actions.append(
-      button("用于新任务", "mini-button", () => applyProfileToTask(profile.id)),
-      button("编辑", "mini-button", () => beginEditProfile(profile.id)),
-      button("删除", "mini-button danger-button", () => deleteProfile(profile.id)),
-    );
-
-    card.append(top, meta, actions);
-    nodes.profileList.appendChild(card);
+    const option = document.createElement("option");
+    option.value = String(profile.id);
+    option.textContent = profile.name;
+    nodes.manageProfileSelect.appendChild(option);
   });
+}
+
+function handleManageProfileSelect() {
+  const profileId = nodes.manageProfileSelect.value;
+  if (!profileId) {
+    nodes.editProfileBtn.classList.add("hidden");
+    nodes.deleteProfileBtn.classList.add("hidden");
+    resetProfileForm();
+  } else {
+    nodes.editProfileBtn.classList.remove("hidden");
+    nodes.deleteProfileBtn.classList.remove("hidden");
+  }
 }
 
 function renderDiscoveryList() {
   const condaEnvs = state.discovery.conda_envs || [];
   const venvs = state.discovery.venvs || [];
-  const groups = [
-    { title: "Conda 环境", items: condaEnvs },
-    { title: "venv / virtualenv", items: venvs },
-  ];
-
-  nodes.discoveryList.innerHTML = "";
-  if (!condaEnvs.length && !venvs.length) {
-    nodes.discoveryList.className = "stack-list empty-state";
-    nodes.discoveryList.textContent = "未发现可导入环境";
+  const allEnvs = [...condaEnvs, ...venvs];
+  
+  nodes.discoverySelect.innerHTML = "";
+  
+  if (!allEnvs.length) {
+    nodes.discoverySelect.innerHTML = '<option value="">(未发现可导入环境)</option>';
+    nodes.discoverySelect.disabled = true;
+    nodes.importDiscoveryBtn.classList.add("hidden");
     return;
   }
 
-  nodes.discoveryList.className = "stack-list";
-  groups.forEach((group) => {
-    if (!group.items.length) return;
-    const groupWrap = document.createElement("section");
-    groupWrap.className = "discovery-group";
+  nodes.discoverySelect.disabled = false;
+  nodes.importDiscoveryBtn.classList.remove("hidden");
+  
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "";
+  defaultOption.textContent = `发现 ${allEnvs.length} 个环境，请选中以导入...`;
+  nodes.discoverySelect.appendChild(defaultOption);
 
-    const title = document.createElement("h4");
-    title.className = "discovery-group-title";
-    title.textContent = `${group.title} (${group.items.length})`;
-    groupWrap.appendChild(title);
+  condaEnvs.forEach((env, idx) => {
+    const opt = document.createElement("option");
+    opt.value = `conda_${idx}`;
+    opt.textContent = `[Conda] ${env.display_name}`;
+    nodes.discoverySelect.appendChild(opt);
+  });
 
-    group.items.forEach((item) => {
-      const card = document.createElement("article");
-      card.className = "discovery-card";
-
-      const heading = document.createElement("h4");
-      heading.textContent = `${item.display_name} -> ${item.suggested_profile.name}`;
-
-      const path = document.createElement("p");
-      path.className = "discovery-path";
-      path.textContent = item.path;
-
-      const shell = document.createElement("p");
-      shell.className = "discovery-shell";
-      shell.textContent = item.suggested_profile.shell_setup || "无额外激活命令";
-
-      const meta = document.createElement("div");
-      meta.className = "discovery-meta";
-      const pythonPath = document.createElement("span");
-      pythonPath.textContent = `Python: ${item.python_path}`;
-      meta.appendChild(pythonPath);
-      if (item.suggested_profile.cwd) {
-        const cwd = document.createElement("span");
-        cwd.textContent = `默认目录: ${item.suggested_profile.cwd}`;
-        meta.appendChild(cwd);
-      }
-
-      const actions = document.createElement("div");
-      actions.className = "discovery-actions";
-      actions.append(
-        button("导入模板", "mini-button", () => importDiscoveredProfile(item)),
-        button("导入并编辑", "mini-button", () => prefillProfileFormFromDiscovery(item)),
-      );
-
-      card.append(heading, path, shell, meta, actions);
-      groupWrap.appendChild(card);
-    });
-
-    nodes.discoveryList.appendChild(groupWrap);
+  venvs.forEach((env, idx) => {
+    const opt = document.createElement("option");
+    opt.value = `venv_${idx}`;
+    opt.textContent = `[Venv] ${env.display_name}`;
+    nodes.discoverySelect.appendChild(opt);
   });
 }
 
@@ -647,32 +598,21 @@ function beginEditProfile(profileId) {
   nodes.profileForm.elements.shell_setup.value = profile.shell_setup || "";
   nodes.profileForm.elements.env.value = envToText(profile.env);
   nodes.profileForm.elements.notes.value = profile.notes || "";
-  nodes.profileSubmitButton.textContent = "更新环境配置";
+  nodes.profileSubmitButton.textContent = "更新现有配置";
   nodes.profileCancelButton.classList.remove("hidden");
   nodes.profileMessage.textContent = `正在编辑「${profile.name}」`;
+  nodes.profileForm.scrollIntoView({ behavior: 'smooth' });
 }
 
 function resetProfileForm() {
   nodes.profileForm.reset();
   nodes.profileForm.elements.profile_id.value = "";
-  nodes.profileSubmitButton.textContent = "保存环境配置";
+  nodes.profileSubmitButton.textContent = "💾 保存新模板";
   nodes.profileCancelButton.classList.add("hidden");
-}
-
-function applyProfileToTask(profileId) {
-  nodes.taskProfileSelect.value = String(profileId);
-  renderProfilePreview();
-}
-
-function prefillProfileFormFromDiscovery(item) {
-  const payload = item.suggested_profile || {};
-  resetProfileForm();
-  nodes.profileForm.elements.name.value = payload.name || "";
-  nodes.profileForm.elements.cwd.value = payload.cwd || "";
-  nodes.profileForm.elements.shell_setup.value = payload.shell_setup || "";
-  nodes.profileForm.elements.env.value = envToText(payload.env || {});
-  nodes.profileForm.elements.notes.value = payload.notes || "";
-  nodes.profileMessage.textContent = `已把「${item.display_name}」填入环境配置表单`;
+  nodes.manageProfileSelect.value = "";
+  nodes.editProfileBtn.classList.add("hidden");
+  nodes.deleteProfileBtn.classList.add("hidden");
+  nodes.profileMessage.textContent = "";
 }
 
 nodes.taskForm.addEventListener("submit", createTask);
@@ -682,6 +622,29 @@ nodes.profileScanButton.addEventListener("click", scanProfiles);
 nodes.taskProfileSelect.addEventListener("change", renderProfilePreview);
 nodes.queueToggle.addEventListener("click", toggleQueue);
 nodes.refreshButton.addEventListener("click", refreshAll);
+
+if (nodes.manageProfileSelect) {
+  nodes.manageProfileSelect.addEventListener("change", handleManageProfileSelect);
+  nodes.editProfileBtn.addEventListener("click", () => {
+    const pid = nodes.manageProfileSelect.value;
+    if (pid) beginEditProfile(Number(pid));
+  });
+  nodes.deleteProfileBtn.addEventListener("click", () => {
+    const pid = nodes.manageProfileSelect.value;
+    if (pid) deleteProfile(Number(pid));
+  });
+}
+
+if (nodes.importDiscoveryBtn) {
+  nodes.importDiscoveryBtn.addEventListener("click", () => {
+    const val = nodes.discoverySelect.value;
+    if (!val) return;
+    let item;
+    if (val.startsWith("conda_")) item = state.discovery.conda_envs[parseInt(val.split("_")[1])];
+    if (val.startsWith("venv_")) item = state.discovery.venvs[parseInt(val.split("_")[1])];
+    if (item) importDiscoveredProfile(item);
+  });
+}
 
 refreshAll()
   .then(connectEvents)

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 import logging
 import os
 from pathlib import Path
+import re
 import signal
 import traceback
 from typing import Callable
@@ -19,6 +21,14 @@ from .profile_discovery import discover_installed_environments
 LOGGER = logging.getLogger("exp_scheduler")
 LOG_TAIL_BYTES = 32 * 1024
 TERMINATE_GRACE_SECONDS = 5
+RETRYABLE_OOM_PATTERN = re.compile(
+    r"out of memory|cuda out of memory|cublas.*alloc|cuda error: out of memory|"
+    r"failed to allocate|cuda runtime error|memory allocation|std::bad_alloc|"
+    r"nccl.*unhandled system error|device-side assert triggered|resource exhausted|"
+    r"cuda error.*launch out of resources|killed|terminated|oom-kill|"
+    r"out of memory: kill process",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -28,6 +38,7 @@ class ProcessHandle:
     process: asyncio.subprocess.Process
     log_file: object
     log_path: Path
+    attempt_count: int
     stop_reason: str | None = None
 
 
@@ -279,7 +290,11 @@ class SchedulerService:
         async with self._lock:
             if self.database.get_queue_paused():
                 return
-            queued_tasks = self.database.list_queued_tasks()
+            queued_tasks = [
+                task
+                for task in self.database.list_queued_tasks()
+                if self._is_task_ready_for_launch(task)
+            ]
             if not queued_tasks:
                 return
             available = [
@@ -312,12 +327,14 @@ class SchedulerService:
     ) -> None:
         task_id = int(task["id"])
         gpu_id = int(gpu["index"])
-        log_path = self._log_path_for_task(task_id)
+        next_attempt = int(task.get("attempt_count") or 0) + 1
+        log_path = self._log_path_for_task(task_id, next_attempt)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "a", encoding="utf-8")
         log_file.write(
             f"[exp-scheduler] task={task_id} gpu={gpu_id} started\n"
             f"[exp-scheduler] command={task['command']}\n"
+            f"[exp-scheduler] attempt={next_attempt}/{self.config.auto_retry_max_retries + 1}\n"
         )
         if isinstance(task.get("profile_name"), str) and task["profile_name"]:
             log_file.write(f"[exp-scheduler] profile={task['profile_name']}\n")
@@ -326,6 +343,8 @@ class SchedulerService:
         env = os.environ.copy()
         env.update({key: str(value) for key, value in dict(task["env"]).items()})
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env["EXP_SCHEDULER_ATTEMPT"] = str(next_attempt)
+        env["EXP_SCHEDULER_MAX_RETRIES"] = str(self.config.auto_retry_max_retries)
         cwd = task["cwd"] if isinstance(task["cwd"], str) and task["cwd"] else None
         launch_command = self._build_launch_command(task)
 
@@ -365,6 +384,7 @@ class SchedulerService:
             process=process,
             log_file=log_file,
             log_path=log_path,
+            attempt_count=int(running_task.get("attempt_count") or next_attempt),
         )
         self._running[task_id] = handle
         self._watchers[task_id] = asyncio.create_task(
@@ -384,12 +404,42 @@ class SchedulerService:
         task_id = handle.task_id
         try:
             exit_code = await handle.process.wait()
+            handle.log_file.flush()
             if handle.stop_reason == "cancel":
                 status = "cancelled"
             elif handle.stop_reason == "interrupt":
                 status = "interrupted"
             else:
                 status = "succeeded" if exit_code == 0 else "failed"
+
+            if (
+                status == "failed"
+                and self._should_retry_task(handle=handle, exit_code=exit_code)
+            ):
+                next_retry_at = self._next_retry_at()
+                handle.log_file.write(
+                    "\n[exp-scheduler] retry_scheduled=true "
+                    f"next_retry_at={next_retry_at} "
+                    f"attempt={handle.attempt_count}/{self.config.auto_retry_max_retries + 1}\n"
+                )
+                handle.log_file.flush()
+                self.database.schedule_task_retry(
+                    task_id=task_id,
+                    next_retry_at=next_retry_at,
+                    exit_code=exit_code,
+                )
+                await self.events.publish(
+                    "task_retry_scheduled",
+                    {
+                        "task_id": task_id,
+                        "attempt_count": handle.attempt_count,
+                        "max_retries": self.config.auto_retry_max_retries,
+                        "next_retry_at": next_retry_at,
+                        "exit_code": exit_code,
+                    },
+                )
+                return
+
             handle.log_file.write(
                 f"\n[exp-scheduler] task={task_id} finished status={status} exit_code={exit_code}\n"
             )
@@ -443,8 +493,37 @@ class SchedulerService:
         except ProcessLookupError:
             return
 
-    def _log_path_for_task(self, task_id: int) -> Path:
-        return self.config.log_dir / f"task_{task_id}.log"
+    def _log_path_for_task(self, task_id: int, attempt_count: int) -> Path:
+        return self.config.log_dir / f"task_{task_id}_attempt_{attempt_count}.log"
+
+    def _is_task_ready_for_launch(self, task: dict[str, object]) -> bool:
+        next_retry_at = task.get("next_retry_at")
+        if not isinstance(next_retry_at, str) or not next_retry_at:
+            return True
+        try:
+            retry_time = datetime.fromisoformat(next_retry_at)
+        except ValueError:
+            return True
+        return retry_time <= datetime.now(UTC)
+
+    def _should_retry_task(
+        self,
+        *,
+        handle: ProcessHandle,
+        exit_code: int,
+    ) -> bool:
+        if self.config.auto_retry_max_retries <= 0:
+            return False
+        retries_used = max(0, handle.attempt_count - 1)
+        if retries_used >= self.config.auto_retry_max_retries:
+            return False
+        return is_retryable_oom_error(exit_code, handle.log_path)
+
+    def _next_retry_at(self) -> str:
+        return (
+            datetime.now(UTC)
+            + timedelta(seconds=max(0, self.config.auto_retry_delay_seconds))
+        ).isoformat()
 
     def _build_launch_command(self, task: dict[str, object]) -> str:
         shell_setup = (
@@ -473,3 +552,12 @@ def read_text_tail(path: Path, *, tail_bytes: int = LOG_TAIL_BYTES) -> str:
         fh.seek(max(0, size - tail_bytes))
         data = fh.read()
     return data.decode("utf-8", errors="replace")
+
+
+def is_retryable_oom_error(exit_code: int, log_path: Path) -> bool:
+    if exit_code in {137, 143, -9, -15}:
+        return True
+    if not log_path.exists():
+        return False
+    content = log_path.read_text(encoding="utf-8", errors="replace")
+    return bool(RETRYABLE_OOM_PATTERN.search(content))

@@ -39,6 +39,8 @@ def run_init(config_path: Path, *, force: bool) -> int:
     print(f"状态目录: {config.state_dir}")
     print(f"日志目录: {config.log_dir}")
     print(f"数据库: {config.db_path}")
+    print(f"自动重试次数: {config.auto_retry_max_retries}")
+    print(f"自动重试延迟: {config.auto_retry_delay_seconds}s")
     return 0
 
 
@@ -56,6 +58,8 @@ def run_doctor(config_path: Path) -> int:
     print(f"状态目录: {config.state_dir}")
     print(f"日志目录: {config.log_dir}")
     print(f"数据库: {config.db_path}")
+    print(f"自动重试次数: {config.auto_retry_max_retries}")
+    print(f"自动重试延迟: {config.auto_retry_delay_seconds}s")
 
     nvidia_smi = shutil.which("nvidia-smi")
     print(f"nvidia-smi: {nvidia_smi or 'missing'}")

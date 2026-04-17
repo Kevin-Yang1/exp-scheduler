@@ -10,6 +10,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17861
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_GPU_IDLE_MEMORY_MB = 2000
+DEFAULT_AUTO_RETRY_MAX_RETRIES = 0
+DEFAULT_AUTO_RETRY_DELAY_SECONDS = 5
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "exp-scheduler" / "config.toml"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "share" / "exp-scheduler"
 
@@ -20,6 +22,8 @@ class SchedulerConfig:
     port: int = DEFAULT_PORT
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     gpu_idle_memory_mb: int = DEFAULT_GPU_IDLE_MEMORY_MB
+    auto_retry_max_retries: int = DEFAULT_AUTO_RETRY_MAX_RETRIES
+    auto_retry_delay_seconds: int = DEFAULT_AUTO_RETRY_DELAY_SECONDS
     state_dir: Path = DEFAULT_STATE_DIR
     log_dir: Path = DEFAULT_STATE_DIR / "logs"
 
@@ -48,6 +52,12 @@ def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
         gpu_idle_memory_mb=int(
             data.get("gpu_idle_memory_mb", DEFAULT_GPU_IDLE_MEMORY_MB)
         ),
+        auto_retry_max_retries=int(
+            data.get("auto_retry_max_retries", DEFAULT_AUTO_RETRY_MAX_RETRIES)
+        ),
+        auto_retry_delay_seconds=int(
+            data.get("auto_retry_delay_seconds", DEFAULT_AUTO_RETRY_DELAY_SECONDS)
+        ),
         state_dir=state_dir,
         log_dir=log_dir,
     )
@@ -60,6 +70,8 @@ def default_config_text() -> str:
             f"port = {DEFAULT_PORT}",
             f"poll_interval_seconds = {DEFAULT_POLL_INTERVAL_SECONDS}",
             f"gpu_idle_memory_mb = {DEFAULT_GPU_IDLE_MEMORY_MB}",
+            f"auto_retry_max_retries = {DEFAULT_AUTO_RETRY_MAX_RETRIES}",
+            f"auto_retry_delay_seconds = {DEFAULT_AUTO_RETRY_DELAY_SECONDS}",
             f'state_dir = "{DEFAULT_STATE_DIR}"',
             f'log_dir = "{DEFAULT_STATE_DIR / "logs"}"',
             "",

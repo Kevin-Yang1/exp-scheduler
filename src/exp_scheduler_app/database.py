@@ -49,6 +49,8 @@ class Database:
                     "profile_id": "INTEGER",
                     "profile_name": "TEXT",
                     "shell_setup": "TEXT",
+                    "attempt_count": "INTEGER",
+                    "next_retry_at": "TEXT",
                 },
             )
             conn.execute(
@@ -103,8 +105,8 @@ class Database:
                 INSERT INTO tasks(
                     name, command, cwd, env, status, queue_rank, assigned_gpu, pid,
                     exit_code, created_at, started_at, finished_at, log_path, notes,
-                    profile_id, profile_name, shell_setup
-                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?)
+                    profile_id, profile_name, shell_setup, attempt_count, next_retry_at
+                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL)
                 """,
                 (
                     name,
@@ -343,7 +345,9 @@ class Database:
                     started_at = ?,
                     log_path = ?,
                     finished_at = NULL,
-                    exit_code = NULL
+                    exit_code = NULL,
+                    next_retry_at = NULL,
+                    attempt_count = COALESCE(attempt_count, 0) + 1
                 WHERE id = ? AND status = 'queued'
                 """,
                 (gpu_id, pid, started_at, log_path, task_id),
@@ -408,6 +412,35 @@ class Database:
             raise ValueError(f"任务不存在: {task_id}")
         return task
 
+    def schedule_task_retry(
+        self,
+        *,
+        task_id: int,
+        next_retry_at: str,
+        exit_code: int | None,
+    ) -> dict[str, object]:
+        with self._lock, self._connect() as conn:
+            queue_rank = self._head_queue_rank(conn)
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'queued',
+                    queue_rank = ?,
+                    assigned_gpu = NULL,
+                    pid = NULL,
+                    exit_code = ?,
+                    finished_at = ?,
+                    next_retry_at = ?
+                WHERE id = ?
+                """,
+                (queue_rank, exit_code, utc_now_iso(), next_retry_at, task_id),
+            )
+            conn.commit()
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        return task
+
     def clone_task_for_requeue(self, task_id: int) -> dict[str, object]:
         task = self.get_task(task_id)
         if task is None:
@@ -450,6 +483,15 @@ class Database:
         ).fetchone()
         return int(row["max_rank"]) + 1
 
+    def _head_queue_rank(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT MIN(queue_rank) AS min_rank FROM tasks WHERE status = 'queued'"
+        ).fetchone()
+        min_rank = row["min_rank"]
+        if min_rank is None:
+            return 1
+        return int(min_rank) - 1
+
     def _ensure_columns(
         self,
         conn: sqlite3.Connection,
@@ -487,6 +529,8 @@ class Database:
             "profile_id": row["profile_id"] if "profile_id" in keys else None,
             "profile_name": row["profile_name"] if "profile_name" in keys else None,
             "shell_setup": row["shell_setup"] if "shell_setup" in keys else None,
+            "attempt_count": row["attempt_count"] if "attempt_count" in keys and row["attempt_count"] is not None else 0,
+            "next_retry_at": row["next_retry_at"] if "next_retry_at" in keys else None,
         }
 
     def _row_to_profile(self, row: sqlite3.Row) -> dict[str, object]:

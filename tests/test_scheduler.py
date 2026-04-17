@@ -46,20 +46,40 @@ def gpu(index: int, *, idle: bool = True, has_processes: bool = False) -> GPUInf
     )
 
 
-def make_config(tmp_path) -> SchedulerConfig:
+def make_config(
+    tmp_path,
+    *,
+    auto_retry_max_retries: int = 0,
+    auto_retry_delay_seconds: int = 5,
+) -> SchedulerConfig:
     state_dir = tmp_path / "state"
     return SchedulerConfig(
         host="127.0.0.1",
         port=17861,
         poll_interval_seconds=0.1,
         gpu_idle_memory_mb=1000,
+        auto_retry_max_retries=auto_retry_max_retries,
+        auto_retry_delay_seconds=auto_retry_delay_seconds,
         state_dir=state_dir,
         log_dir=state_dir / "logs",
     )
 
 
-def build_client(tmp_path, provider: FakeGPUProvider) -> TestClient:
-    app = create_app(make_config(tmp_path), gpu_provider=provider)
+def build_client(
+    tmp_path,
+    provider: FakeGPUProvider,
+    *,
+    auto_retry_max_retries: int = 0,
+    auto_retry_delay_seconds: int = 5,
+) -> TestClient:
+    app = create_app(
+        make_config(
+            tmp_path,
+            auto_retry_max_retries=auto_retry_max_retries,
+            auto_retry_delay_seconds=auto_retry_delay_seconds,
+        ),
+        gpu_provider=provider,
+    )
     return TestClient(app)
 
 
@@ -288,6 +308,151 @@ def test_task_can_use_environment_profile_defaults_and_shell_setup(tmp_path):
         assert f"cwd={project_dir}" in log_payload["content"]
         assert "foo=from-task" in log_payload["content"]
         assert "hook=from-shell" in log_payload["content"]
+
+
+def test_retryable_oom_failure_is_automatically_retried(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(
+        tmp_path,
+        provider,
+        auto_retry_max_retries=1,
+        auto_retry_delay_seconds=0,
+    ) as client:
+        task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "import os, sys",
+                        "attempt = int(os.environ['EXP_SCHEDULER_ATTEMPT'])",
+                        "print(f'attempt={attempt}')",
+                        "if attempt == 1:",
+                        "    print('CUDA out of memory')",
+                        "    raise SystemExit(1)",
+                        "print('recovered')",
+                    ]
+                )
+            )
+        )
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+        assert history_task["attempt_count"] == 2
+        assert history_task["log_path"].endswith("attempt_2.log")
+        log_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        assert "attempt=2" in log_payload["content"]
+        assert "recovered" in log_payload["content"]
+
+
+def test_non_retryable_failure_stops_without_retry(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(
+        tmp_path,
+        provider,
+        auto_retry_max_retries=3,
+        auto_retry_delay_seconds=0,
+    ) as client:
+        task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "import os",
+                        "print(f\"attempt={os.environ['EXP_SCHEDULER_ATTEMPT']}\")",
+                        "print('plain failure')",
+                        "raise SystemExit(1)",
+                    ]
+                )
+            )
+        )
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "failed"
+            ),
+            timeout=8,
+        )
+        assert history_task["attempt_count"] == 1
+        log_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        assert "attempt=1" in log_payload["content"]
+        assert "plain failure" in log_payload["content"]
+
+
+def test_retryable_task_requeues_to_queue_head(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    order_file = tmp_path / "order.log"
+    with build_client(
+        tmp_path,
+        provider,
+        auto_retry_max_retries=1,
+        auto_retry_delay_seconds=0,
+    ) as client:
+        first_task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "import os",
+                        "from pathlib import Path",
+                        "attempt = int(os.environ['EXP_SCHEDULER_ATTEMPT'])",
+                        f"path = Path({str(order_file)!r})",
+                        "with path.open('a', encoding='utf-8') as fh:",
+                        "    fh.write(f'first-attempt-{attempt}\\n')",
+                        "if attempt == 1:",
+                        "    print('CUDA out of memory')",
+                        "    raise SystemExit(1)",
+                        "print('first recovered')",
+                    ]
+                )
+            ),
+            name="first",
+        )
+        second_task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        f"path = Path({str(order_file)!r})",
+                        "with path.open('a', encoding='utf-8') as fh:",
+                        "    fh.write('second\\n')",
+                        "print('second done')",
+                    ]
+                )
+            ),
+            name="second",
+        )
+
+        wait_for(
+            lambda: (
+                len(client.get("/api/tasks").json()["history"]) == 2
+                and {
+                    task["id"]: task["status"]
+                    for task in client.get("/api/tasks").json()["history"]
+                }.get(first_task_id)
+                == "succeeded"
+                and {
+                    task["id"]: task["status"]
+                    for task in client.get("/api/tasks").json()["history"]
+                }.get(second_task_id)
+                == "succeeded"
+            ),
+            timeout=8,
+        )
+
+    assert order_file.read_text(encoding="utf-8").splitlines() == [
+        "first-attempt-1",
+        "first-attempt-2",
+        "second",
+    ]
 
 
 def test_startup_marks_stale_running_tasks_interrupted(tmp_path):
