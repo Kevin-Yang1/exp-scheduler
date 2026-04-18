@@ -16,10 +16,38 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "exp-scheduler" / "config.toml"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "share" / "exp-scheduler"
 
 
+def _detect_server_name() -> str:
+    return socket.gethostname() or "unknown-host"
+
+
+def _detect_server_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 80))
+            ip = sock.getsockname()[0]
+            if ip:
+                return ip
+    except OSError:
+        pass
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip:
+            return ip
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+DEFAULT_SERVER_NAME = _detect_server_name()
+DEFAULT_SERVER_IP = _detect_server_ip()
+
+
 @dataclass(slots=True)
 class SchedulerConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
+    server_name: str = DEFAULT_SERVER_NAME
+    server_ip: str = DEFAULT_SERVER_IP
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     gpu_idle_memory_mb: int = DEFAULT_GPU_IDLE_MEMORY_MB
     auto_retry_max_retries: int = DEFAULT_AUTO_RETRY_MAX_RETRIES
@@ -46,6 +74,8 @@ def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
     return SchedulerConfig(
         host=str(data.get("host", DEFAULT_HOST)),
         port=int(data.get("port", DEFAULT_PORT)),
+        server_name=str(data.get("server_name", DEFAULT_SERVER_NAME)),
+        server_ip=str(data.get("server_ip", DEFAULT_SERVER_IP)),
         poll_interval_seconds=int(
             data.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS)
         ),
@@ -68,6 +98,8 @@ def default_config_text() -> str:
         [
             f'host = "{DEFAULT_HOST}"',
             f"port = {DEFAULT_PORT}",
+            f'server_name = "{DEFAULT_SERVER_NAME}"',
+            f'server_ip = "{DEFAULT_SERVER_IP}"',
             f"poll_interval_seconds = {DEFAULT_POLL_INTERVAL_SECONDS}",
             f"gpu_idle_memory_mb = {DEFAULT_GPU_IDLE_MEMORY_MB}",
             f"auto_retry_max_retries = {DEFAULT_AUTO_RETRY_MAX_RETRIES}",

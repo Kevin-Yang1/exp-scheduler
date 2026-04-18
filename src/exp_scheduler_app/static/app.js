@@ -2,6 +2,7 @@ const state = {
   tasks: { queued: [], running: [], history: [], queue_paused: false },
   gpus: [],
   profiles: [],
+  serverInfo: null,
   discovery: { conda_envs: [], venvs: [], search_roots: [], conda_executable: null },
   selectedLogTaskId: null,
   logTimer: null,
@@ -30,6 +31,7 @@ const nodes = {
   gpuList: document.getElementById("gpu-list"),
   queueToggle: document.getElementById("queue-toggle"),
   refreshButton: document.getElementById("refresh-button"),
+  serverIdentityValue: document.getElementById("server-identity-value"),
   logOutput: document.getElementById("log-output"),
   logTaskName: document.getElementById("log-task-name"),
   template: document.getElementById("task-card-template"),
@@ -297,6 +299,18 @@ function renderQueueToggle() {
   nodes.queueToggle.textContent = state.tasks.queue_paused ? "恢复调度" : "暂停调度";
 }
 
+function renderServerInfo() {
+  if (!nodes.serverIdentityValue) return;
+  if (!state.serverInfo) {
+    nodes.serverIdentityValue.textContent = "读取中...";
+    return;
+  }
+  const name = state.serverInfo.server_name || "unknown-host";
+  const ip = state.serverInfo.server_ip || "127.0.0.1";
+  nodes.serverIdentityValue.textContent = `${name} (${ip})`;
+  document.title = `任务调度看板 · ${name}`;
+}
+
 function renderProfiles() {
   nodes.manageProfileSelect.innerHTML = '<option value="">＋ 新建模板 (保持下方表单为空新增)</option>';
   
@@ -382,6 +396,11 @@ async function loadProfiles() {
   state.profiles = payload.profiles || [];
   renderProfiles();
   renderProfileSelect();
+}
+
+async function loadServerInfo() {
+  state.serverInfo = await api("/api/server");
+  renderServerInfo();
 }
 
 async function scanProfiles() {
@@ -647,6 +666,7 @@ if (nodes.importDiscoveryBtn) {
 }
 
 refreshAll()
+  .then(loadServerInfo)
   .then(connectEvents)
   .then(startLogPolling)
   .catch((error) => {

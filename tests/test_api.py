@@ -195,6 +195,30 @@ def test_profile_crud_and_task_validation(tmp_path):
         assert all(profile["id"] != profile_id for profile in remaining)
 
 
+def test_server_info_endpoint_uses_config_values(tmp_path):
+    config = SchedulerConfig(
+        host="127.0.0.1",
+        port=17861,
+        server_name="lab-gpu-a",
+        server_ip="10.10.0.23",
+        poll_interval_seconds=0.1,
+        gpu_idle_memory_mb=1000,
+        state_dir=tmp_path / "state-server",
+        log_dir=(tmp_path / "state-server" / "logs"),
+    )
+    provider = FakeGPUProvider([gpu(0, idle=False)])
+    app = create_app(config, gpu_provider=provider)
+    with TestClient(app) as client:
+        response = client.get("/api/server")
+        response.raise_for_status()
+        assert response.json() == {
+            "server_name": "lab-gpu-a",
+            "server_ip": "10.10.0.23",
+            "host": "127.0.0.1",
+            "port": 17861,
+        }
+
+
 def test_pause_resume_delete_and_requeue(tmp_path):
     with make_client(tmp_path) as client:
         create = client.post(

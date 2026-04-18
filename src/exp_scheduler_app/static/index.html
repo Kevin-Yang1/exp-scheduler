@@ -14,9 +14,15 @@
           <h1>任务调度看板</h1>
           <p class="subtitle">自动化 GPU 排队管理与状态监控平台</p>
         </div>
-        <div class="hero-actions">
-          <button id="queue-toggle" class="primary-button">加载中...</button>
-          <button id="refresh-button" class="ghost-button">立即刷新</button>
+        <div class="hero-right">
+          <div id="server-identity" class="server-identity" aria-live="polite">
+            <span class="server-label">当前服务器</span>
+            <span id="server-identity-value" class="server-value">读取中...</span>
+          </div>
+          <div class="hero-actions">
+            <button id="queue-toggle" class="primary-button">加载中...</button>
+            <button id="refresh-button" class="ghost-button">立即刷新</button>
+          </div>
         </div>
       </header>
 

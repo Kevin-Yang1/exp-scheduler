@@ -87,6 +87,15 @@ def create_app(
     async def list_tasks() -> dict[str, object]:
         return await scheduler.list_tasks()
 
+    @app.get("/api/server")
+    async def get_server_info() -> dict[str, object]:
+        return {
+            "server_name": config.server_name,
+            "server_ip": config.server_ip,
+            "host": config.host,
+            "port": config.port,
+        }
+
     @app.get("/api/profiles")
     async def list_profiles() -> dict[str, object]:
         return {"profiles": await scheduler.list_profiles()}
