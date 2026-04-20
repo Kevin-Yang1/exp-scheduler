@@ -1,6 +1,7 @@
 const state = {
   tasks: { queued: [], running: [], history: [], queue_paused: false },
   gpus: [],
+  settings: { allowed_gpu_ids: null },
   profiles: [],
   serverInfo: null,
   discovery: { conda_envs: [], venvs: [], search_roots: [], conda_executable: null },
@@ -13,6 +14,7 @@ const nodes = {
   taskForm: document.getElementById("task-form"),
   formMessage: document.getElementById("form-message"),
   taskProfileSelect: document.getElementById("task-profile-select"),
+  taskRequestedGpuSelect: document.getElementById("task-requested-gpu-select"),
   profilePreview: document.getElementById("profile-preview"),
   profileForm: document.getElementById("profile-form"),
   profileMessage: document.getElementById("profile-message"),
@@ -29,6 +31,11 @@ const nodes = {
   runningList: document.getElementById("running-list"),
   historyList: document.getElementById("history-list"),
   gpuList: document.getElementById("gpu-list"),
+  gpuSettingsForm: document.getElementById("gpu-settings-form"),
+  gpuAllowlistOptions: document.getElementById("gpu-allowlist-options"),
+  gpuSettingsSummary: document.getElementById("gpu-settings-summary"),
+  gpuSettingsMessage: document.getElementById("gpu-settings-message"),
+  gpuAllowAllButton: document.getElementById("gpu-allow-all-button"),
   queueToggle: document.getElementById("queue-toggle"),
   refreshButton: document.getElementById("refresh-button"),
   serverIdentityValue: document.getElementById("server-identity-value"),
@@ -86,6 +93,9 @@ function taskMeta(task) {
   const meta = [];
   if (task.profile_name) meta.push(`环境: ${task.profile_name}`);
   if (task.cwd) meta.push(`目录: ${task.cwd}`);
+  if (task.requested_gpu !== null && task.requested_gpu !== undefined) {
+    meta.push(`指定GPU: ${task.requested_gpu}`);
+  }
   if ((task.attempt_count || 0) > 0) {
     meta.push(`尝试次数: ${task.attempt_count || 0}`);
   }
@@ -193,6 +203,12 @@ function currentProfileId() {
   return nodes.taskProfileSelect.value ? Number(nodes.taskProfileSelect.value) : null;
 }
 
+function currentRequestedGpuId() {
+  return nodes.taskRequestedGpuSelect.value
+    ? Number(nodes.taskRequestedGpuSelect.value)
+    : null;
+}
+
 function findProfile(profileId) {
   return state.profiles.find((profile) => profile.id === profileId) || null;
 }
@@ -217,6 +233,67 @@ function renderProfileSelect() {
     nodes.taskProfileSelect.value = currentValue;
   }
   renderProfilePreview();
+}
+
+function renderTaskGpuSelect() {
+  if (!nodes.taskRequestedGpuSelect) return;
+  const currentValue = nodes.taskRequestedGpuSelect.value;
+  nodes.taskRequestedGpuSelect.innerHTML = "";
+  const autoOption = document.createElement("option");
+  autoOption.value = "";
+  autoOption.textContent = "自动分配";
+  nodes.taskRequestedGpuSelect.appendChild(autoOption);
+  state.gpus.forEach((gpu) => {
+    const option = document.createElement("option");
+    option.value = String(gpu.index);
+    option.textContent = `GPU ${gpu.index} · ${gpu.name}`;
+    nodes.taskRequestedGpuSelect.appendChild(option);
+  });
+  if (currentValue && state.gpus.some((gpu) => String(gpu.index) === currentValue)) {
+    nodes.taskRequestedGpuSelect.value = currentValue;
+  }
+}
+
+function gpuSettingsSummaryText() {
+  if (!state.gpus.length) {
+    return "未检测到 GPU";
+  }
+  if (state.settings.allowed_gpu_ids === null) {
+    return "默认全部可用";
+  }
+  if (!state.settings.allowed_gpu_ids.length) {
+    return "已禁用全部 GPU";
+  }
+  return `允许 GPU ${state.settings.allowed_gpu_ids.join(", ")}`;
+}
+
+function renderGpuSettings() {
+  if (!nodes.gpuAllowlistOptions || !nodes.gpuSettingsSummary) return;
+  nodes.gpuAllowlistOptions.innerHTML = "";
+  nodes.gpuSettingsSummary.textContent = gpuSettingsSummaryText();
+  if (!state.gpus.length) {
+    const empty = document.createElement("div");
+    empty.className = "subtle-note";
+    empty.textContent = "当前没有检测到 GPU，稍后刷新即可。";
+    nodes.gpuAllowlistOptions.appendChild(empty);
+    return;
+  }
+  const allowedSet = state.settings.allowed_gpu_ids === null
+    ? null
+    : new Set(state.settings.allowed_gpu_ids);
+  state.gpus.forEach((gpu) => {
+    const label = document.createElement("label");
+    label.className = "gpu-checkbox";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.name = "allowed_gpu_ids";
+    checkbox.value = String(gpu.index);
+    checkbox.checked = allowedSet ? allowedSet.has(gpu.index) : true;
+    const text = document.createElement("span");
+    text.textContent = `GPU ${gpu.index}`;
+    label.append(checkbox, text);
+    nodes.gpuAllowlistOptions.appendChild(label);
+  });
 }
 
 function renderProfilePreview() {
@@ -278,15 +355,27 @@ function renderGpus() {
   state.gpus.forEach((gpu) => {
     const card = document.createElement("article");
     card.className = "gpu-card";
+    let statusText = "空闲可调度";
+    let statusClass = "";
+    if (!gpu.globally_enabled) {
+      card.classList.add("disabled-gpu");
+      statusText = "全局禁用";
+      statusClass = "disabled";
+    } else if (!gpu.is_idle) {
+      card.classList.add("busy-gpu");
+      statusText = "忙碌";
+      statusClass = "busy";
+    }
     const title = document.createElement("h3");
     title.textContent = `GPU ${gpu.index} · ${gpu.name}`;
     const status = document.createElement("span");
-    status.className = `gpu-status ${gpu.is_idle ? "" : "busy"}`.trim();
-    status.textContent = gpu.is_idle ? "空闲可调度" : "忙碌";
+    status.className = `gpu-status ${statusClass}`.trim();
+    status.textContent = statusText;
     const meta = document.createElement("p");
     meta.textContent = `显存 ${gpu.memory_used_mb}/${gpu.memory_total_mb} MiB · 利用率 ${gpu.utilization_gpu}%`;
     const details = document.createElement("p");
     const reasons = [];
+    if (!gpu.globally_enabled) reasons.push("未纳入全局可用列表");
     if (gpu.has_processes) reasons.push("检测到进程");
     if (gpu.scheduler_occupied) reasons.push("调度器已占用");
     details.textContent = reasons.length ? reasons.join(" / ") : "无额外阻塞";
@@ -388,7 +477,14 @@ async function loadTasks() {
 async function loadGpus() {
   const payload = await api("/api/gpus");
   state.gpus = payload.gpus || [];
+  renderTaskGpuSelect();
+  renderGpuSettings();
   renderGpus();
+}
+
+async function loadSettings() {
+  state.settings = await api("/api/settings");
+  renderGpuSettings();
 }
 
 async function loadProfiles() {
@@ -431,7 +527,7 @@ async function scanProfiles() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadTasks(), loadGpus(), loadProfiles()]);
+  await Promise.all([loadTasks(), loadGpus(), loadProfiles(), loadSettings()]);
 }
 
 async function createTask(event) {
@@ -447,15 +543,56 @@ async function createTask(event) {
         cwd: normalizeText(formData.get("cwd")),
         notes: normalizeText(formData.get("notes")),
         env,
+        requested_gpu: currentRequestedGpuId(),
         profile_id: currentProfileId(),
       }),
     });
     nodes.taskForm.reset();
+    renderTaskGpuSelect();
     renderProfilePreview();
     nodes.formMessage.textContent = "任务已加入队列。";
     await refreshAll();
   } catch (error) {
     nodes.formMessage.textContent = error.message;
+  }
+}
+
+async function saveGpuSettings(event) {
+  event.preventDefault();
+  try {
+    const selected = Array.from(
+      nodes.gpuAllowlistOptions.querySelectorAll('input[name="allowed_gpu_ids"]:checked')
+    ).map((input) => Number(input.value));
+    const allowedGpuIds = selected.length === state.gpus.length ? null : selected;
+    state.settings = await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ allowed_gpu_ids: allowedGpuIds }),
+    });
+    if (state.settings.allowed_gpu_ids === null) {
+      nodes.gpuSettingsMessage.textContent = "已恢复全部 GPU 可调度。";
+    } else if (!state.settings.allowed_gpu_ids.length) {
+      nodes.gpuSettingsMessage.textContent = "已禁用全部 GPU 的新任务调度。";
+    } else {
+      nodes.gpuSettingsMessage.textContent = `已应用 GPU 白名单：${state.settings.allowed_gpu_ids.join(", ")}`;
+    }
+    renderGpuSettings();
+    await refreshAll();
+  } catch (error) {
+    nodes.gpuSettingsMessage.textContent = error.message;
+  }
+}
+
+async function allowAllGpus() {
+  try {
+    state.settings = await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ allowed_gpu_ids: null }),
+    });
+    nodes.gpuSettingsMessage.textContent = "已恢复全部 GPU 可调度。";
+    renderGpuSettings();
+    await refreshAll();
+  } catch (error) {
+    nodes.gpuSettingsMessage.textContent = error.message;
   }
 }
 
@@ -639,6 +776,12 @@ nodes.profileForm.addEventListener("submit", saveProfile);
 nodes.profileCancelButton.addEventListener("click", resetProfileForm);
 nodes.profileScanButton.addEventListener("click", scanProfiles);
 nodes.taskProfileSelect.addEventListener("change", renderProfilePreview);
+if (nodes.gpuSettingsForm) {
+  nodes.gpuSettingsForm.addEventListener("submit", saveGpuSettings);
+}
+if (nodes.gpuAllowAllButton) {
+  nodes.gpuAllowAllButton.addEventListener("click", allowAllGpus);
+}
 nodes.queueToggle.addEventListener("click", toggleQueue);
 nodes.refreshButton.addEventListener("click", refreshAll);
 

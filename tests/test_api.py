@@ -195,6 +195,34 @@ def test_profile_crud_and_task_validation(tmp_path):
         assert all(profile["id"] != profile_id for profile in remaining)
 
 
+def test_gpu_settings_endpoint_and_requested_gpu_validation(tmp_path):
+    with make_client(tmp_path) as client:
+        settings = client.get("/api/settings")
+        settings.raise_for_status()
+        assert settings.json()["allowed_gpu_ids"] is None
+
+        update = client.put("/api/settings", json={"allowed_gpu_ids": [0]})
+        update.raise_for_status()
+        assert update.json()["allowed_gpu_ids"] == [0]
+
+        invalid_settings = client.put("/api/settings", json={"allowed_gpu_ids": [7]})
+        assert invalid_settings.status_code == 400
+
+        invalid_task = client.post(
+            "/api/tasks",
+            json={
+                "name": "bad-gpu",
+                "command": command("print('bad-gpu')"),
+                "cwd": None,
+                "env": {},
+                "notes": None,
+                "requested_gpu": 7,
+                "profile_id": None,
+            },
+        )
+        assert invalid_task.status_code == 400
+
+
 def test_server_info_endpoint_uses_config_values(tmp_path):
     config = SchedulerConfig(
         host="127.0.0.1",

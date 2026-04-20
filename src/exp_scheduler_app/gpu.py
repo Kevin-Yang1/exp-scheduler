@@ -20,11 +20,18 @@ class GPUInfo:
     utilization_gpu: int
     has_processes: bool = False
 
-    def to_dict(self, *, threshold_mb: int, scheduler_occupied: bool) -> dict[str, object]:
+    def to_dict(
+        self,
+        *,
+        threshold_mb: int,
+        scheduler_occupied: bool,
+        globally_enabled: bool,
+    ) -> dict[str, object]:
         is_idle = (
             self.memory_used_mb < threshold_mb
             and not self.has_processes
             and not scheduler_occupied
+            and globally_enabled
         )
         return {
             "index": self.index,
@@ -35,6 +42,7 @@ class GPUInfo:
             "utilization_gpu": self.utilization_gpu,
             "has_processes": self.has_processes,
             "scheduler_occupied": scheduler_occupied,
+            "globally_enabled": globally_enabled,
             "is_idle": is_idle,
         }
 

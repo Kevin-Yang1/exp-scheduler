@@ -103,8 +103,10 @@ class SchedulerService:
         cwd: str | None,
         env: dict[str, str],
         notes: str | None,
+        requested_gpu: int | None = None,
         profile_id: int | None = None,
     ) -> dict[str, object]:
+        normalized_requested_gpu = await self._normalize_requested_gpu(requested_gpu)
         final_name = (name or "").strip() or command.strip()[:80]
         profile_name: str | None = None
         shell_setup: str | None = None
@@ -130,6 +132,7 @@ class SchedulerService:
             cwd=resolved_cwd,
             env=resolved_env,
             notes=notes,
+            requested_gpu=normalized_requested_gpu,
             profile_id=profile_id,
             profile_name=profile_name,
             shell_setup=shell_setup,
@@ -259,6 +262,19 @@ class SchedulerService:
         )
         return result
 
+    async def get_settings(self) -> dict[str, object]:
+        return {"allowed_gpu_ids": self.database.get_allowed_gpu_ids()}
+
+    async def update_settings(self, *, allowed_gpu_ids: list[int] | None) -> dict[str, object]:
+        normalized_allowed_gpu_ids = await self._normalize_allowed_gpu_ids(allowed_gpu_ids)
+        self.database.set_allowed_gpu_ids(normalized_allowed_gpu_ids)
+        await self.events.publish(
+            "settings_updated",
+            {"allowed_gpu_ids": normalized_allowed_gpu_ids},
+        )
+        await self._trigger_immediate_schedule()
+        return await self.get_settings()
+
     async def read_task_log(self, task_id: int, *, tail_bytes: int = LOG_TAIL_BYTES) -> dict[str, object]:
         task = self.database.get_task(task_id)
         if task is None:
@@ -302,16 +318,19 @@ class SchedulerService:
             ]
             if not available:
                 return
-            for task, gpu in zip(queued_tasks, available):
+            for task, gpu in self._match_tasks_to_gpus(queued_tasks, available):
                 await self._launch_task(task, gpu)
 
     async def _refresh_gpu_payload(self) -> list[dict[str, object]]:
         gpus = await asyncio.to_thread(self._gpu_provider)
         occupied = {handle.gpu_id for handle in self._running.values()}
+        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
+        allowed_gpu_set = set(allowed_gpu_ids) if allowed_gpu_ids is not None else None
         payload = [
             gpu.to_dict(
                 threshold_mb=self.config.gpu_idle_memory_mb,
                 scheduler_occupied=gpu.index in occupied,
+                globally_enabled=allowed_gpu_set is None or gpu.index in allowed_gpu_set,
             )
             for gpu in gpus
         ]
@@ -463,7 +482,31 @@ class SchedulerService:
             async with self._lock:
                 self._running.pop(task_id, None)
                 self._watchers.pop(task_id, None)
-            await self._refresh_gpu_payload()
+            await self._trigger_immediate_schedule()
+
+    def _match_tasks_to_gpus(
+        self,
+        queued_tasks: list[dict[str, object]],
+        available_gpus: list[dict[str, object]],
+    ) -> list[tuple[dict[str, object], dict[str, object]]]:
+        remaining_gpus = list(available_gpus)
+        assignments: list[tuple[dict[str, object], dict[str, object]]] = []
+        for task in queued_tasks:
+            requested_gpu = task.get("requested_gpu")
+            chosen_index: int | None = None
+            if isinstance(requested_gpu, int):
+                for index, gpu in enumerate(remaining_gpus):
+                    if int(gpu["index"]) == requested_gpu:
+                        chosen_index = index
+                        break
+            elif remaining_gpus:
+                chosen_index = 0
+            if chosen_index is None:
+                continue
+            assignments.append((task, remaining_gpus.pop(chosen_index)))
+            if not remaining_gpus:
+                break
+        return assignments
 
     async def _interrupt_running_tasks(self) -> None:
         async with self._lock:
@@ -524,6 +567,53 @@ class SchedulerService:
             datetime.now(UTC)
             + timedelta(seconds=max(0, self.config.auto_retry_delay_seconds))
         ).isoformat()
+
+    async def _normalize_requested_gpu(self, requested_gpu: int | None) -> int | None:
+        if requested_gpu is None:
+            return None
+        if requested_gpu < 0:
+            raise ValueError("指定 GPU 必须是非负整数")
+        known_gpu_ids = await self._known_gpu_ids()
+        if requested_gpu not in known_gpu_ids:
+            raise ValueError(f"GPU 不存在: {requested_gpu}")
+        return requested_gpu
+
+    async def _normalize_allowed_gpu_ids(
+        self,
+        allowed_gpu_ids: list[int] | None,
+    ) -> list[int] | None:
+        if allowed_gpu_ids is None:
+            return None
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for gpu_id in allowed_gpu_ids:
+            value = int(gpu_id)
+            if value < 0:
+                raise ValueError("GPU 列表里只能包含非负整数")
+            if value in seen:
+                continue
+            normalized.append(value)
+            seen.add(value)
+        known_gpu_ids = await self._known_gpu_ids()
+        missing = [gpu_id for gpu_id in normalized if gpu_id not in known_gpu_ids]
+        if missing:
+            missing_text = ", ".join(str(item) for item in missing)
+            raise ValueError(f"GPU 不存在: {missing_text}")
+        return normalized
+
+    async def _known_gpu_ids(self) -> set[int]:
+        gpus = await asyncio.to_thread(self._gpu_provider)
+        return {gpu.index for gpu in gpus}
+
+    async def _trigger_immediate_schedule(self) -> None:
+        if self._stop_event.is_set():
+            return
+        try:
+            await self._tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Immediate reschedule failed")
 
     def _build_launch_command(self, task: dict[str, object]) -> str:
         shell_setup = (

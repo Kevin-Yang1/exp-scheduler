@@ -51,6 +51,7 @@ class Database:
                     "shell_setup": "TEXT",
                     "attempt_count": "INTEGER",
                     "next_retry_at": "TEXT",
+                    "requested_gpu": "INTEGER",
                 },
             )
             conn.execute(
@@ -93,6 +94,7 @@ class Database:
         cwd: str | None,
         env: dict[str, str],
         notes: str | None,
+        requested_gpu: int | None = None,
         profile_id: int | None = None,
         profile_name: str | None = None,
         shell_setup: str | None = None,
@@ -105,8 +107,9 @@ class Database:
                 INSERT INTO tasks(
                     name, command, cwd, env, status, queue_rank, assigned_gpu, pid,
                     exit_code, created_at, started_at, finished_at, log_path, notes,
-                    profile_id, profile_name, shell_setup, attempt_count, next_retry_at
-                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL)
+                    profile_id, profile_name, shell_setup, attempt_count, next_retry_at,
+                    requested_gpu
+                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?)
                 """,
                 (
                     name,
@@ -119,6 +122,7 @@ class Database:
                     profile_id,
                     profile_name,
                     shell_setup,
+                    requested_gpu,
                 ),
             )
             conn.commit()
@@ -325,6 +329,38 @@ class Database:
             conn.commit()
         return paused
 
+    def get_allowed_gpu_ids(self) -> list[int] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'allowed_gpu_ids'"
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if payload is None:
+            return None
+        if not isinstance(payload, list):
+            return None
+        return [int(item) for item in payload]
+
+    def set_allowed_gpu_ids(self, allowed_gpu_ids: list[int] | None) -> list[int] | None:
+        with self._lock, self._connect() as conn:
+            if allowed_gpu_ids is None:
+                conn.execute("DELETE FROM meta WHERE key = 'allowed_gpu_ids'")
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO meta(key, value) VALUES('allowed_gpu_ids', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (json.dumps(allowed_gpu_ids),),
+                )
+            conn.commit()
+        return allowed_gpu_ids
+
     def mark_task_running(
         self,
         *,
@@ -453,6 +489,9 @@ class Database:
             cwd=task["cwd"] if isinstance(task["cwd"], str) else None,
             env=dict(task["env"]),
             notes=task["notes"] if isinstance(task["notes"], str) else None,
+            requested_gpu=task["requested_gpu"]
+            if isinstance(task["requested_gpu"], int)
+            else None,
             profile_id=task["profile_id"] if isinstance(task["profile_id"], int) else None,
             profile_name=task["profile_name"]
             if isinstance(task["profile_name"], str)
@@ -531,6 +570,7 @@ class Database:
             "shell_setup": row["shell_setup"] if "shell_setup" in keys else None,
             "attempt_count": row["attempt_count"] if "attempt_count" in keys and row["attempt_count"] is not None else 0,
             "next_retry_at": row["next_retry_at"] if "next_retry_at" in keys else None,
+            "requested_gpu": row["requested_gpu"] if "requested_gpu" in keys else None,
         }
 
     def _row_to_profile(self, row: sqlite3.Row) -> dict[str, object]:

@@ -240,6 +240,50 @@ button {
 .button-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
 .hidden { display: none !important; }
 
+.gpu-settings-form {
+  margin-bottom: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  padding: 1rem;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.gpu-settings-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.gpu-allowlist-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.gpu-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-main);
+  font-size: 0.82rem;
+}
+
+.gpu-checkbox input {
+  width: auto;
+  margin: 0;
+  accent-color: #ffffff;
+}
+
 /* 卡片特效 (Tasks & GPUs) */
 .stack-list, .history-list { display: flex; flex-direction: column; gap: 0.85rem; }
 .empty-state { text-align: center; padding: 2.5rem 1rem; color: var(--text-muted); font-size: 0.875rem; border: 1px dashed var(--panel-border); border-radius: var(--radius); background: rgba(0,0,0,0.2); }
@@ -358,6 +402,7 @@ button {
   box-shadow: 0 0 10px var(--success);
 }
 .gpu-card.busy-gpu::before { background: var(--danger); box-shadow: 0 0 10px var(--danger); }
+.gpu-card.disabled-gpu::before { background: #f59e0b; box-shadow: 0 0 10px #f59e0b; }
 
 .gpu-card:hover { transform: translateY(-3px); border-color: rgba(255,255,255,0.15); box-shadow: 0 10px 20px rgba(0,0,0,0.3); }
 
@@ -375,6 +420,7 @@ button {
   border: 1px solid rgba(16, 185, 129, 0.2); 
 }
 .gpu-status.busy { background: rgba(244, 63, 94, 0.1); color: #f43f5e; border-color: rgba(244, 63, 94, 0.2); }
+.gpu-status.disabled { background: rgba(245, 158, 11, 0.12); color: #f59e0b; border-color: rgba(245, 158, 11, 0.24); }
 .gpu-card p { margin: 0 0 0.25rem; font-size: 0.85rem; color: var(--text-muted); font-family: var(--font-mono); }
 
 /* History */

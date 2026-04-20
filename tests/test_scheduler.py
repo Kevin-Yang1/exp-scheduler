@@ -49,6 +49,7 @@ def gpu(index: int, *, idle: bool = True, has_processes: bool = False) -> GPUInf
 def make_config(
     tmp_path,
     *,
+    poll_interval_seconds: float = 0.1,
     auto_retry_max_retries: int = 0,
     auto_retry_delay_seconds: int = 5,
 ) -> SchedulerConfig:
@@ -56,7 +57,7 @@ def make_config(
     return SchedulerConfig(
         host="127.0.0.1",
         port=17861,
-        poll_interval_seconds=0.1,
+        poll_interval_seconds=poll_interval_seconds,
         gpu_idle_memory_mb=1000,
         auto_retry_max_retries=auto_retry_max_retries,
         auto_retry_delay_seconds=auto_retry_delay_seconds,
@@ -69,12 +70,14 @@ def build_client(
     tmp_path,
     provider: FakeGPUProvider,
     *,
+    poll_interval_seconds: float = 0.1,
     auto_retry_max_retries: int = 0,
     auto_retry_delay_seconds: int = 5,
 ) -> TestClient:
     app = create_app(
         make_config(
             tmp_path,
+            poll_interval_seconds=poll_interval_seconds,
             auto_retry_max_retries=auto_retry_max_retries,
             auto_retry_delay_seconds=auto_retry_delay_seconds,
         ),
@@ -138,6 +141,7 @@ def create_task(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     notes: str | None = None,
+    requested_gpu: int | None = None,
     profile_id: int | None = None,
 ) -> int:
     response = client.post(
@@ -148,6 +152,7 @@ def create_task(
             "env": env or {},
             "cwd": cwd,
             "notes": notes,
+            "requested_gpu": requested_gpu,
             "profile_id": profile_id,
         },
     )
@@ -241,6 +246,134 @@ def test_two_free_gpus_can_run_two_tasks_in_parallel(tmp_path):
         assert assignments[first_id] in {0, 1}
         assert assignments[second_id] in {0, 1}
         assert assignments[first_id] != assignments[second_id]
+
+
+def test_requested_gpu_waits_for_specific_device_while_other_tasks_can_run(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=False, has_processes=True)])
+    with build_client(tmp_path, provider) as client:
+        pinned_id = create_task(
+            client,
+            command("import os; print('pinned=' + os.environ['CUDA_VISIBLE_DEVICES'])"),
+            name="pinned",
+            requested_gpu=1,
+        )
+        auto_id = create_task(
+            client,
+            command("import os; print('auto=' + os.environ['CUDA_VISIBLE_DEVICES'])"),
+            name="auto",
+        )
+
+        auto_history = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == auto_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+        assert auto_history["assigned_gpu"] == 0
+        queued = client.get("/api/tasks").json()["queued"]
+        assert [task["id"] for task in queued] == [pinned_id]
+
+        provider.set_gpus([gpu(0, idle=True), gpu(1, idle=True)])
+
+        pinned_history = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == pinned_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+        assert pinned_history["assigned_gpu"] == 1
+        log_payload = client.get(f"/api/tasks/{pinned_id}/log").json()
+        assert "pinned=1" in log_payload["content"]
+
+
+def test_global_allowed_gpu_ids_limit_scheduling_and_apply_live(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        response = client.put("/api/settings", json={"allowed_gpu_ids": [1]})
+        response.raise_for_status()
+        assert response.json()["allowed_gpu_ids"] == [1]
+
+        first_id = create_task(
+            client,
+            command("import os; print('gpu=' + os.environ['CUDA_VISIBLE_DEVICES'])"),
+            name="first",
+        )
+        first_history = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == first_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+        assert first_history["assigned_gpu"] == 1
+
+        disable_response = client.put("/api/settings", json={"allowed_gpu_ids": []})
+        disable_response.raise_for_status()
+        assert disable_response.json()["allowed_gpu_ids"] == []
+
+        second_id = create_task(
+            client,
+            command("import os; print('gpu=' + os.environ['CUDA_VISIBLE_DEVICES'])"),
+            name="second",
+        )
+        time.sleep(0.3)
+        queued = client.get("/api/tasks").json()["queued"]
+        assert [task["id"] for task in queued] == [second_id]
+
+        enable_response = client.put("/api/settings", json={"allowed_gpu_ids": [0]})
+        enable_response.raise_for_status()
+        assert enable_response.json()["allowed_gpu_ids"] == [0]
+
+        second_history = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == second_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+        assert second_history["assigned_gpu"] == 0
+
+
+def test_task_completion_triggers_immediate_reschedule_without_waiting_for_poll(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider, poll_interval_seconds=0.1) as client:
+        first_id = create_task(
+            client,
+            command("import time; time.sleep(0.3)"),
+            name="first",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == first_id
+            ),
+            timeout=3,
+        )
+        client.app.state.scheduler.config.poll_interval_seconds = 5
+
+        second_id = create_task(
+            client,
+            command("print('second')"),
+            name="second",
+        )
+
+        second_history = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == second_id and task["status"] == "succeeded"
+            ),
+            timeout=2,
+        )
+        assert second_history["assigned_gpu"] == 0
 
 
 def test_cancel_running_task_transitions_to_cancelled(tmp_path):

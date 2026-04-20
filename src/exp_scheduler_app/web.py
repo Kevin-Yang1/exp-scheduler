@@ -23,6 +23,7 @@ class CreateTaskRequest(BaseModel):
     cwd: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     notes: str | None = None
+    requested_gpu: int | None = None
     profile_id: int | None = None
 
 
@@ -40,6 +41,10 @@ class ImportProfileRequest(ProfileRequest):
 
 class ReorderTasksRequest(BaseModel):
     task_ids: list[int]
+
+
+class UpdateSettingsRequest(BaseModel):
+    allowed_gpu_ids: list[int] | None = None
 
 
 def create_app(
@@ -167,6 +172,7 @@ def create_app(
                 cwd=payload.cwd,
                 env=payload.env,
                 notes=payload.notes,
+                requested_gpu=payload.requested_gpu,
                 profile_id=payload.profile_id,
             )
         except ValueError as exc:
@@ -218,6 +224,19 @@ def create_app(
     @app.get("/api/gpus")
     async def list_gpus_endpoint() -> dict[str, object]:
         return {"gpus": await scheduler.list_gpus()}
+
+    @app.get("/api/settings")
+    async def get_settings_endpoint() -> dict[str, object]:
+        return await scheduler.get_settings()
+
+    @app.put("/api/settings")
+    async def update_settings_endpoint(payload: UpdateSettingsRequest) -> dict[str, object]:
+        try:
+            return await scheduler.update_settings(
+                allowed_gpu_ids=payload.allowed_gpu_ids,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/tasks/{task_id}/log")
     async def get_task_log_endpoint(task_id: int) -> dict[str, object]:

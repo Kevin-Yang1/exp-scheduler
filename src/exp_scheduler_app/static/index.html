@@ -45,6 +45,12 @@
                   <option value="">不使用环境模板</option>
                 </select>
               </label>
+              <label>
+                指定 GPU
+                <select id="task-requested-gpu-select" name="requested_gpu">
+                  <option value="">自动分配</option>
+                </select>
+              </label>
               <label class="full-span">
                 启动命令
                 <textarea name="command" rows="3" placeholder="python main.py" required></textarea>
@@ -135,6 +141,18 @@
             <div class="panel-header">
               <h2>GPU 实时资源池 <span class="badge-sub">Hardware Status</span></h2>
             </div>
+            <form id="gpu-settings-form" class="gpu-settings-form">
+              <div class="gpu-settings-topline">
+                <span>全局可用 GPU</span>
+                <span id="gpu-settings-summary" class="badge-sub">默认全部可用</span>
+              </div>
+              <div id="gpu-allowlist-options" class="gpu-allowlist-options"></div>
+              <div class="button-row">
+                <button type="button" id="gpu-allow-all-button" class="ghost-button">恢复全部可用</button>
+                <button type="submit" class="primary-button">应用 GPU 设置</button>
+              </div>
+            </form>
+            <div id="gpu-settings-message" class="form-message"></div>
             <div id="gpu-list" class="gpu-grid"></div>
           </section>
 
