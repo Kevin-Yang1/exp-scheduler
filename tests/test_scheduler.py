@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import shlex
 import sys
 import time
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 from exp_scheduler_app.config import SchedulerConfig
 from exp_scheduler_app.database import Database
 from exp_scheduler_app.gpu import GPUInfo
+from exp_scheduler_app.scheduler import SchedulerService
 from exp_scheduler_app.web import create_app
 
 
@@ -141,6 +143,7 @@ def create_task(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     notes: str | None = None,
+    is_urgent: bool = False,
     requested_gpu: int | None = None,
     profile_id: int | None = None,
 ) -> int:
@@ -152,6 +155,7 @@ def create_task(
             "env": env or {},
             "cwd": cwd,
             "notes": notes,
+            "is_urgent": is_urgent,
             "requested_gpu": requested_gpu,
             "profile_id": profile_id,
         },
@@ -178,6 +182,42 @@ def test_reorder_queue_persists_to_database(tmp_path):
 
     database = Database(make_config(tmp_path).db_path)
     assert [item["id"] for item in database.list_queued_tasks()] == [third, first, second]
+
+
+def test_task_environment_strips_scheduler_virtualenv(tmp_path):
+    config = make_config(tmp_path)
+    database = Database(config.db_path)
+    service = SchedulerService(config=config, database=database, gpu_provider=lambda: [])
+
+    task = {
+        "env": {"HF_HOME": "/tmp/hf-cache"},
+    }
+    original_env = {
+        "PATH": "/workspace/.venv/bin:/usr/local/bin:/usr/bin",
+        "VIRTUAL_ENV": "/workspace/.venv",
+        "VIRTUAL_ENV_PROMPT": "(.venv) ",
+        "_OLD_VIRTUAL_PATH": "/usr/local/bin:/usr/bin",
+    }
+
+    import os
+    import sys
+    from unittest.mock import patch
+
+    with patch.dict("os.environ", original_env, clear=True), patch.object(
+        sys,
+        "executable",
+        "/workspace/.venv/bin/python",
+    ):
+        env = service._build_task_environment(task=task, gpu_id=1, next_attempt=2)
+
+    assert env["HF_HOME"] == "/tmp/hf-cache"
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert env["EXP_SCHEDULER_ATTEMPT"] == "2"
+    assert env["EXP_SCHEDULER_MAX_RETRIES"] == "0"
+    assert env["PATH"] == "/usr/local/bin:/usr/bin"
+    assert "VIRTUAL_ENV" not in env
+    assert "VIRTUAL_ENV_PROMPT" not in env
+    assert "_OLD_VIRTUAL_PATH" not in env
 
 
 def test_scheduler_runs_task_when_gpu_becomes_free(tmp_path):
@@ -400,6 +440,109 @@ def test_cancel_running_task_transitions_to_cancelled(tmp_path):
             timeout=8,
         )
         assert history_task["status"] == "cancelled"
+        assert client.app.state.scheduler._terminal_sessions == {}
+
+
+def test_preempt_running_task_runs_urgent_queue_first_and_requeues_to_normal_head(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    order_file = tmp_path / "preempt-order.log"
+    with build_client(tmp_path, provider) as client:
+        first_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "import os, time",
+                        "from pathlib import Path",
+                        "attempt = int(os.environ['EXP_SCHEDULER_ATTEMPT'])",
+                        f"path = Path({str(order_file)!r})",
+                        "with path.open('a', encoding='utf-8') as fh:",
+                        "    fh.write(f'first-attempt-{attempt}\\n')",
+                        "time.sleep(30 if attempt == 1 else 0.1)",
+                    ]
+                )
+            ),
+            name="first",
+        )
+        second_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        f"path = Path({str(order_file)!r})",
+                        "with path.open('a', encoding='utf-8') as fh:",
+                        "    fh.write('second\\n')",
+                    ]
+                )
+            ),
+            name="second",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == first_id
+            ),
+            timeout=3,
+        )
+        wait_for(
+            lambda: (
+                order_file.exists()
+                and "first-attempt-1" in order_file.read_text(encoding="utf-8")
+            ),
+            timeout=3,
+        )
+
+        urgent_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        f"path = Path({str(order_file)!r})",
+                        "with path.open('a', encoding='utf-8') as fh:",
+                        "    fh.write('urgent\\n')",
+                    ]
+                )
+            ),
+            name="urgent",
+            is_urgent=True,
+        )
+
+        preempt_response = client.post(f"/api/tasks/{first_id}/preempt")
+        preempt_response.raise_for_status()
+
+        wait_for(
+            lambda: (
+                len(client.get("/api/tasks").json()["history"]) == 3
+                and {
+                    task["id"]: task["status"]
+                    for task in client.get("/api/tasks").json()["history"]
+                }.get(first_id)
+                == "succeeded"
+                and {
+                    task["id"]: task["status"]
+                    for task in client.get("/api/tasks").json()["history"]
+                }.get(second_id)
+                == "succeeded"
+                and {
+                    task["id"]: task["status"]
+                    for task in client.get("/api/tasks").json()["history"]
+                }.get(urgent_id)
+                == "succeeded"
+            ),
+            timeout=8,
+        )
+        assert client.app.state.scheduler._terminal_sessions == {}
+
+    assert order_file.read_text(encoding="utf-8").splitlines() == [
+        "first-attempt-1",
+        "urgent",
+        "first-attempt-2",
+        "second",
+    ]
 
 
 def test_task_can_use_environment_profile_defaults_and_shell_setup(tmp_path):
@@ -443,6 +586,38 @@ def test_task_can_use_environment_profile_defaults_and_shell_setup(tmp_path):
         assert "hook=from-shell" in log_payload["content"]
 
 
+def test_pty_logs_keep_raw_terminal_bytes_but_text_endpoint_is_sanitized(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command(
+                "import sys; "
+                "sys.stdout.write('\\x1b[31mRED\\x1b[0m\\rGREEN\\n'); "
+                "sys.stdout.flush()"
+            ),
+            name="ansi-demo",
+        )
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+
+        raw_bytes = Path(history_task["log_path"]).read_bytes()
+        assert b"\x1b[31mRED\x1b[0m\rGREEN" in raw_bytes
+
+        log_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        assert "\x1b[" not in log_payload["content"]
+        assert "RED" in log_payload["content"]
+        assert "GREEN" in log_payload["content"]
+        assert client.app.state.scheduler._terminal_sessions == {}
+
+
 def test_retryable_oom_failure_is_automatically_retried(tmp_path):
     provider = FakeGPUProvider([gpu(0, idle=True)])
     with build_client(
@@ -481,6 +656,7 @@ def test_retryable_oom_failure_is_automatically_retried(tmp_path):
         log_payload = client.get(f"/api/tasks/{task_id}/log").json()
         assert "attempt=2" in log_payload["content"]
         assert "recovered" in log_payload["content"]
+        assert client.app.state.scheduler._terminal_sessions == {}
 
 
 def test_non_retryable_failure_stops_without_retry(tmp_path):
@@ -517,6 +693,7 @@ def test_non_retryable_failure_stops_without_retry(tmp_path):
         log_payload = client.get(f"/api/tasks/{task_id}/log").json()
         assert "attempt=1" in log_payload["content"]
         assert "plain failure" in log_payload["content"]
+        assert client.app.state.scheduler._terminal_sessions == {}
 
 
 def test_retryable_task_requeues_to_queue_head(tmp_path):

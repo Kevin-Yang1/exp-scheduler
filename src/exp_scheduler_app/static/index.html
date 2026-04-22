@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>exp-scheduler</title>
+    <link rel="stylesheet" href="/static/vendor/xterm/xterm.css" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -35,6 +36,7 @@
               <p>填写并提交给调度器</p>
             </div>
             <form id="task-form" class="task-form">
+              <input type="hidden" name="task_id" />
               <label>
                 任务名称
                 <input type="text" name="name" placeholder="例如：llama-sft" />
@@ -50,6 +52,13 @@
                 <select id="task-requested-gpu-select" name="requested_gpu">
                   <option value="">自动分配</option>
                 </select>
+              </label>
+              <label class="task-checkbox">
+                <span>队列类型</span>
+                <span class="checkbox-inline">
+                  <input type="checkbox" id="task-is-urgent" name="is_urgent" />
+                  <span>加入紧急队列</span>
+                </span>
               </label>
               <label class="full-span">
                 启动命令
@@ -71,7 +80,23 @@
               <div id="profile-preview" class="subtle-note full-span">
                 当前不使用模板；此处的环境变量直接生效。
               </div>
-              <button type="submit" class="primary-button full-span">加入队列排队</button>
+              <div id="task-edit-banner" class="subtle-note full-span hidden"></div>
+              <div class="button-row full-span">
+                <button
+                  type="submit"
+                  id="task-submit-button"
+                  class="primary-button task-submit-button"
+                >
+                  加入队列排队
+                </button>
+                <button
+                  type="button"
+                  id="task-cancel-edit-button"
+                  class="ghost-button task-submit-button hidden"
+                >
+                  取消编辑
+                </button>
+              </div>
             </form>
             <div id="form-message" class="form-message"></div>
           </section>
@@ -168,6 +193,7 @@
                   <span>实时终端输出</span>
                   <span id="log-task-name">未选择任务</span>
                 </div>
+                <div id="log-terminal" class="log-terminal hidden"></div>
                 <pre id="log-output">系统休眠中，请选择左侧任务查看日志...</pre>
               </div>
             </section>
@@ -176,7 +202,22 @@
               <div class="panel-header">
                 <h2>系统队列 <span class="badge-sub">Pending Queue</span></h2>
               </div>
-              <div id="queue-list" class="stack-list empty-state">队列空闲，等待中...</div>
+              <div class="queue-sections">
+                <section class="queue-subsection">
+                  <div class="queue-subheader">
+                    <h3>紧急队列</h3>
+                    <span class="badge-sub urgent-badge">优先执行</span>
+                  </div>
+                  <div id="urgent-queue-list" class="stack-list empty-state">暂无紧急任务</div>
+                </section>
+                <section class="queue-subsection">
+                  <div class="queue-subheader">
+                    <h3>执行队列</h3>
+                    <span class="badge-sub">普通任务</span>
+                  </div>
+                  <div id="queue-list" class="stack-list empty-state">队列空闲，等待中...</div>
+                </section>
+              </div>
             </section>
           </div>
 
@@ -206,6 +247,8 @@
       </article>
     </template>
 
+    <script src="/static/vendor/xterm/xterm.js" defer></script>
+    <script src="/static/vendor/xterm/addon-fit.js" defer></script>
     <script src="/static/app.js" defer></script>
   </body>
 </html>

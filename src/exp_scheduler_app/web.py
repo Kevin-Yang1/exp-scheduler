@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 import asyncio
+import base64
+import json
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
@@ -17,14 +19,23 @@ from .scheduler import SchedulerService
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+def sse_message(event_name: str, payload: dict[str, object]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 class CreateTaskRequest(BaseModel):
     name: str | None = None
     command: str = Field(min_length=1)
     cwd: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     notes: str | None = None
+    is_urgent: bool = False
     requested_gpu: int | None = None
     profile_id: int | None = None
+
+
+class UpdateTaskRequest(CreateTaskRequest):
+    pass
 
 
 class ProfileRequest(BaseModel):
@@ -41,6 +52,7 @@ class ImportProfileRequest(ProfileRequest):
 
 class ReorderTasksRequest(BaseModel):
     task_ids: list[int]
+    queue_name: str = "normal"
 
 
 class UpdateSettingsRequest(BaseModel):
@@ -172,6 +184,7 @@ def create_app(
                 cwd=payload.cwd,
                 env=payload.env,
                 notes=payload.notes,
+                is_urgent=payload.is_urgent,
                 requested_gpu=payload.requested_gpu,
                 profile_id=payload.profile_id,
             )
@@ -179,18 +192,46 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"task": task}
 
+    @app.put("/api/tasks/{task_id}")
+    async def update_task_endpoint(
+        task_id: int,
+        payload: UpdateTaskRequest,
+    ) -> dict[str, object]:
+        try:
+            task = await scheduler.update_task(
+                task_id,
+                name=payload.name,
+                command=payload.command,
+                cwd=payload.cwd,
+                env=payload.env,
+                notes=payload.notes,
+                is_urgent=payload.is_urgent,
+                requested_gpu=payload.requested_gpu,
+                profile_id=payload.profile_id,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 409 if "排队中" in message else 400
+            raise HTTPException(status_code=status_code, detail=message) from exc
+        return {"task": task}
+
     @app.delete("/api/tasks/{task_id}")
     async def delete_task_endpoint(task_id: int) -> dict[str, object]:
         try:
             await scheduler.delete_task(task_id)
         except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            message = str(exc)
+            status_code = 404 if "不存在" in message else 409
+            raise HTTPException(status_code=status_code, detail=message) from exc
         return {"ok": True}
 
     @app.post("/api/tasks/reorder")
     async def reorder_tasks_endpoint(payload: ReorderTasksRequest) -> dict[str, object]:
         try:
-            queue = await scheduler.reorder_tasks(payload.task_ids)
+            queue = await scheduler.reorder_tasks(
+                payload.task_ids,
+                queue_name=payload.queue_name,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"queued": queue}
@@ -199,6 +240,14 @@ def create_app(
     async def cancel_task_endpoint(task_id: int) -> dict[str, object]:
         try:
             await scheduler.cancel_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/api/tasks/{task_id}/preempt")
+    async def preempt_task_endpoint(task_id: int) -> dict[str, object]:
+        try:
+            await scheduler.preempt_task(task_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True}
@@ -244,6 +293,55 @@ def create_app(
             return await scheduler.read_task_log(task_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/tasks/{task_id}/terminal/stream")
+    async def get_task_terminal_stream_endpoint(task_id: int) -> StreamingResponse:
+        try:
+            _, subscriber, snapshot = await scheduler.subscribe_terminal_stream(task_id)
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "不存在" in message else 409
+            raise HTTPException(status_code=status_code, detail=message) from exc
+
+        async def event_stream():
+            try:
+                yield sse_message(
+                    "snapshot",
+                    {
+                        "task_id": task_id,
+                        "data": base64.b64encode(snapshot).decode("ascii"),
+                    },
+                )
+                while True:
+                    chunk_task = asyncio.create_task(subscriber.chunk_queue.get())
+                    control_task = asyncio.create_task(subscriber.control_queue.get())
+                    done, pending = await asyncio.wait(
+                        {chunk_task, control_task},
+                        timeout=15,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for pending_task in pending:
+                        pending_task.cancel()
+                    if not done:
+                        yield sse_message("heartbeat", {"task_id": task_id})
+                        continue
+                    if control_task in done:
+                        event_type, payload = control_task.result()
+                        if event_type == "exit":
+                            yield sse_message("exit", payload or {"task_id": task_id})
+                        break
+                    chunk = chunk_task.result()
+                    yield sse_message(
+                        "chunk",
+                        {
+                            "task_id": task_id,
+                            "data": base64.b64encode(chunk).decode("ascii"),
+                        },
+                    )
+            finally:
+                await scheduler.unsubscribe_terminal_stream(task_id, subscriber)
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.get("/api/events")
     async def events_endpoint() -> StreamingResponse:

@@ -12,6 +12,11 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+NORMAL_QUEUE = "normal"
+URGENT_QUEUE = "urgent"
+VALID_QUEUE_NAMES = {NORMAL_QUEUE, URGENT_QUEUE}
+
+
 class Database:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -52,7 +57,16 @@ class Database:
                     "attempt_count": "INTEGER",
                     "next_retry_at": "TEXT",
                     "requested_gpu": "INTEGER",
+                    "queue_name": "TEXT",
                 },
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET queue_name = ?
+                WHERE queue_name IS NULL OR queue_name = ''
+                """,
+                (NORMAL_QUEUE,),
             )
             conn.execute(
                 """
@@ -95,12 +109,14 @@ class Database:
         env: dict[str, str],
         notes: str | None,
         requested_gpu: int | None = None,
+        queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
         shell_setup: str | None = None,
     ) -> dict[str, object]:
+        normalized_queue_name = self._normalize_queue_name(queue_name)
         with self._lock, self._connect() as conn:
-            queue_rank = self._next_queue_rank(conn)
+            queue_rank = self._next_queue_rank(conn, normalized_queue_name)
             now = utc_now_iso()
             cursor = conn.execute(
                 """
@@ -108,8 +124,8 @@ class Database:
                     name, command, cwd, env, status, queue_rank, assigned_gpu, pid,
                     exit_code, created_at, started_at, finished_at, log_path, notes,
                     profile_id, profile_name, shell_setup, attempt_count, next_retry_at,
-                    requested_gpu
-                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?)
+                    requested_gpu, queue_name
+                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?)
                 """,
                 (
                     name,
@@ -123,6 +139,7 @@ class Database:
                     profile_name,
                     shell_setup,
                     requested_gpu,
+                    normalized_queue_name,
                 ),
             )
             conn.commit()
@@ -246,7 +263,20 @@ class Database:
     def list_tasks(self, history_limit: int = 100) -> dict[str, object]:
         with self._lock, self._connect() as conn:
             queued = conn.execute(
-                "SELECT * FROM tasks WHERE status = 'queued' ORDER BY queue_rank ASC, id ASC"
+                """
+                SELECT * FROM tasks
+                WHERE status = 'queued' AND queue_name = ?
+                ORDER BY queue_rank ASC, id ASC
+                """,
+                (NORMAL_QUEUE,),
+            ).fetchall()
+            urgent_queued = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'queued' AND queue_name = ?
+                ORDER BY queue_rank ASC, id ASC
+                """,
+                (URGENT_QUEUE,),
             ).fetchall()
             running = conn.execute(
                 "SELECT * FROM tasks WHERE status = 'running' ORDER BY started_at ASC, id ASC"
@@ -265,6 +295,7 @@ class Database:
             ).fetchone()
         return {
             "queued": [self._row_to_task(row) for row in queued],
+            "urgent_queued": [self._row_to_task(row) for row in urgent_queued],
             "running": [self._row_to_task(row) for row in running],
             "history": [self._row_to_task(row) for row in history],
             "queue_paused": paused_value is not None and paused_value["value"] == "1",
@@ -273,7 +304,28 @@ class Database:
     def list_queued_tasks(self) -> list[dict[str, object]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE status = 'queued' ORDER BY queue_rank ASC, id ASC"
+                """
+                SELECT * FROM tasks
+                WHERE status = 'queued'
+                ORDER BY CASE queue_name
+                    WHEN ? THEN 0
+                    ELSE 1
+                END ASC, queue_rank ASC, id ASC
+                """,
+                (URGENT_QUEUE,),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def list_queue_tasks(self, queue_name: str = NORMAL_QUEUE) -> list[dict[str, object]]:
+        normalized_queue_name = self._normalize_queue_name(queue_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'queued' AND queue_name = ?
+                ORDER BY queue_rank ASC, id ASC
+                """,
+                (normalized_queue_name,),
             ).fetchall()
         return [self._row_to_task(row) for row in rows]
 
@@ -284,19 +336,110 @@ class Database:
             ).fetchall()
         return [self._row_to_task(row) for row in rows]
 
-    def delete_queued_task(self, task_id: int) -> bool:
+    def delete_task(self, task_id: int) -> dict[str, object] | None:
         with self._lock, self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM tasks WHERE id = ? AND status = 'queued'",
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] == "running":
+                raise ValueError("运行中的任务不能删除")
+            conn.execute(
+                "DELETE FROM tasks WHERE id = ?",
                 (task_id,),
             )
             conn.commit()
-            return cursor.rowcount > 0
+        return self._row_to_task(row)
 
-    def reorder_queue(self, task_ids: Sequence[int]) -> list[dict[str, object]]:
+    def update_queued_task(
+        self,
+        task_id: int,
+        *,
+        name: str,
+        command: str,
+        cwd: str | None,
+        env: dict[str, str],
+        notes: str | None,
+        requested_gpu: int | None = None,
+        queue_name: str = NORMAL_QUEUE,
+        profile_id: int | None = None,
+        profile_name: str | None = None,
+        shell_setup: str | None = None,
+    ) -> dict[str, object]:
+        normalized_queue_name = self._normalize_queue_name(queue_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT queue_rank, queue_name
+                FROM tasks
+                WHERE id = ? AND status = 'queued'
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("只能修改排队中的任务")
+            current_queue_name = self._normalize_queue_name(row["queue_name"])
+            if current_queue_name == normalized_queue_name and row["queue_rank"] is not None:
+                queue_rank = int(row["queue_rank"])
+            else:
+                queue_rank = self._next_queue_rank(conn, normalized_queue_name)
+            conn.execute(
+                """
+                UPDATE tasks
+                SET name = ?,
+                    command = ?,
+                    cwd = ?,
+                    env = ?,
+                    notes = ?,
+                    requested_gpu = ?,
+                    queue_name = ?,
+                    queue_rank = ?,
+                    profile_id = ?,
+                    profile_name = ?,
+                    shell_setup = ?,
+                    exit_code = NULL,
+                    finished_at = NULL,
+                    next_retry_at = NULL
+                WHERE id = ? AND status = 'queued'
+                """,
+                (
+                    name,
+                    command,
+                    cwd,
+                    json.dumps(env),
+                    notes,
+                    requested_gpu,
+                    normalized_queue_name,
+                    queue_rank,
+                    profile_id,
+                    profile_name,
+                    shell_setup,
+                    task_id,
+                ),
+            )
+            conn.commit()
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        return task
+
+    def reorder_queue(
+        self,
+        task_ids: Sequence[int],
+        *,
+        queue_name: str = NORMAL_QUEUE,
+    ) -> list[dict[str, object]]:
+        normalized_queue_name = self._normalize_queue_name(queue_name)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT id FROM tasks WHERE status = 'queued' ORDER BY queue_rank ASC, id ASC"
+                """
+                SELECT id FROM tasks
+                WHERE status = 'queued' AND queue_name = ?
+                ORDER BY queue_rank ASC, id ASC
+                """,
+                (normalized_queue_name,),
             ).fetchall()
             current_ids = [row["id"] for row in rows]
             if current_ids != list(task_ids):
@@ -304,11 +447,15 @@ class Database:
                     raise ValueError("重排请求必须包含完整的排队任务列表")
             for idx, task_id in enumerate(task_ids, start=1):
                 conn.execute(
-                    "UPDATE tasks SET queue_rank = ? WHERE id = ? AND status = 'queued'",
-                    (idx, task_id),
+                    """
+                    UPDATE tasks
+                    SET queue_rank = ?
+                    WHERE id = ? AND status = 'queued' AND queue_name = ?
+                    """,
+                    (idx, task_id, normalized_queue_name),
                 )
             conn.commit()
-        return self.list_queued_tasks()
+        return self.list_queue_tasks(normalized_queue_name)
 
     def get_queue_paused(self) -> bool:
         with self._lock, self._connect() as conn:
@@ -456,7 +603,8 @@ class Database:
         exit_code: int | None,
     ) -> dict[str, object]:
         with self._lock, self._connect() as conn:
-            queue_rank = self._head_queue_rank(conn)
+            queue_name = self._queue_name_for_task(conn, task_id)
+            queue_rank = self._head_queue_rank(conn, queue_name)
             conn.execute(
                 """
                 UPDATE tasks
@@ -477,6 +625,39 @@ class Database:
             raise ValueError(f"任务不存在: {task_id}")
         return task
 
+    def preempt_running_task_to_queue_head(
+        self,
+        task_id: int,
+        *,
+        queue_name: str = NORMAL_QUEUE,
+    ) -> dict[str, object]:
+        normalized_queue_name = self._normalize_queue_name(queue_name)
+        with self._lock, self._connect() as conn:
+            queue_rank = self._head_queue_rank(conn, normalized_queue_name)
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'queued',
+                    queue_rank = ?,
+                    assigned_gpu = NULL,
+                    pid = NULL,
+                    exit_code = NULL,
+                    started_at = NULL,
+                    finished_at = NULL,
+                    next_retry_at = NULL,
+                    queue_name = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (queue_rank, normalized_queue_name, task_id),
+            )
+            conn.commit()
+        if cursor.rowcount == 0:
+            raise ValueError("只有运行中的任务可以抢占后回队列")
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        return task
+
     def clone_task_for_requeue(self, task_id: int) -> dict[str, object]:
         task = self.get_task(task_id)
         if task is None:
@@ -492,6 +673,7 @@ class Database:
             requested_gpu=task["requested_gpu"]
             if isinstance(task["requested_gpu"], int)
             else None,
+            queue_name=str(task.get("queue_name") or NORMAL_QUEUE),
             profile_id=task["profile_id"] if isinstance(task["profile_id"], int) else None,
             profile_name=task["profile_name"]
             if isinstance(task["profile_name"], str)
@@ -516,20 +698,45 @@ class Database:
             conn.commit()
             return cursor.rowcount
 
-    def _next_queue_rank(self, conn: sqlite3.Connection) -> int:
+    def _next_queue_rank(self, conn: sqlite3.Connection, queue_name: str) -> int:
         row = conn.execute(
-            "SELECT COALESCE(MAX(queue_rank), 0) AS max_rank FROM tasks WHERE status = 'queued'"
+            """
+            SELECT COALESCE(MAX(queue_rank), 0) AS max_rank
+            FROM tasks
+            WHERE status = 'queued' AND queue_name = ?
+            """,
+            (self._normalize_queue_name(queue_name),),
         ).fetchone()
         return int(row["max_rank"]) + 1
 
-    def _head_queue_rank(self, conn: sqlite3.Connection) -> int:
+    def _head_queue_rank(self, conn: sqlite3.Connection, queue_name: str) -> int:
         row = conn.execute(
-            "SELECT MIN(queue_rank) AS min_rank FROM tasks WHERE status = 'queued'"
+            """
+            SELECT MIN(queue_rank) AS min_rank
+            FROM tasks
+            WHERE status = 'queued' AND queue_name = ?
+            """,
+            (self._normalize_queue_name(queue_name),),
         ).fetchone()
         min_rank = row["min_rank"]
         if min_rank is None:
             return 1
         return int(min_rank) - 1
+
+    def _queue_name_for_task(self, conn: sqlite3.Connection, task_id: int) -> str:
+        row = conn.execute(
+            "SELECT queue_name FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        return self._normalize_queue_name(row["queue_name"])
+
+    def _normalize_queue_name(self, queue_name: str | None) -> str:
+        value = str(queue_name or NORMAL_QUEUE).strip().lower()
+        if value not in VALID_QUEUE_NAMES:
+            raise ValueError(f"未知队列类型: {value}")
+        return value
 
     def _ensure_columns(
         self,
@@ -571,6 +778,11 @@ class Database:
             "attempt_count": row["attempt_count"] if "attempt_count" in keys and row["attempt_count"] is not None else 0,
             "next_retry_at": row["next_retry_at"] if "next_retry_at" in keys else None,
             "requested_gpu": row["requested_gpu"] if "requested_gpu" in keys else None,
+            "queue_name": (
+                self._normalize_queue_name(row["queue_name"])
+                if "queue_name" in keys
+                else NORMAL_QUEUE
+            ),
         }
 
     def _row_to_profile(self, row: sqlite3.Row) -> dict[str, object]:

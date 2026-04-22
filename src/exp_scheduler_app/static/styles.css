@@ -177,6 +177,22 @@ body {
 .task-form { display: grid; gap: 1rem; grid-template-columns: 1fr; }
 .task-form label.full-span, .button-row.full-span { grid-column: 1 / -1; }
 .task-form label { display: flex; flex-direction: column; font-size: 0.85rem; font-weight: 500; gap: 0.4rem; color: var(--text-main); }
+.task-checkbox { justify-content: flex-end; }
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 42px;
+  padding: 0.65rem 0.8rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--card-border);
+  background: rgba(0, 0, 0, 0.3);
+}
+.checkbox-inline input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
 
 input, select, textarea {
   width: 100%;
@@ -238,6 +254,7 @@ button {
 .form-message { font-size: 0.8rem; color: #38bdf8; margin-top: 0.75rem; min-height: 1.2rem; transition: opacity 0.3s;}
 .subtle-note { font-size: 0.8rem; color: var(--text-muted); padding: 0.85rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: var(--radius-sm); }
 .button-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+.task-submit-button { width: 100%; }
 .hidden { display: none !important; }
 
 .gpu-settings-form {
@@ -287,6 +304,12 @@ button {
 /* 卡片特效 (Tasks & GPUs) */
 .stack-list, .history-list { display: flex; flex-direction: column; gap: 0.85rem; }
 .empty-state { text-align: center; padding: 2.5rem 1rem; color: var(--text-muted); font-size: 0.875rem; border: 1px dashed var(--panel-border); border-radius: var(--radius); background: rgba(0,0,0,0.2); }
+.stack-list.drag-over-zone,
+.empty-state.drag-over-zone {
+  border: 1px dashed rgba(56, 189, 248, 0.45);
+  background: rgba(56, 189, 248, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.18);
+}
 
 .task-card, .profile-card, .discovery-card {
   padding: 1.25rem;
@@ -296,6 +319,14 @@ button {
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   position: relative;
   overflow: hidden;
+}
+.task-card.urgent-task {
+  border-color: rgba(244, 63, 94, 0.22);
+  background: linear-gradient(180deg, rgba(244, 63, 94, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%);
+}
+.task-card.editing-task {
+  border-color: rgba(56, 189, 248, 0.45);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.25), 0 10px 30px -10px rgba(14, 165, 233, 0.28);
 }
 
 .task-card::before {
@@ -316,6 +347,11 @@ button {
 .task-card:hover::before { opacity: 1; }
 
 .task-card.dragging { opacity: 0.4; border-style: dashed; transform: scale(0.98); }
+.task-card.drag-over-card {
+  border-color: rgba(56, 189, 248, 0.45);
+  background: rgba(56, 189, 248, 0.08);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.22), 0 10px 30px -10px rgba(14, 165, 233, 0.26);
+}
 
 .task-topline { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
 .task-name { margin: 0 0 0.35rem; font-weight: 600; font-size: 1rem; letter-spacing: -0.01em;}
@@ -349,6 +385,25 @@ button {
 .task-meta span { background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); padding: 0.2rem 0.5rem; border-radius: 6px; }
 .task-notes { margin-top: 0.75rem; font-size: 0.85rem; color: var(--text-muted); }
 .task-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.25rem; }
+.queue-sections { display: flex; flex-direction: column; gap: 1.25rem; }
+.queue-subsection { display: flex; flex-direction: column; gap: 0.85rem; }
+.queue-subheader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.queue-subheader h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.urgent-badge {
+  color: #fb7185;
+  border-color: rgba(244, 63, 94, 0.2);
+  background: rgba(244, 63, 94, 0.08);
+}
 
 /* 沉浸式终端日志 Viewer */
 .log-viewer {
@@ -383,6 +438,26 @@ button {
   max-height: 550px; 
   overflow-y: auto; 
   white-space: pre-wrap; 
+}
+.log-terminal {
+  min-height: 380px;
+  max-height: 550px;
+  padding: 0.85rem 1rem;
+  overflow: hidden;
+}
+.log-terminal .xterm {
+  height: 100%;
+}
+.log-terminal .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.16) transparent;
+}
+.log-terminal .xterm-viewport::-webkit-scrollbar {
+  width: 6px;
+}
+.log-terminal .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.16);
+  border-radius: 999px;
 }
 
 /* GPU 资源池卡片 */

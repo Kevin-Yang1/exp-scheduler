@@ -1,20 +1,35 @@
 const state = {
-  tasks: { queued: [], running: [], history: [], queue_paused: false },
+  tasks: { queued: [], urgent_queued: [], running: [], history: [], queue_paused: false },
   gpus: [],
   settings: { allowed_gpu_ids: null },
   profiles: [],
   serverInfo: null,
   discovery: { conda_envs: [], venvs: [], search_roots: [], conda_executable: null },
   selectedLogTaskId: null,
+  logAutoFollow: true,
+  terminal: null,
+  terminalFitAddon: null,
+  terminalDecoder: null,
+  terminalSource: null,
+  terminalStreamTaskId: null,
+  terminalReconnectTimer: null,
+  editingTaskId: null,
+  duplicateSourceTaskId: null,
   logTimer: null,
   eventSource: null,
 };
+
+const LOG_AUTO_FOLLOW_THRESHOLD = 16;
 
 const nodes = {
   taskForm: document.getElementById("task-form"),
   formMessage: document.getElementById("form-message"),
   taskProfileSelect: document.getElementById("task-profile-select"),
   taskRequestedGpuSelect: document.getElementById("task-requested-gpu-select"),
+  taskIsUrgent: document.getElementById("task-is-urgent"),
+  taskSubmitButton: document.getElementById("task-submit-button"),
+  taskCancelEditButton: document.getElementById("task-cancel-edit-button"),
+  taskEditBanner: document.getElementById("task-edit-banner"),
   profilePreview: document.getElementById("profile-preview"),
   profileForm: document.getElementById("profile-form"),
   profileMessage: document.getElementById("profile-message"),
@@ -27,6 +42,7 @@ const nodes = {
   discoverySelect: document.getElementById("discovery-select"),
   importDiscoveryBtn: document.getElementById("import-discovery-btn"),
   discoveryMessage: document.getElementById("discovery-message"),
+  urgentQueueList: document.getElementById("urgent-queue-list"),
   queueList: document.getElementById("queue-list"),
   runningList: document.getElementById("running-list"),
   historyList: document.getElementById("history-list"),
@@ -39,6 +55,7 @@ const nodes = {
   queueToggle: document.getElementById("queue-toggle"),
   refreshButton: document.getElementById("refresh-button"),
   serverIdentityValue: document.getElementById("server-identity-value"),
+  logTerminal: document.getElementById("log-terminal"),
   logOutput: document.getElementById("log-output"),
   logTaskName: document.getElementById("log-task-name"),
   template: document.getElementById("task-card-template"),
@@ -78,9 +95,26 @@ function envToText(env) {
     .join("\n");
 }
 
+function taskToPayload(task, queueName = task.queue_name || "normal") {
+  return {
+    name: normalizeText(task.name),
+    command: task.command,
+    cwd: normalizeText(task.cwd),
+    notes: normalizeText(task.notes),
+    env: task.env || {},
+    is_urgent: queueName === "urgent",
+    requested_gpu: task.requested_gpu ?? null,
+    profile_id: task.profile_id ?? null,
+  };
+}
+
 function normalizeText(value) {
   const text = String(value || "").trim();
   return text || null;
+}
+
+function hasSelectOption(selectNode, value) {
+  return Array.from(selectNode?.options || []).some((option) => option.value === value);
 }
 
 function formatTime(iso) {
@@ -92,6 +126,7 @@ function formatTime(iso) {
 function taskMeta(task) {
   const meta = [];
   if (task.profile_name) meta.push(`环境: ${task.profile_name}`);
+  if (task.queue_name === "urgent") meta.push("队列: 紧急");
   if (task.cwd) meta.push(`目录: ${task.cwd}`);
   if (task.requested_gpu !== null && task.requested_gpu !== undefined) {
     meta.push(`指定GPU: ${task.requested_gpu}`);
@@ -113,7 +148,7 @@ function taskMeta(task) {
   return meta;
 }
 
-function renderTaskCard(task, kind) {
+function renderTaskCard(task, kind, queueName = null) {
   const fragment = nodes.template.content.cloneNode(true);
   const card = fragment.querySelector(".task-card");
   const name = fragment.querySelector(".task-name");
@@ -124,6 +159,12 @@ function renderTaskCard(task, kind) {
   const actions = fragment.querySelector(".task-actions");
 
   card.dataset.taskId = task.id;
+  if (task.queue_name === "urgent") {
+    card.classList.add("urgent-task");
+  }
+  if (kind === "queue" && state.editingTaskId === task.id) {
+    card.classList.add("editing-task");
+  }
   name.textContent = task.name;
   command.textContent = task.command;
   badge.textContent = task.status;
@@ -136,9 +177,12 @@ function renderTaskCard(task, kind) {
   });
 
   if (kind === "queue") {
+    const editButton = button("编辑", "mini-button", () => beginEditTask(task.id));
+    const topButton = button("置顶", "mini-button", () => moveTaskToBoundary(task.id, queueName || "normal", "start"));
+    const bottomButton = button("置底", "mini-button", () => moveTaskToBoundary(task.id, queueName || "normal", "end"));
     const deleteButton = button("删除", "mini-button danger-button", () => deleteTask(task.id));
-    actions.appendChild(deleteButton);
-    enableDrag(card);
+    actions.append(editButton, topButton, bottomButton, deleteButton);
+    enableDrag(card, queueName || "normal");
   } else {
     card.draggable = false;
   }
@@ -147,11 +191,28 @@ function renderTaskCard(task, kind) {
     const cancelButton = button("取消任务", "mini-button danger-button", () => cancelTask(task.id));
     const logButton = button("查看日志", "mini-button", () => selectLogTask(task.id));
     actions.append(cancelButton, logButton);
+    if (task.queue_name !== "urgent" && (state.tasks.urgent_queued || []).length) {
+      const preemptButton = button(
+        "抢占回普通队首",
+        "mini-button danger-button",
+        () => preemptTask(task.id),
+      );
+      actions.appendChild(preemptButton);
+    }
   }
 
   if (kind === "history") {
+    const duplicateButton = button("复用新建", "mini-button", () => beginDuplicateTask(task.id));
     const logButton = button("查看日志", "mini-button", () => selectLogTask(task.id));
-    actions.appendChild(logButton);
+    const deleteButton = button(
+      "删除记录",
+      "mini-button danger-button",
+      () => deleteTask(task.id, {
+        confirmMessage: `确认删除历史记录「${task.name}」吗？对应日志文件也会一并删除。`,
+        successMessage: `已删除历史任务 #${task.id}。`,
+      }),
+    );
+    actions.append(duplicateButton, logButton, deleteButton);
     if (["failed", "cancelled", "interrupted"].includes(task.status)) {
       const requeueButton = button("重新入队", "mini-button", () => requeueTask(task.id));
       actions.appendChild(requeueButton);
@@ -171,31 +232,292 @@ function button(label, className, onClick) {
 }
 
 let draggedTaskId = null;
+let draggedQueueName = null;
 
-function enableDrag(card) {
+function clearDragIndicators() {
+  document.querySelectorAll(".drag-over-card").forEach((node) => {
+    node.classList.remove("drag-over-card");
+  });
+  document.querySelectorAll(".drag-over-zone").forEach((node) => {
+    node.classList.remove("drag-over-zone");
+  });
+}
+
+function queueItemsFor(queueName) {
+  return queueName === "urgent" ? state.tasks.urgent_queued : state.tasks.queued;
+}
+
+function findQueuedTask(taskId) {
+  return [...(state.tasks.urgent_queued || []), ...(state.tasks.queued || [])].find(
+    (task) => task.id === taskId
+  ) || null;
+}
+
+function findTask(taskId) {
+  return [
+    ...(state.tasks.urgent_queued || []),
+    ...(state.tasks.queued || []),
+    ...(state.tasks.running || []),
+    ...(state.tasks.history || []),
+  ].find((task) => task.id === taskId) || null;
+}
+
+function shouldUseTerminalView(task) {
+  return Boolean(
+    task
+    && task.status === "running"
+    && window.Terminal
+    && window.FitAddon
+    && window.FitAddon.FitAddon
+  );
+}
+
+function isTextLogNearBottom() {
+  const distanceFromBottom = nodes.logOutput.scrollHeight
+    - nodes.logOutput.clientHeight
+    - nodes.logOutput.scrollTop;
+  return distanceFromBottom <= LOG_AUTO_FOLLOW_THRESHOLD;
+}
+
+function showTextLogView() {
+  nodes.logTerminal.classList.add("hidden");
+  nodes.logOutput.classList.remove("hidden");
+}
+
+function ensureTerminalView() {
+  if (!shouldUseTerminalView({ status: "running" })) {
+    return false;
+  }
+  if (!state.terminal) {
+    state.terminal = new window.Terminal({
+      allowProposedApi: false,
+      convertEol: false,
+      cursorBlink: false,
+      disableStdin: true,
+      fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
+      fontSize: 13,
+      scrollback: 5000,
+      theme: {
+        background: "#050505",
+        foreground: "#e4e4e7",
+        cursor: "#f4f4f5",
+        selectionBackground: "rgba(255,255,255,0.14)",
+      },
+    });
+    state.terminalFitAddon = new window.FitAddon.FitAddon();
+    state.terminal.loadAddon(state.terminalFitAddon);
+    state.terminal.open(nodes.logTerminal);
+    state.terminal.onScroll(() => {
+      state.logAutoFollow = isTerminalNearBottom();
+    });
+    window.addEventListener("resize", () => {
+      if (!nodes.logTerminal.classList.contains("hidden")) {
+        window.requestAnimationFrame(fitTerminalToContainer);
+      }
+    });
+  }
+  return true;
+}
+
+function showTerminalLogView() {
+  if (!ensureTerminalView()) {
+    showTextLogView();
+    return false;
+  }
+  nodes.logOutput.classList.add("hidden");
+  nodes.logTerminal.classList.remove("hidden");
+  window.requestAnimationFrame(fitTerminalToContainer);
+  return true;
+}
+
+function fitTerminalToContainer() {
+  if (!state.terminal || !state.terminalFitAddon || nodes.logTerminal.classList.contains("hidden")) {
+    return;
+  }
+  try {
+    state.terminalFitAddon.fit();
+  } catch (_error) {}
+  if (state.logAutoFollow) {
+    state.terminal.scrollToBottom();
+  }
+}
+
+function isTerminalNearBottom() {
+  if (!state.terminal) return true;
+  const buffer = state.terminal.buffer.active;
+  return (buffer.baseY - buffer.viewportY) <= 1;
+}
+
+function resetTerminalBuffer() {
+  if (!state.terminal) return;
+  state.terminal.reset();
+  state.terminalDecoder = new TextDecoder("utf-8");
+  state.logAutoFollow = true;
+}
+
+function decodeBase64Bytes(encoded) {
+  if (!encoded) return new Uint8Array();
+  const binary = window.atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function writeTerminalPayload(encoded, options = {}) {
+  if (!state.terminal) return;
+  const { reset = false } = options;
+  if (reset || !state.terminalDecoder) {
+    resetTerminalBuffer();
+  }
+  const bytes = decodeBase64Bytes(encoded);
+  const text = state.terminalDecoder.decode(bytes, { stream: true });
+  const shouldFollow = state.logAutoFollow;
+  if (!text && !bytes.length) {
+    if (shouldFollow) {
+      state.terminal.scrollToBottom();
+    }
+    return;
+  }
+  state.terminal.write(text, () => {
+    if (shouldFollow) {
+      state.terminal.scrollToBottom();
+      state.logAutoFollow = true;
+    }
+  });
+}
+
+function renderTextLogContent(content, options = {}) {
+  const { forceScrollToBottom = false } = options;
+  const nextContent = content || "(日志为空)";
+  const previousBottomOffset = nodes.logOutput.scrollHeight - nodes.logOutput.scrollTop;
+
+  showTextLogView();
+  if (nodes.logOutput.textContent !== nextContent) {
+    nodes.logOutput.textContent = nextContent;
+  }
+
+  if (forceScrollToBottom || state.logAutoFollow) {
+    nodes.logOutput.scrollTop = nodes.logOutput.scrollHeight;
+    state.logAutoFollow = true;
+    return;
+  }
+
+  nodes.logOutput.scrollTop = Math.max(0, nodes.logOutput.scrollHeight - previousBottomOffset);
+}
+
+async function moveTaskToBoundary(taskId, queueName, boundary) {
+  const ids = queueItemsFor(queueName).map((task) => task.id);
+  if (!ids.includes(taskId)) return;
+  const nextIds = ids.filter((id) => id !== taskId);
+  if (boundary === "start") {
+    nextIds.unshift(taskId);
+  } else {
+    nextIds.push(taskId);
+  }
+  if (ids.join(",") === nextIds.join(",")) return;
+  await reorderQueue(nextIds, queueName);
+}
+
+async function moveQueuedTask(taskId, targetQueueName, options = {}) {
+  const { targetIndex = null } = options;
+  const task = findQueuedTask(taskId);
+  if (!task) {
+    throw new Error("只能移动当前仍在队列中的任务。");
+  }
+  await api(`/api/tasks/${taskId}`, {
+    method: "PUT",
+    body: JSON.stringify(taskToPayload(task, targetQueueName)),
+  });
+  await refreshAll();
+  if (targetIndex === null) return;
+  const ids = queueItemsFor(targetQueueName)
+    .map((item) => item.id)
+    .filter((id) => id !== taskId);
+  const normalizedIndex = Math.max(0, Math.min(targetIndex, ids.length));
+  ids.splice(normalizedIndex, 0, taskId);
+  await reorderQueue(ids, targetQueueName);
+}
+
+function enableDrag(card, queueName) {
   card.addEventListener("dragstart", () => {
     draggedTaskId = Number(card.dataset.taskId);
+    draggedQueueName = queueName;
+    clearDragIndicators();
     card.classList.add("dragging");
   });
 
   card.addEventListener("dragend", () => {
     draggedTaskId = null;
+    draggedQueueName = null;
+    clearDragIndicators();
     card.classList.remove("dragging");
   });
 
   card.addEventListener("dragover", (event) => {
     event.preventDefault();
+    card.classList.add("drag-over-card");
+  });
+
+  card.addEventListener("dragleave", (event) => {
+    if (card.contains(event.relatedTarget)) return;
+    card.classList.remove("drag-over-card");
   });
 
   card.addEventListener("drop", async (event) => {
     event.preventDefault();
+    event.stopPropagation();
+    clearDragIndicators();
     const targetId = Number(card.dataset.taskId);
     if (!draggedTaskId || draggedTaskId === targetId) return;
-    const ids = state.tasks.queued.map((task) => task.id);
-    const fromIndex = ids.indexOf(draggedTaskId);
-    const toIndex = ids.indexOf(targetId);
-    ids.splice(toIndex, 0, ids.splice(fromIndex, 1)[0]);
-    await reorderQueue(ids);
+    try {
+      const ids = queueItemsFor(queueName).map((task) => task.id);
+      const toIndex = ids.indexOf(targetId);
+      if (draggedQueueName === queueName) {
+        const fromIndex = ids.indexOf(draggedTaskId);
+        ids.splice(toIndex, 0, ids.splice(fromIndex, 1)[0]);
+        await reorderQueue(ids, queueName);
+      } else {
+        await moveQueuedTask(draggedTaskId, queueName, { targetIndex: toIndex });
+      }
+    } catch (error) {
+      nodes.formMessage.textContent = error.message;
+    }
+  });
+}
+
+function enableQueueDropZone(node, queueName) {
+  if (!node) return;
+  node.addEventListener("dragover", (event) => {
+    if (!draggedTaskId) return;
+    event.preventDefault();
+    if (event.target.closest(".task-card")) return;
+    node.classList.add("drag-over-zone");
+  });
+  node.addEventListener("dragleave", (event) => {
+    if (node.contains(event.relatedTarget)) return;
+    node.classList.remove("drag-over-zone");
+  });
+  node.addEventListener("drop", async (event) => {
+    if (!draggedTaskId) return;
+    event.preventDefault();
+    if (event.target.closest(".task-card")) return;
+    clearDragIndicators();
+    try {
+      const ids = queueItemsFor(queueName).map((task) => task.id);
+      if (draggedQueueName === queueName) {
+        const nextIds = ids.filter((id) => id !== draggedTaskId);
+        nextIds.push(draggedTaskId);
+        if (ids.join(",") !== nextIds.join(",")) {
+          await reorderQueue(nextIds, queueName);
+        }
+      } else {
+        await moveQueuedTask(draggedTaskId, queueName, { targetIndex: ids.length });
+      }
+    } catch (error) {
+      nodes.formMessage.textContent = error.message;
+    }
   });
 }
 
@@ -314,11 +636,25 @@ function renderQueue() {
   nodes.queueList.innerHTML = "";
   if (!state.tasks.queued.length) {
     nodes.queueList.className = "stack-list empty-state";
-    nodes.queueList.textContent = "暂无排队任务";
+    nodes.queueList.textContent = "暂无普通排队任务";
     return;
   }
   nodes.queueList.className = "stack-list";
-  state.tasks.queued.forEach((task) => nodes.queueList.appendChild(renderTaskCard(task, "queue")));
+  state.tasks.queued.forEach((task) => nodes.queueList.appendChild(renderTaskCard(task, "queue", "normal")));
+}
+
+function renderUrgentQueue() {
+  if (!nodes.urgentQueueList) return;
+  nodes.urgentQueueList.innerHTML = "";
+  if (!state.tasks.urgent_queued.length) {
+    nodes.urgentQueueList.className = "stack-list empty-state";
+    nodes.urgentQueueList.textContent = "暂无紧急任务";
+    return;
+  }
+  nodes.urgentQueueList.className = "stack-list";
+  state.tasks.urgent_queued.forEach((task) => {
+    nodes.urgentQueueList.appendChild(renderTaskCard(task, "queue", "urgent"));
+  });
 }
 
 function renderRunning() {
@@ -328,13 +664,14 @@ function renderRunning() {
     nodes.runningList.textContent = "当前没有运行中的任务";
     if (!state.selectedLogTaskId) {
       nodes.logTaskName.textContent = "未选择任务";
-      nodes.logOutput.textContent = "请选择一个运行中任务查看日志。";
+      showTextLogView();
+      nodes.logOutput.textContent = "请选择一个任务查看日志。";
     }
     return;
   }
   nodes.runningList.className = "stack-list";
   state.tasks.running.forEach((task) => nodes.runningList.appendChild(renderTaskCard(task, "running")));
-  if (!state.selectedLogTaskId || !state.tasks.running.some((task) => task.id === state.selectedLogTaskId)) {
+  if (!state.selectedLogTaskId || !findTask(state.selectedLogTaskId)) {
     selectLogTask(state.tasks.running[0].id);
   }
 }
@@ -467,7 +804,15 @@ function renderDiscoveryList() {
 }
 
 async function loadTasks() {
-  state.tasks = await api("/api/tasks");
+  const payload = await api("/api/tasks");
+  state.tasks = {
+    queued: payload.queued || [],
+    urgent_queued: payload.urgent_queued || [],
+    running: payload.running || [],
+    history: payload.history || [],
+    queue_paused: Boolean(payload.queue_paused),
+  };
+  renderUrgentQueue();
   renderQueue();
   renderRunning();
   renderHistory();
@@ -528,29 +873,44 @@ async function scanProfiles() {
 
 async function refreshAll() {
   await Promise.all([loadTasks(), loadGpus(), loadProfiles(), loadSettings()]);
+  syncTaskEditState();
+  await syncLogSelectionState();
 }
 
-async function createTask(event) {
+async function saveTask(event) {
   event.preventDefault();
   const formData = new FormData(nodes.taskForm);
+  const editingTaskId = normalizeText(formData.get("task_id"));
   try {
     const env = parseEnv(formData.get("env") || "");
-    await api("/api/tasks", {
-      method: "POST",
-      body: JSON.stringify({
-        name: normalizeText(formData.get("name")),
-        command: formData.get("command"),
-        cwd: normalizeText(formData.get("cwd")),
-        notes: normalizeText(formData.get("notes")),
-        env,
-        requested_gpu: currentRequestedGpuId(),
-        profile_id: currentProfileId(),
-      }),
-    });
-    nodes.taskForm.reset();
-    renderTaskGpuSelect();
-    renderProfilePreview();
-    nodes.formMessage.textContent = "任务已加入队列。";
+    const payload = {
+      name: normalizeText(formData.get("name")),
+      command: formData.get("command"),
+      cwd: normalizeText(formData.get("cwd")),
+      notes: normalizeText(formData.get("notes")),
+      env,
+      is_urgent: Boolean(nodes.taskIsUrgent?.checked),
+      requested_gpu: currentRequestedGpuId(),
+      profile_id: currentProfileId(),
+    };
+    if (editingTaskId) {
+      await api(`/api/tasks/${editingTaskId}`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      nodes.formMessage.textContent = `任务 #${editingTaskId} 已更新。`;
+    } else {
+      await api("/api/tasks", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      if (state.duplicateSourceTaskId) {
+        nodes.formMessage.textContent = `已根据任务 #${state.duplicateSourceTaskId} 创建新任务。`;
+      } else {
+        nodes.formMessage.textContent = "任务已加入队列。";
+      }
+    }
+    resetTaskForm({ keepMessage: true });
     await refreshAll();
   } catch (error) {
     nodes.formMessage.textContent = error.message;
@@ -656,15 +1016,29 @@ async function importDiscoveredProfile(item) {
   }
 }
 
-async function deleteTask(taskId) {
-  await api(`/api/tasks/${taskId}`, { method: "DELETE" });
-  await refreshAll();
+async function deleteTask(taskId, options = {}) {
+  const { confirmMessage = "", successMessage = "" } = options;
+  if (confirmMessage && !window.confirm(confirmMessage)) {
+    return;
+  }
+  try {
+    await api(`/api/tasks/${taskId}`, { method: "DELETE" });
+    if (state.selectedLogTaskId === taskId) {
+      clearLogSelection("所选日志任务已删除。");
+    }
+    await refreshAll();
+    if (successMessage) {
+      nodes.formMessage.textContent = successMessage;
+    }
+  } catch (error) {
+    nodes.formMessage.textContent = error.message;
+  }
 }
 
-async function reorderQueue(taskIds) {
+async function reorderQueue(taskIds, queueName = "normal") {
   await api("/api/tasks/reorder", {
     method: "POST",
-    body: JSON.stringify({ task_ids: taskIds }),
+    body: JSON.stringify({ task_ids: taskIds, queue_name: queueName }),
   });
   await refreshAll();
 }
@@ -674,9 +1048,114 @@ async function cancelTask(taskId) {
   await refreshAll();
 }
 
+async function preemptTask(taskId) {
+  const confirmed = window.confirm(
+    "这会终止当前运行中的任务，并把它放回普通队列队首，让紧急队列先执行。是否继续？"
+  );
+  if (!confirmed) return;
+  await api(`/api/tasks/${taskId}/preempt`, { method: "POST" });
+  await refreshAll();
+}
+
 async function requeueTask(taskId) {
   await api(`/api/tasks/${taskId}/requeue`, { method: "POST" });
   await refreshAll();
+}
+
+function beginEditTask(taskId) {
+  const task = findQueuedTask(taskId);
+  if (!task) {
+    nodes.formMessage.textContent = "只能编辑当前仍在队列中的任务。";
+    return;
+  }
+  state.duplicateSourceTaskId = null;
+  state.editingTaskId = task.id;
+  nodes.taskForm.elements.task_id.value = String(task.id);
+  nodes.taskForm.elements.name.value = task.name || "";
+  nodes.taskForm.elements.command.value = task.command || "";
+  nodes.taskForm.elements.cwd.value = task.cwd || "";
+  nodes.taskForm.elements.env.value = envToText(task.env);
+  nodes.taskForm.elements.notes.value = task.notes || "";
+  nodes.taskIsUrgent.checked = task.queue_name === "urgent";
+
+  const profileValue = task.profile_id !== null && task.profile_id !== undefined
+    ? String(task.profile_id)
+    : "";
+  nodes.taskProfileSelect.value = hasSelectOption(nodes.taskProfileSelect, profileValue)
+    ? profileValue
+    : "";
+
+  const gpuValue = task.requested_gpu !== null && task.requested_gpu !== undefined
+    ? String(task.requested_gpu)
+    : "";
+  nodes.taskRequestedGpuSelect.value = hasSelectOption(nodes.taskRequestedGpuSelect, gpuValue)
+    ? gpuValue
+    : "";
+
+  if (nodes.taskSubmitButton) {
+    nodes.taskSubmitButton.textContent = "保存任务修改";
+  }
+  if (nodes.taskCancelEditButton) {
+    nodes.taskCancelEditButton.textContent = "取消编辑";
+    nodes.taskCancelEditButton.classList.remove("hidden");
+  }
+  if (nodes.taskEditBanner) {
+    nodes.taskEditBanner.textContent = `正在编辑队列任务 #${task.id}「${task.name}」`;
+    nodes.taskEditBanner.classList.remove("hidden");
+  }
+  renderProfilePreview();
+  renderUrgentQueue();
+  renderQueue();
+  nodes.formMessage.textContent = `已载入任务 #${task.id}，保存后会原地更新。`;
+  nodes.taskForm.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function beginDuplicateTask(taskId) {
+  const task = findTask(taskId);
+  if (!task) {
+    nodes.formMessage.textContent = "找不到要复用的任务。";
+    return;
+  }
+  state.editingTaskId = null;
+  state.duplicateSourceTaskId = task.id;
+  nodes.taskForm.elements.task_id.value = "";
+  nodes.taskForm.elements.name.value = task.name || "";
+  nodes.taskForm.elements.command.value = task.command || "";
+  nodes.taskForm.elements.cwd.value = task.cwd || "";
+  nodes.taskForm.elements.env.value = envToText(task.env);
+  nodes.taskForm.elements.notes.value = task.notes || "";
+  nodes.taskIsUrgent.checked = task.queue_name === "urgent";
+
+  const profileValue = task.profile_id !== null && task.profile_id !== undefined
+    ? String(task.profile_id)
+    : "";
+  nodes.taskProfileSelect.value = hasSelectOption(nodes.taskProfileSelect, profileValue)
+    ? profileValue
+    : "";
+
+  const gpuValue = task.requested_gpu !== null && task.requested_gpu !== undefined
+    ? String(task.requested_gpu)
+    : "";
+  nodes.taskRequestedGpuSelect.value = hasSelectOption(nodes.taskRequestedGpuSelect, gpuValue)
+    ? gpuValue
+    : "";
+
+  if (nodes.taskSubmitButton) {
+    nodes.taskSubmitButton.textContent = "按当前内容创建新任务";
+  }
+  if (nodes.taskCancelEditButton) {
+    nodes.taskCancelEditButton.textContent = "取消复用";
+    nodes.taskCancelEditButton.classList.remove("hidden");
+  }
+  if (nodes.taskEditBanner) {
+    nodes.taskEditBanner.textContent = `正在基于任务 #${task.id} 复用新建；保存后会创建一个新的任务。`;
+    nodes.taskEditBanner.classList.remove("hidden");
+  }
+  renderProfilePreview();
+  renderUrgentQueue();
+  renderQueue();
+  nodes.formMessage.textContent = `已从任务 #${task.id} 载入参数，你可以改一部分后直接新建。`;
+  nodes.taskForm.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function deleteProfile(profileId) {
@@ -704,28 +1183,140 @@ async function toggleQueue() {
 
 async function selectLogTask(taskId) {
   state.selectedLogTaskId = taskId;
-  const task = state.tasks.running.find((item) => item.id === taskId)
-    || state.tasks.history.find((item) => item.id === taskId);
+  state.logAutoFollow = true;
+  const task = findTask(taskId);
   nodes.logTaskName.textContent = task ? task.name : `任务 ${taskId}`;
-  await loadLog();
+  await loadLog({ forceScrollToBottom: true });
 }
 
-async function loadLog() {
+function clearLogSelection(message = "请选择一个任务查看日志。") {
+  closeTerminalStream();
+  state.selectedLogTaskId = null;
+  state.logAutoFollow = true;
+  nodes.logTaskName.textContent = "未选择任务";
+  showTextLogView();
+  nodes.logOutput.textContent = message;
+}
+
+async function syncLogSelectionState() {
   if (!state.selectedLogTaskId) return;
+  if (findTask(state.selectedLogTaskId)) return;
+  if (state.tasks.running.length) {
+    await selectLogTask(state.tasks.running[0].id);
+    return;
+  }
+  clearLogSelection("所选日志任务已不存在。");
+}
+
+function closeTerminalStream() {
+  if (state.terminalReconnectTimer) {
+    clearTimeout(state.terminalReconnectTimer);
+    state.terminalReconnectTimer = null;
+  }
+  state.terminalSource?.close();
+  state.terminalSource = null;
+  state.terminalStreamTaskId = null;
+  state.terminalDecoder = null;
+}
+
+function scheduleTerminalReconnect(taskId) {
+  if (state.terminalReconnectTimer) {
+    clearTimeout(state.terminalReconnectTimer);
+  }
+  state.terminalReconnectTimer = setTimeout(() => {
+    state.terminalReconnectTimer = null;
+    if (state.selectedLogTaskId !== taskId) return;
+    const task = findTask(taskId);
+    if (!shouldUseTerminalView(task)) return;
+    connectTerminalStream(taskId, { resetTerminal: false });
+  }, 1500);
+}
+
+function connectTerminalStream(taskId, options = {}) {
+  const { resetTerminal = false } = options;
+  if (!showTerminalLogView()) {
+    return false;
+  }
+  if (state.terminalStreamTaskId === taskId && state.terminalSource) {
+    if (resetTerminal) {
+      resetTerminalBuffer();
+    }
+    fitTerminalToContainer();
+    return true;
+  }
+
+  closeTerminalStream();
+  if (resetTerminal) {
+    resetTerminalBuffer();
+  }
+
+  const source = new EventSource(`/api/tasks/${taskId}/terminal/stream`);
+  state.terminalSource = source;
+  state.terminalStreamTaskId = taskId;
+
+  source.addEventListener("snapshot", (event) => {
+    if (state.selectedLogTaskId !== taskId) return;
+    const payload = JSON.parse(event.data);
+    showTerminalLogView();
+    writeTerminalPayload(payload.data, { reset: true });
+    fitTerminalToContainer();
+  });
+
+  source.addEventListener("chunk", (event) => {
+    if (state.selectedLogTaskId !== taskId) return;
+    const payload = JSON.parse(event.data);
+    writeTerminalPayload(payload.data);
+  });
+
+  source.addEventListener("exit", () => {
+    closeTerminalStream();
+  });
+
+  source.onerror = () => {
+    const task = findTask(taskId);
+    closeTerminalStream();
+    if (state.selectedLogTaskId === taskId && task && task.status === "running") {
+      scheduleTerminalReconnect(taskId);
+    }
+  };
+
+  return true;
+}
+
+async function loadTextLog(options = {}) {
+  if (!state.selectedLogTaskId) return;
+  closeTerminalStream();
   try {
     const payload = await api(`/api/tasks/${state.selectedLogTaskId}/log`);
-    nodes.logOutput.textContent = payload.content || "(日志为空)";
-    nodes.logOutput.scrollTop = nodes.logOutput.scrollHeight;
+    renderTextLogContent(payload.content, options);
   } catch (error) {
-    nodes.logOutput.textContent = `日志加载失败: ${error.message}`;
+    renderTextLogContent(`日志加载失败: ${error.message}`, options);
   }
+}
+
+async function loadLog(options = {}) {
+  if (!state.selectedLogTaskId) return;
+  const task = findTask(state.selectedLogTaskId);
+  nodes.logTaskName.textContent = task ? task.name : `任务 ${state.selectedLogTaskId}`;
+  if (shouldUseTerminalView(task)) {
+    const connected = connectTerminalStream(state.selectedLogTaskId, {
+      resetTerminal: Boolean(options.forceScrollToBottom),
+    });
+    if (connected) {
+      return;
+    }
+  }
+  await loadTextLog(options);
 }
 
 function startLogPolling() {
   if (state.logTimer) clearInterval(state.logTimer);
   state.logTimer = setInterval(() => {
     if (state.selectedLogTaskId) {
-      loadLog();
+      const task = findTask(state.selectedLogTaskId);
+      if (!shouldUseTerminalView(task)) {
+        loadLog();
+      }
     }
   }, 2000);
 }
@@ -760,6 +1351,40 @@ function beginEditProfile(profileId) {
   nodes.profileForm.scrollIntoView({ behavior: 'smooth' });
 }
 
+function resetTaskForm(options = {}) {
+  const { keepMessage = false, message = "" } = options;
+  nodes.taskForm.reset();
+  nodes.taskForm.elements.task_id.value = "";
+  state.editingTaskId = null;
+  state.duplicateSourceTaskId = null;
+  if (nodes.taskSubmitButton) {
+    nodes.taskSubmitButton.textContent = "加入队列排队";
+  }
+  if (nodes.taskCancelEditButton) {
+    nodes.taskCancelEditButton.textContent = "取消编辑";
+    nodes.taskCancelEditButton.classList.add("hidden");
+  }
+  if (nodes.taskEditBanner) {
+    nodes.taskEditBanner.textContent = "";
+    nodes.taskEditBanner.classList.add("hidden");
+  }
+  renderTaskGpuSelect();
+  renderProfilePreview();
+  renderUrgentQueue();
+  renderQueue();
+  if (!keepMessage) {
+    nodes.formMessage.textContent = message;
+  }
+}
+
+function syncTaskEditState() {
+  if (!state.editingTaskId) return;
+  if (findQueuedTask(state.editingTaskId)) return;
+  resetTaskForm({
+    message: "正在编辑的任务已不在队列中，已退出编辑模式。",
+  });
+}
+
 function resetProfileForm() {
   nodes.profileForm.reset();
   nodes.profileForm.elements.profile_id.value = "";
@@ -771,11 +1396,19 @@ function resetProfileForm() {
   nodes.profileMessage.textContent = "";
 }
 
-nodes.taskForm.addEventListener("submit", createTask);
+nodes.taskForm.addEventListener("submit", saveTask);
+nodes.taskCancelEditButton.addEventListener("click", () => {
+  const message = state.duplicateSourceTaskId
+    ? "已取消复用草稿。"
+    : "已取消任务编辑。";
+  resetTaskForm({ message });
+});
 nodes.profileForm.addEventListener("submit", saveProfile);
 nodes.profileCancelButton.addEventListener("click", resetProfileForm);
 nodes.profileScanButton.addEventListener("click", scanProfiles);
 nodes.taskProfileSelect.addEventListener("change", renderProfilePreview);
+enableQueueDropZone(nodes.urgentQueueList, "urgent");
+enableQueueDropZone(nodes.queueList, "normal");
 if (nodes.gpuSettingsForm) {
   nodes.gpuSettingsForm.addEventListener("submit", saveGpuSettings);
 }
@@ -784,6 +1417,9 @@ if (nodes.gpuAllowAllButton) {
 }
 nodes.queueToggle.addEventListener("click", toggleQueue);
 nodes.refreshButton.addEventListener("click", refreshAll);
+nodes.logOutput.addEventListener("scroll", () => {
+  state.logAutoFollow = isTextLogNearBottom();
+});
 
 if (nodes.manageProfileSelect) {
   nodes.manageProfileSelect.addEventListener("change", handleManageProfileSelect);
