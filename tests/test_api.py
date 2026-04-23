@@ -593,6 +593,11 @@ def test_terminal_stream_status_codes_for_missing_and_non_running_tasks(tmp_path
     with make_client(tmp_path) as client:
         missing = client.get("/api/tasks/999999/terminal/stream")
         assert missing.status_code == 404
+        missing_resize = client.post(
+            "/api/tasks/999999/terminal/resize",
+            json={"cols": 120, "rows": 30},
+        )
+        assert missing_resize.status_code == 404
 
         queued = client.post(
             "/api/tasks",
@@ -609,6 +614,11 @@ def test_terminal_stream_status_codes_for_missing_and_non_running_tasks(tmp_path
 
         queued_stream = client.get(f"/api/tasks/{queued_id}/terminal/stream")
         assert queued_stream.status_code == 409
+        queued_resize = client.post(
+            f"/api/tasks/{queued_id}/terminal/resize",
+            json={"cols": 120, "rows": 30},
+        )
+        assert queued_resize.status_code == 409
 
         client.fake_gpu_provider.set_gpus([gpu(0, idle=True)])
         history = client.post(
@@ -635,6 +645,65 @@ def test_terminal_stream_status_codes_for_missing_and_non_running_tasks(tmp_path
 
         history_stream = client.get(f"/api/tasks/{history_id}/terminal/stream")
         assert history_stream.status_code == 409
+        history_resize = client.post(
+            f"/api/tasks/{history_id}/terminal/resize",
+            json={"cols": 120, "rows": 30},
+        )
+        assert history_resize.status_code == 409
+
+
+def test_terminal_resize_endpoint_updates_running_pty_size(tmp_path):
+    with make_client(tmp_path) as client:
+        client.fake_gpu_provider.set_gpus([gpu(0, idle=True)])
+        create = client.post(
+            "/api/tasks",
+            json={
+                "name": "terminal-resize",
+                "command": command(
+                    "import os, sys, time; "
+                    "print('ready', flush=True); "
+                    "time.sleep(1.2); "
+                    "size = os.get_terminal_size(sys.stdout.fileno()); "
+                    "print(f'term={size.columns}x{size.lines}', flush=True)"
+                ),
+                "cwd": None,
+                "env": {},
+                "notes": None,
+            },
+        )
+        create.raise_for_status()
+        task_id = create.json()["task"]["id"]
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == task_id
+            ),
+            timeout=4,
+        )
+
+        resize = client.post(
+            f"/api/tasks/{task_id}/terminal/resize",
+            json={"cols": 120, "rows": 30},
+        )
+        resize.raise_for_status()
+
+        session = client.app.state.scheduler._terminal_sessions[task_id]
+        assert session.cols == 120
+        assert session.rows == 30
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+
+        log_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        assert "term=120x30" in log_payload["content"]
 
 
 def test_terminal_stream_emits_snapshot_chunk_and_exit_for_running_task(tmp_path):

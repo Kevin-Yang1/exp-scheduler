@@ -442,11 +442,13 @@ button {
 .log-terminal {
   min-height: 380px;
   max-height: 550px;
-  padding: 0.85rem 1rem;
+  height: 420px;
   overflow: hidden;
+  position: relative;
 }
 .log-terminal .xterm {
   height: 100%;
+  padding: 0.85rem 1rem;
 }
 .log-terminal .xterm-viewport {
   scrollbar-width: thin;

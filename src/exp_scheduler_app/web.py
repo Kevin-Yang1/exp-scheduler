@@ -59,6 +59,11 @@ class UpdateSettingsRequest(BaseModel):
     allowed_gpu_ids: list[int] | None = None
 
 
+class ResizeTerminalRequest(BaseModel):
+    cols: int = Field(ge=2, le=1000)
+    rows: int = Field(ge=1, le=1000)
+
+
 def create_app(
     config: SchedulerConfig,
     *,
@@ -342,6 +347,23 @@ def create_app(
                 await scheduler.unsubscribe_terminal_stream(task_id, subscriber)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @app.post("/api/tasks/{task_id}/terminal/resize")
+    async def resize_task_terminal_endpoint(
+        task_id: int,
+        payload: ResizeTerminalRequest,
+    ) -> dict[str, object]:
+        try:
+            await scheduler.resize_terminal(
+                task_id,
+                cols=payload.cols,
+                rows=payload.rows,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "不存在" in message else 409
+            raise HTTPException(status_code=status_code, detail=message) from exc
+        return {"ok": True}
 
     @app.get("/api/events")
     async def events_endpoint() -> StreamingResponse:

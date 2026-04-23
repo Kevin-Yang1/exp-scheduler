@@ -12,6 +12,9 @@ const state = {
   terminalDecoder: null,
   terminalSource: null,
   terminalStreamTaskId: null,
+  terminalResizeObserver: null,
+  terminalResizeTimer: null,
+  terminalSizeKey: null,
   terminalReconnectTimer: null,
   editingTaskId: null,
   duplicateSourceTaskId: null,
@@ -296,6 +299,7 @@ function ensureTerminalView() {
       disableStdin: true,
       fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
       fontSize: 13,
+      lineHeight: 1.1,
       scrollback: 5000,
       theme: {
         background: "#050505",
@@ -310,6 +314,23 @@ function ensureTerminalView() {
     state.terminal.onScroll(() => {
       state.logAutoFollow = isTerminalNearBottom();
     });
+    if ("ResizeObserver" in window) {
+      state.terminalResizeObserver = new ResizeObserver(() => {
+        if (!nodes.logTerminal.classList.contains("hidden")) {
+          window.requestAnimationFrame(fitTerminalToContainer);
+        }
+      });
+      state.terminalResizeObserver.observe(nodes.logTerminal);
+    }
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready
+        .then(() => {
+          if (!nodes.logTerminal.classList.contains("hidden")) {
+            window.requestAnimationFrame(fitTerminalToContainer);
+          }
+        })
+        .catch(() => {});
+    }
     window.addEventListener("resize", () => {
       if (!nodes.logTerminal.classList.contains("hidden")) {
         window.requestAnimationFrame(fitTerminalToContainer);
@@ -320,12 +341,12 @@ function ensureTerminalView() {
 }
 
 function showTerminalLogView() {
+  nodes.logOutput.classList.add("hidden");
+  nodes.logTerminal.classList.remove("hidden");
   if (!ensureTerminalView()) {
     showTextLogView();
     return false;
   }
-  nodes.logOutput.classList.add("hidden");
-  nodes.logTerminal.classList.remove("hidden");
   window.requestAnimationFrame(fitTerminalToContainer);
   return true;
 }
@@ -337,9 +358,54 @@ function fitTerminalToContainer() {
   try {
     state.terminalFitAddon.fit();
   } catch (_error) {}
+  scheduleTerminalResize();
   if (state.logAutoFollow) {
     state.terminal.scrollToBottom();
   }
+}
+
+function scheduleTerminalResize() {
+  if (state.terminalResizeTimer) {
+    clearTimeout(state.terminalResizeTimer);
+  }
+  const taskId = state.terminalStreamTaskId || state.selectedLogTaskId;
+  if (!taskId || !state.terminal || nodes.logTerminal.classList.contains("hidden")) {
+    return;
+  }
+  const task = findTask(taskId);
+  if (!shouldUseTerminalView(task)) {
+    return;
+  }
+  const cols = Math.max(2, state.terminal.cols || 0);
+  const rows = Math.max(1, state.terminal.rows || 0);
+  if (!cols || !rows) {
+    return;
+  }
+  const nextSizeKey = `${taskId}:${cols}x${rows}`;
+  if (state.terminalSizeKey === nextSizeKey) {
+    return;
+  }
+  state.terminalResizeTimer = setTimeout(async () => {
+    state.terminalResizeTimer = null;
+    if (!state.terminal) return;
+    const currentTask = findTask(taskId);
+    if (!shouldUseTerminalView(currentTask)) return;
+    const currentCols = Math.max(2, state.terminal.cols || 0);
+    const currentRows = Math.max(1, state.terminal.rows || 0);
+    if (!currentCols || !currentRows) return;
+    const currentSizeKey = `${taskId}:${currentCols}x${currentRows}`;
+    if (state.terminalSizeKey === currentSizeKey) return;
+    try {
+      await api(`/api/tasks/${taskId}/terminal/resize`, {
+        method: "POST",
+        body: JSON.stringify({
+          cols: currentCols,
+          rows: currentRows,
+        }),
+      });
+      state.terminalSizeKey = currentSizeKey;
+    } catch (_error) {}
+  }, 120);
 }
 
 function isTerminalNearBottom() {
@@ -1209,6 +1275,10 @@ async function syncLogSelectionState() {
 }
 
 function closeTerminalStream() {
+  if (state.terminalResizeTimer) {
+    clearTimeout(state.terminalResizeTimer);
+    state.terminalResizeTimer = null;
+  }
   if (state.terminalReconnectTimer) {
     clearTimeout(state.terminalReconnectTimer);
     state.terminalReconnectTimer = null;
@@ -1216,6 +1286,7 @@ function closeTerminalStream() {
   state.terminalSource?.close();
   state.terminalSource = null;
   state.terminalStreamTaskId = null;
+  state.terminalSizeKey = null;
   state.terminalDecoder = null;
 }
 

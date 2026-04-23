@@ -21,12 +21,15 @@ from .events import EventBroker
 from .gpu import GPUInfo, query_gpus
 from .profile_discovery import discover_installed_environments
 from .terminal import (
+    DEFAULT_TERMINAL_COLUMNS,
+    DEFAULT_TERMINAL_ROWS,
     TERMINAL_CHUNK_BYTES,
     TERMINAL_SNAPSHOT_BYTES,
     TerminalSession,
     TerminalSubscriber,
     read_text,
     read_text_tail,
+    set_terminal_window_size,
 )
 
 
@@ -435,6 +438,27 @@ class SchedulerService:
                 return
             session.unsubscribe(subscriber)
 
+    async def resize_terminal(
+        self,
+        task_id: int,
+        *,
+        cols: int,
+        rows: int,
+    ) -> None:
+        task = self.database.get_task(task_id)
+        if task is None:
+            raise ValueError("任务不存在")
+        if task.get("status") != "running":
+            raise ValueError("终端尺寸只支持运行中的任务")
+        async with self._lock:
+            session = self._terminal_sessions.get(task_id)
+            if session is None or session.closed:
+                raise ValueError("运行中的任务终端不可用")
+            try:
+                session.resize(cols=cols, rows=rows)
+            except OSError as exc:
+                raise ValueError("运行中的任务终端不可用") from exc
+
     async def _scheduler_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -501,11 +525,18 @@ class SchedulerService:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "ab")
         master_fd, slave_fd = pty.openpty()
+        terminal_cols, terminal_rows = set_terminal_window_size(
+            slave_fd,
+            cols=DEFAULT_TERMINAL_COLUMNS,
+            rows=DEFAULT_TERMINAL_ROWS,
+        )
         terminal_session = TerminalSession(
             task_id=task_id,
             master_fd=master_fd,
             log_path=log_path,
             log_file=log_file,
+            cols=terminal_cols,
+            rows=terminal_rows,
         )
         self._append_terminal_bytes(
             terminal_session,
@@ -525,6 +556,8 @@ class SchedulerService:
             task=task,
             gpu_id=gpu_id,
             next_attempt=next_attempt,
+            terminal_cols=terminal_session.cols,
+            terminal_rows=terminal_session.rows,
         )
         cwd = task["cwd"] if isinstance(task["cwd"], str) and task["cwd"] else None
         launch_command = self._build_launch_command(task)
@@ -863,6 +896,8 @@ class SchedulerService:
         task: dict[str, object],
         gpu_id: int,
         next_attempt: int,
+        terminal_cols: int = DEFAULT_TERMINAL_COLUMNS,
+        terminal_rows: int = DEFAULT_TERMINAL_ROWS,
     ) -> dict[str, str]:
         env = self._sanitize_scheduler_python_env(os.environ.copy())
         env.update({key: str(value) for key, value in dict(task["env"]).items()})
@@ -870,6 +905,8 @@ class SchedulerService:
         env["EXP_SCHEDULER_ATTEMPT"] = str(next_attempt)
         env["EXP_SCHEDULER_MAX_RETRIES"] = str(self.config.auto_retry_max_retries)
         env.setdefault("TERM", "xterm-256color")
+        env.setdefault("COLUMNS", str(terminal_cols))
+        env.setdefault("LINES", str(terminal_rows))
         env.setdefault("PYTHONUNBUFFERED", "1")
         return env
 

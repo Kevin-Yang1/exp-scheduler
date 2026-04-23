@@ -214,10 +214,38 @@ def test_task_environment_strips_scheduler_virtualenv(tmp_path):
     assert env["CUDA_VISIBLE_DEVICES"] == "1"
     assert env["EXP_SCHEDULER_ATTEMPT"] == "2"
     assert env["EXP_SCHEDULER_MAX_RETRIES"] == "0"
+    assert env["COLUMNS"] == "160"
+    assert env["LINES"] == "48"
     assert env["PATH"] == "/usr/local/bin:/usr/bin"
     assert "VIRTUAL_ENV" not in env
     assert "VIRTUAL_ENV_PROMPT" not in env
     assert "_OLD_VIRTUAL_PATH" not in env
+
+
+def test_running_task_receives_default_terminal_size(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command(
+                "import os, sys; "
+                "size = os.get_terminal_size(sys.stdout.fileno()); "
+                "print(f'term={size.columns}x{size.lines}', flush=True)"
+            ),
+            name="term-size",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+
+        log_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        assert "term=160x48" in log_payload["content"]
 
 
 def test_scheduler_runs_task_when_gpu_becomes_free(tmp_path):
