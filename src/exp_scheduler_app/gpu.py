@@ -33,12 +33,14 @@ class GPUInfo:
             and not scheduler_occupied
             and globally_enabled
         )
+        free_memory_mb = max(0, self.memory_total_mb - self.memory_used_mb)
         return {
             "index": self.index,
             "uuid": self.uuid,
             "name": self.name,
             "memory_total_mb": self.memory_total_mb,
             "memory_used_mb": self.memory_used_mb,
+            "memory_free_mb": free_memory_mb,
             "utilization_gpu": self.utilization_gpu,
             "has_processes": self.has_processes,
             "scheduler_occupied": scheduler_occupied,

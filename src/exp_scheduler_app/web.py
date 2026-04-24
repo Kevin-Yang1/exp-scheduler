@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from .config import SchedulerConfig
 from .database import Database
 from .scheduler import SchedulerService
+from .system_terminal import NvitopTerminalService
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -31,6 +32,7 @@ class CreateTaskRequest(BaseModel):
     notes: str | None = None
     is_urgent: bool = False
     requested_gpu: int | None = None
+    gpu_memory_budget_mb: int | None = Field(default=None, gt=0)
     profile_id: int | None = None
 
 
@@ -59,6 +61,11 @@ class UpdateSettingsRequest(BaseModel):
     allowed_gpu_ids: list[int] | None = None
 
 
+class ScheduleGpuRequest(BaseModel):
+    action: str
+    run_at: str
+
+
 class ResizeTerminalRequest(BaseModel):
     cols: int = Field(ge=2, le=1000)
     rows: int = Field(ge=1, le=1000)
@@ -70,6 +77,7 @@ def create_app(
     gpu_provider=None,
     profile_discovery_provider=None,
     autostart: bool = True,
+    nvitop_command: str = "nvitop",
 ) -> FastAPI:
     database = Database(config.db_path)
     scheduler = SchedulerService(
@@ -77,6 +85,10 @@ def create_app(
         database=database,
         gpu_provider=gpu_provider,
         profile_discovery_provider=profile_discovery_provider,
+    )
+    nvitop_terminal = NvitopTerminalService(
+        state_dir=config.state_dir / "system-terminals",
+        command=nvitop_command,
     )
 
     @asynccontextmanager
@@ -86,12 +98,14 @@ def create_app(
         try:
             yield
         finally:
+            await nvitop_terminal.shutdown()
             if autostart:
                 await scheduler.shutdown()
 
     app = FastAPI(title="exp-scheduler", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.state.scheduler = scheduler
+    app.state.nvitop_terminal = nvitop_terminal
 
     @app.middleware("http")
     async def disable_cache(request, call_next):
@@ -191,6 +205,7 @@ def create_app(
                 notes=payload.notes,
                 is_urgent=payload.is_urgent,
                 requested_gpu=payload.requested_gpu,
+                gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
                 profile_id=payload.profile_id,
             )
         except ValueError as exc:
@@ -212,6 +227,7 @@ def create_app(
                 notes=payload.notes,
                 is_urgent=payload.is_urgent,
                 requested_gpu=payload.requested_gpu,
+                gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
                 profile_id=payload.profile_id,
             )
         except ValueError as exc:
@@ -292,6 +308,27 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/settings/gpu-schedule/{gpu_id}")
+    async def schedule_gpu_endpoint(
+        gpu_id: int,
+        payload: ScheduleGpuRequest,
+    ) -> dict[str, object]:
+        try:
+            return await scheduler.schedule_gpu_state(
+                gpu_id=gpu_id,
+                action=payload.action,
+                run_at=payload.run_at,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/settings/gpu-schedule/{gpu_id}")
+    async def clear_gpu_schedule_endpoint(gpu_id: int) -> dict[str, object]:
+        try:
+            return await scheduler.clear_gpu_schedule(gpu_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/tasks/{task_id}/log")
     async def get_task_log_endpoint(task_id: int) -> dict[str, object]:
         try:
@@ -363,6 +400,64 @@ def create_app(
             message = str(exc)
             status_code = 404 if "不存在" in message else 409
             raise HTTPException(status_code=status_code, detail=message) from exc
+        return {"ok": True}
+
+    @app.get("/api/system/nvitop/terminal/stream")
+    async def get_nvitop_terminal_stream_endpoint(
+        cols: int | None = Query(default=None, ge=2, le=1000),
+        rows: int | None = Query(default=None, ge=1, le=1000),
+    ) -> StreamingResponse:
+        try:
+            subscriber, snapshot = await nvitop_terminal.subscribe(cols=cols, rows=rows)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        async def event_stream():
+            try:
+                yield sse_message(
+                    "snapshot",
+                    {
+                        "source": "nvitop",
+                        "data": base64.b64encode(snapshot).decode("ascii"),
+                    },
+                )
+                while True:
+                    chunk_task = asyncio.create_task(subscriber.chunk_queue.get())
+                    control_task = asyncio.create_task(subscriber.control_queue.get())
+                    done, pending = await asyncio.wait(
+                        {chunk_task, control_task},
+                        timeout=15,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for pending_task in pending:
+                        pending_task.cancel()
+                    if not done:
+                        yield sse_message("heartbeat", {"source": "nvitop"})
+                        continue
+                    if control_task in done:
+                        event_type, payload = control_task.result()
+                        if event_type == "exit":
+                            yield sse_message("exit", payload or {"source": "nvitop"})
+                        break
+                    chunk = chunk_task.result()
+                    yield sse_message(
+                        "chunk",
+                        {
+                            "source": "nvitop",
+                            "data": base64.b64encode(chunk).decode("ascii"),
+                        },
+                    )
+            finally:
+                await nvitop_terminal.unsubscribe(subscriber)
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @app.post("/api/system/nvitop/terminal/resize")
+    async def resize_nvitop_terminal_endpoint(payload: ResizeTerminalRequest) -> dict[str, object]:
+        try:
+            await nvitop_terminal.resize(cols=payload.cols, rows=payload.rows)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True}
 
     @app.get("/api/events")

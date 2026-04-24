@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import shlex
@@ -40,13 +41,19 @@ class FakeGPUProvider:
         ]
 
 
-def gpu(index: int, *, idle: bool = True) -> GPUInfo:
+def gpu(
+    index: int,
+    *,
+    idle: bool = True,
+    memory_total_mb: int = 24564,
+    memory_used_mb: int | None = None,
+) -> GPUInfo:
     return GPUInfo(
         index=index,
         uuid=f"GPU-{index}",
         name=f"Fake GPU {index}",
-        memory_total_mb=24564,
-        memory_used_mb=500 if idle else 5000,
+        memory_total_mb=memory_total_mb,
+        memory_used_mb=memory_used_mb if memory_used_mb is not None else (500 if idle else 5000),
         utilization_gpu=0,
         has_processes=not idle,
     )
@@ -89,7 +96,12 @@ def wait_for(assertion, *, timeout: float = 6.0, interval: float = 0.05):
     raise AssertionError("condition not met")
 
 
-def start_server(tmp_path, provider: FakeGPUProvider) -> tuple[uvicorn.Server, threading.Thread, int]:
+def start_server(
+    tmp_path,
+    provider: FakeGPUProvider,
+    *,
+    nvitop_command: str = "nvitop",
+) -> tuple[uvicorn.Server, threading.Thread, int]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -103,7 +115,7 @@ def start_server(tmp_path, provider: FakeGPUProvider) -> tuple[uvicorn.Server, t
         state_dir=tmp_path / "state-live",
         log_dir=(tmp_path / "state-live" / "logs"),
     )
-    app = create_app(config, gpu_provider=provider)
+    app = create_app(config, gpu_provider=provider, nvitop_command=nvitop_command)
     server = uvicorn.Server(
         uvicorn.Config(app, host=config.host, port=config.port, log_level="warning")
     )
@@ -257,6 +269,7 @@ def test_gpu_settings_endpoint_and_requested_gpu_validation(tmp_path):
         settings = client.get("/api/settings")
         settings.raise_for_status()
         assert settings.json()["allowed_gpu_ids"] is None
+        assert settings.json()["gpu_schedule"] == {}
 
         update = client.put("/api/settings", json={"allowed_gpu_ids": [0]})
         update.raise_for_status()
@@ -278,6 +291,47 @@ def test_gpu_settings_endpoint_and_requested_gpu_validation(tmp_path):
             },
         )
         assert invalid_task.status_code == 400
+
+
+def test_gpu_schedule_endpoint_sets_clears_and_applies_due_actions(tmp_path):
+    with make_client(tmp_path) as client:
+        run_at = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+        schedule = client.post(
+            "/api/settings/gpu-schedule/0",
+            json={"action": "disable", "run_at": run_at},
+        )
+        schedule.raise_for_status()
+        assert schedule.json()["gpu_schedule"] == {
+            "0": {"action": "disable", "run_at": run_at}
+        }
+
+        clear = client.delete("/api/settings/gpu-schedule/0")
+        clear.raise_for_status()
+        assert clear.json()["gpu_schedule"] == {}
+
+        app = client.app
+        scheduler = app.state.scheduler
+        past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        scheduler.database.set_gpu_schedule_entry(0, action="disable", run_at=past)
+
+        client.get("/api/gpus").raise_for_status()
+        settings = client.get("/api/settings")
+        settings.raise_for_status()
+        assert settings.json()["allowed_gpu_ids"] == []
+        assert settings.json()["gpu_schedule"] == {}
+
+        scheduler.database.set_gpu_schedule_entry(0, action="enable", run_at=past)
+        client.get("/api/gpus").raise_for_status()
+        settings = client.get("/api/settings")
+        settings.raise_for_status()
+        assert settings.json()["allowed_gpu_ids"] is None
+        assert settings.json()["gpu_schedule"] == {}
+
+        invalid = client.post(
+            "/api/settings/gpu-schedule/0",
+            json={"action": "disable", "run_at": past},
+        )
+        assert invalid.status_code == 400
 
 
 def test_server_info_endpoint_uses_config_values(tmp_path):
@@ -385,6 +439,7 @@ def test_update_queued_task_endpoint_supports_in_place_edit(tmp_path):
                 "notes": "before",
                 "is_urgent": False,
                 "requested_gpu": None,
+                "gpu_memory_budget_mb": None,
                 "profile_id": None,
             },
         )
@@ -401,6 +456,7 @@ def test_update_queued_task_endpoint_supports_in_place_edit(tmp_path):
                 "notes": "after",
                 "is_urgent": True,
                 "requested_gpu": 0,
+                "gpu_memory_budget_mb": 20000,
                 "profile_id": profile_id,
             },
         )
@@ -419,6 +475,7 @@ def test_update_queued_task_endpoint_supports_in_place_edit(tmp_path):
         assert updated_task["notes"] == "after"
         assert updated_task["queue_name"] == "urgent"
         assert updated_task["requested_gpu"] == 0
+        assert updated_task["gpu_memory_budget_mb"] == 20000
         assert updated_task["profile_id"] == profile_id
         assert updated_task["profile_name"] == "conda-edit"
         assert updated_task["shell_setup"] == "export PROFILE_READY=1"
@@ -427,6 +484,41 @@ def test_update_queued_task_endpoint_supports_in_place_edit(tmp_path):
         tasks.raise_for_status()
         assert tasks.json()["queued"] == []
         assert [task["id"] for task in tasks.json()["urgent_queued"]] == [task_id]
+
+        second_update = client.put(
+            f"/api/tasks/{task_id}",
+            json={
+                "name": "edited-again",
+                "command": command("print('again')"),
+                "cwd": "/tmp/edited-again",
+                "env": {"C": "again"},
+                "notes": "after-again",
+                "is_urgent": False,
+                "requested_gpu": None,
+                "gpu_memory_budget_mb": None,
+                "profile_id": None,
+            },
+        )
+        second_update.raise_for_status()
+        edited_again = second_update.json()["task"]
+
+        assert edited_again["id"] == task_id
+        assert edited_again["name"] == "edited-again"
+        assert edited_again["command"] == command("print('again')")
+        assert edited_again["cwd"] == "/tmp/edited-again"
+        assert edited_again["env"] == {"C": "again"}
+        assert edited_again["notes"] == "after-again"
+        assert edited_again["queue_name"] == "normal"
+        assert edited_again["requested_gpu"] is None
+        assert edited_again["gpu_memory_budget_mb"] is None
+        assert edited_again["profile_id"] is None
+        assert edited_again["profile_name"] is None
+        assert edited_again["shell_setup"] is None
+
+        tasks = client.get("/api/tasks")
+        tasks.raise_for_status()
+        assert [task["id"] for task in tasks.json()["queued"]] == [task_id]
+        assert tasks.json()["urgent_queued"] == []
 
 
 def test_update_running_task_is_rejected(tmp_path):
@@ -826,6 +918,63 @@ def test_terminal_stream_reconnect_receives_snapshot_and_continues(tmp_path):
             name == "chunk" and b"phase2" in base64.b64decode(payload["data"])
             for name, payload in second_events
         )
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=5)
+
+
+def test_nvitop_terminal_stream_runs_configured_command(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    server, server_thread, port = start_server(
+        tmp_path,
+        provider,
+        nvitop_command=command(
+            "import sys, time; "
+            "print('nvitop-test-ready', flush=True); "
+            "time.sleep(0.1)"
+        ),
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as client:
+            with client.stream("GET", f"{base_url}/api/system/nvitop/terminal/stream") as stream:
+                events = collect_sse_events(
+                    stream,
+                    stop_when=lambda items: any(name == "exit" for name, _ in items),
+                )
+
+        assert events
+        assert events[0][0] == "snapshot"
+        streamed_bytes = b"".join(
+            base64.b64decode(payload["data"])
+            for name, payload in events
+            if name in {"snapshot", "chunk"}
+        )
+        assert b"launching nvitop" in streamed_bytes
+        assert b"nvitop-test-ready" in streamed_bytes
+        exit_payload = next(payload for name, payload in events if name == "exit")
+        assert exit_payload["source"] == "nvitop"
+        assert exit_payload["status"] == "succeeded"
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=5)
+
+
+def test_nvitop_terminal_stream_uses_clean_snapshot_for_fullscreen_command(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    server, server_thread, port = start_server(tmp_path, provider)
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as client:
+            with client.stream("GET", f"{base_url}/api/system/nvitop/terminal/stream") as stream:
+                events = collect_sse_events(
+                    stream,
+                    stop_when=lambda items: len(items) >= 1,
+                )
+
+        assert events
+        assert events[0][0] == "snapshot"
+        assert base64.b64decode(events[0][1]["data"]) == b"\x1b[2J\x1b[H"
     finally:
         server.should_exit = True
         server_thread.join(timeout=5)

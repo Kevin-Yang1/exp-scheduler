@@ -36,13 +36,20 @@ class FakeGPUProvider:
         ]
 
 
-def gpu(index: int, *, idle: bool = True, has_processes: bool = False) -> GPUInfo:
+def gpu(
+    index: int,
+    *,
+    idle: bool = True,
+    has_processes: bool = False,
+    memory_total_mb: int = 24564,
+    memory_used_mb: int | None = None,
+) -> GPUInfo:
     return GPUInfo(
         index=index,
         uuid=f"GPU-{index}",
         name=f"Fake GPU {index}",
-        memory_total_mb=24564,
-        memory_used_mb=500 if idle else 5000,
+        memory_total_mb=memory_total_mb,
+        memory_used_mb=memory_used_mb if memory_used_mb is not None else (500 if idle else 5000),
         utilization_gpu=0 if idle else 82,
         has_processes=has_processes,
     )
@@ -146,6 +153,7 @@ def create_task(
     is_urgent: bool = False,
     requested_gpu: int | None = None,
     profile_id: int | None = None,
+    gpu_memory_budget_mb: int | None = None,
 ) -> int:
     response = client.post(
         "/api/tasks",
@@ -157,6 +165,7 @@ def create_task(
             "notes": notes,
             "is_urgent": is_urgent,
             "requested_gpu": requested_gpu,
+            "gpu_memory_budget_mb": gpu_memory_budget_mb,
             "profile_id": profile_id,
         },
     )
@@ -314,6 +323,57 @@ def test_two_free_gpus_can_run_two_tasks_in_parallel(tmp_path):
         assert assignments[first_id] in {0, 1}
         assert assignments[second_id] in {0, 1}
         assert assignments[first_id] != assignments[second_id]
+
+
+def test_memory_budget_allows_scheduling_when_default_idle_threshold_would_wait(tmp_path):
+    provider = FakeGPUProvider([
+        gpu(0, idle=False, memory_total_mb=24564, memory_used_mb=5000),
+    ])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command("import os; print('budget-gpu=' + os.environ['CUDA_VISIBLE_DEVICES'])"),
+            name="budgeted",
+            gpu_memory_budget_mb=16 * 1024,
+        )
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+        assert history_task["assigned_gpu"] == 0
+        assert history_task["gpu_memory_budget_mb"] == 16 * 1024
+
+
+def test_memory_budget_waits_until_free_memory_exceeds_budget_plus_headroom(tmp_path):
+    provider = FakeGPUProvider([
+        gpu(0, idle=False, memory_total_mb=24564, memory_used_mb=7000),
+    ])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command("print('budget-ready')"),
+            name="budget-wait",
+            gpu_memory_budget_mb=16 * 1024,
+        )
+
+        time.sleep(0.5)
+        queued = client.get("/api/tasks").json()["queued"]
+        assert [task["id"] for task in queued] == [task_id]
+
+        provider.set_gpus([gpu(0, idle=False, memory_total_mb=24564, memory_used_mb=5000)])
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
 
 
 def test_requested_gpu_waits_for_specific_device_while_other_tasks_can_run(tmp_path):
@@ -644,6 +704,37 @@ def test_pty_logs_keep_raw_terminal_bytes_but_text_endpoint_is_sanitized(tmp_pat
         assert "RED" in log_payload["content"]
         assert "GREEN" in log_payload["content"]
         assert client.app.state.scheduler._terminal_sessions == {}
+
+
+def test_text_log_collapses_tqdm_carriage_return_updates(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command(
+                "import sys; "
+                "sys.stdout.write('  0%|zero| 0/10 [00:00<?, ?it/s]\\r'); "
+                "sys.stdout.write(' 50%|half| 5/10 [00:01<00:01, 5.00it/s]\\r'); "
+                "sys.stdout.write('100%|done| 10/10 [00:02<00:00, 5.00it/s]\\n'); "
+                "sys.stdout.flush()"
+            ),
+            name="progress-demo",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+
+        log_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        program_output = log_payload["content"].split("[exp-scheduler] attempt=1/1", 1)[1]
+        assert "100%|done|" in program_output
+        assert "0%|zero|" not in program_output
+        assert "50%|half|" not in program_output
 
 
 def test_retryable_oom_failure_is_automatically_retried(tmp_path):

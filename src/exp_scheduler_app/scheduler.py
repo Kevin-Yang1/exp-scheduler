@@ -27,6 +27,7 @@ from .terminal import (
     TERMINAL_SNAPSHOT_BYTES,
     TerminalSession,
     TerminalSubscriber,
+    encode_terminal_text,
     read_text,
     read_text_tail,
     set_terminal_window_size,
@@ -36,6 +37,7 @@ from .terminal import (
 LOGGER = logging.getLogger("exp_scheduler")
 LOG_TAIL_BYTES = 32 * 1024
 TERMINATE_GRACE_SECONDS = 5
+GPU_MEMORY_BUDGET_HEADROOM_MB = 2048
 RETRYABLE_OOM_PATTERN = re.compile(
     r"out of memory|cuda out of memory|cublas.*alloc|cuda error: out of memory|"
     r"failed to allocate|cuda runtime error|memory allocation|std::bad_alloc|"
@@ -116,6 +118,7 @@ class SchedulerService:
         return self.database.list_tasks()
 
     async def list_gpus(self) -> list[dict[str, object]]:
+        await self._apply_due_gpu_schedule()
         if self._last_gpu_payload:
             return self._last_gpu_payload
         return await self._refresh_gpu_payload()
@@ -130,9 +133,13 @@ class SchedulerService:
         notes: str | None,
         is_urgent: bool = False,
         requested_gpu: int | None = None,
+        gpu_memory_budget_mb: int | None = None,
         profile_id: int | None = None,
     ) -> dict[str, object]:
         normalized_requested_gpu = await self._normalize_requested_gpu(requested_gpu)
+        normalized_gpu_memory_budget_mb = self._normalize_gpu_memory_budget_mb(
+            gpu_memory_budget_mb
+        )
         queue_name = URGENT_QUEUE if is_urgent else NORMAL_QUEUE
         final_name = (name or "").strip() or command.strip()[:80]
         profile_name: str | None = None
@@ -160,6 +167,7 @@ class SchedulerService:
             env=resolved_env,
             notes=notes,
             requested_gpu=normalized_requested_gpu,
+            gpu_memory_budget_mb=normalized_gpu_memory_budget_mb,
             queue_name=queue_name,
             profile_id=profile_id,
             profile_name=profile_name,
@@ -285,9 +293,13 @@ class SchedulerService:
         notes: str | None,
         is_urgent: bool = False,
         requested_gpu: int | None = None,
+        gpu_memory_budget_mb: int | None = None,
         profile_id: int | None = None,
     ) -> dict[str, object]:
         normalized_requested_gpu = await self._normalize_requested_gpu(requested_gpu)
+        normalized_gpu_memory_budget_mb = self._normalize_gpu_memory_budget_mb(
+            gpu_memory_budget_mb
+        )
         queue_name = URGENT_QUEUE if is_urgent else NORMAL_QUEUE
         final_name = (name or "").strip() or command.strip()[:80]
         profile_name: str | None = None
@@ -308,19 +320,21 @@ class SchedulerService:
                 resolved_cwd = profile["cwd"]
             resolved_env = dict(profile["env"])
             resolved_env.update({key: str(value) for key, value in env.items()})
-        task = self.database.update_queued_task(
-            task_id,
-            name=final_name,
-            command=command,
-            cwd=resolved_cwd,
-            env=resolved_env,
-            notes=notes,
-            requested_gpu=normalized_requested_gpu,
-            queue_name=queue_name,
-            profile_id=profile_id,
-            profile_name=profile_name,
-            shell_setup=shell_setup,
-        )
+        async with self._lock:
+            task = self.database.update_queued_task(
+                task_id,
+                name=final_name,
+                command=command,
+                cwd=resolved_cwd,
+                env=resolved_env,
+                notes=notes,
+                requested_gpu=normalized_requested_gpu,
+                gpu_memory_budget_mb=normalized_gpu_memory_budget_mb,
+                queue_name=queue_name,
+                profile_id=profile_id,
+                profile_name=profile_name,
+                shell_setup=shell_setup,
+            )
         await self.events.publish("task_updated", {"task_id": task["id"]})
         await self._trigger_immediate_schedule()
         return task
@@ -389,16 +403,54 @@ class SchedulerService:
         return result
 
     async def get_settings(self) -> dict[str, object]:
-        return {"allowed_gpu_ids": self.database.get_allowed_gpu_ids()}
+        await self._apply_due_gpu_schedule()
+        return {
+            "allowed_gpu_ids": self.database.get_allowed_gpu_ids(),
+            "gpu_schedule": self.database.get_gpu_schedule(),
+        }
 
     async def update_settings(self, *, allowed_gpu_ids: list[int] | None) -> dict[str, object]:
         normalized_allowed_gpu_ids = await self._normalize_allowed_gpu_ids(allowed_gpu_ids)
         self.database.set_allowed_gpu_ids(normalized_allowed_gpu_ids)
         await self.events.publish(
             "settings_updated",
-            {"allowed_gpu_ids": normalized_allowed_gpu_ids},
+            {
+                "allowed_gpu_ids": normalized_allowed_gpu_ids,
+                "gpu_schedule": self.database.get_gpu_schedule(),
+            },
         )
         await self._trigger_immediate_schedule()
+        return await self.get_settings()
+
+    async def schedule_gpu_state(
+        self,
+        *,
+        gpu_id: int,
+        action: str,
+        run_at: str,
+    ) -> dict[str, object]:
+        normalized_gpu_id = await self._normalize_gpu_id(gpu_id)
+        normalized_action = self._normalize_gpu_schedule_action(action)
+        normalized_run_at = self._normalize_gpu_schedule_time(run_at)
+        schedule = self.database.set_gpu_schedule_entry(
+            normalized_gpu_id,
+            action=normalized_action,
+            run_at=normalized_run_at.isoformat(),
+        )
+        await self.events.publish(
+            "gpu_schedule_updated",
+            {"gpu_id": normalized_gpu_id, "gpu_schedule": schedule},
+        )
+        await self._trigger_immediate_schedule()
+        return await self.get_settings()
+
+    async def clear_gpu_schedule(self, gpu_id: int) -> dict[str, object]:
+        normalized_gpu_id = await self._normalize_gpu_id(gpu_id)
+        schedule = self.database.clear_gpu_schedule_entry(normalized_gpu_id)
+        await self.events.publish(
+            "gpu_schedule_updated",
+            {"gpu_id": normalized_gpu_id, "gpu_schedule": schedule},
+        )
         return await self.get_settings()
 
     async def read_task_log(self, task_id: int, *, tail_bytes: int = LOG_TAIL_BYTES) -> dict[str, object]:
@@ -476,6 +528,7 @@ class SchedulerService:
                 continue
 
     async def _tick(self) -> None:
+        await self._apply_due_gpu_schedule()
         payload = await self._refresh_gpu_payload()
         async with self._lock:
             if self.database.get_queue_paused():
@@ -488,12 +541,59 @@ class SchedulerService:
             if not queued_tasks:
                 return
             available = [
-                gpu for gpu in payload if gpu["is_idle"] and not gpu["scheduler_occupied"]
+                gpu for gpu in payload if gpu["globally_enabled"] and not gpu["scheduler_occupied"]
             ]
             if not available:
                 return
             for task, gpu in self._match_tasks_to_gpus(queued_tasks, available):
                 await self._launch_task(task, gpu)
+
+
+    async def _apply_due_gpu_schedule(self) -> None:
+        schedule = self.database.get_gpu_schedule()
+        if not schedule:
+            return
+        now = datetime.now(UTC)
+        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
+        known_gpu_ids = await self._known_gpu_ids()
+        enabled = set(known_gpu_ids if allowed_gpu_ids is None else allowed_gpu_ids)
+        changed = False
+        remaining: dict[str, dict[str, str | int]] = {}
+        for key, entry in schedule.items():
+            try:
+                gpu_id = int(key)
+                run_at = datetime.fromisoformat(str(entry["run_at"]))
+            except (KeyError, TypeError, ValueError):
+                changed = True
+                continue
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=UTC)
+            if run_at > now:
+                remaining[key] = entry
+                continue
+            action = entry.get("action")
+            if action == "enable":
+                enabled.add(gpu_id)
+            elif action == "disable":
+                enabled.discard(gpu_id)
+            changed = True
+        if not changed:
+            return
+        normalized_allowed_gpu_ids: list[int] | None
+        if enabled == known_gpu_ids:
+            normalized_allowed_gpu_ids = None
+        else:
+            normalized_allowed_gpu_ids = sorted(enabled)
+        self.database.set_allowed_gpu_ids(normalized_allowed_gpu_ids)
+        self.database.set_gpu_schedule(remaining)
+        self._last_gpu_payload = []
+        await self.events.publish(
+            "gpu_schedule_applied",
+            {
+                "allowed_gpu_ids": normalized_allowed_gpu_ids,
+                "gpu_schedule": remaining,
+            },
+        )
 
     async def _refresh_gpu_payload(self) -> list[dict[str, object]]:
         gpus = await asyncio.to_thread(self._gpu_provider)
@@ -540,16 +640,16 @@ class SchedulerService:
         )
         self._append_terminal_bytes(
             terminal_session,
-            (
+            encode_terminal_text(
                 f"[exp-scheduler] task={task_id} gpu={gpu_id} started\n"
                 f"[exp-scheduler] command={task['command']}\n"
                 f"[exp-scheduler] attempt={next_attempt}/{self.config.auto_retry_max_retries + 1}\n"
-            ).encode("utf-8"),
+            ),
         )
         if isinstance(task.get("profile_name"), str) and task["profile_name"]:
             self._append_terminal_bytes(
                 terminal_session,
-                f"[exp-scheduler] profile={task['profile_name']}\n".encode("utf-8"),
+                encode_terminal_text(f"[exp-scheduler] profile={task['profile_name']}\n"),
             )
 
         env = self._build_task_environment(
@@ -577,11 +677,11 @@ class SchedulerService:
         except Exception as exc:
             self._append_terminal_bytes(
                 terminal_session,
-                "[exp-scheduler] launch failed\n".encode("utf-8"),
+                encode_terminal_text("[exp-scheduler] launch failed\n"),
             )
             self._append_terminal_bytes(
                 terminal_session,
-                "".join(traceback.format_exception(exc)).encode("utf-8", errors="replace"),
+                encode_terminal_text("".join(traceback.format_exception(exc))),
             )
             self._close_master_fd(terminal_session)
             log_file.close()
@@ -644,8 +744,10 @@ class SchedulerService:
                 requeue_queue_name = handle.requeue_to_queue_name or NORMAL_QUEUE
                 self._append_terminal_bytes(
                     session,
-                    "\n[exp-scheduler] task_preempted=true "
-                    f"requeue_to={requeue_queue_name}\n".encode("utf-8"),
+                    encode_terminal_text(
+                        "\n[exp-scheduler] task_preempted=true "
+                        f"requeue_to={requeue_queue_name}\n"
+                    ),
                 )
                 self.database.preempt_running_task_to_queue_head(
                     task_id,
@@ -678,10 +780,10 @@ class SchedulerService:
                 next_retry_at = self._next_retry_at()
                 self._append_terminal_bytes(
                     session,
-                    "\n[exp-scheduler] retry_scheduled=true "
-                    f"next_retry_at={next_retry_at} "
-                    f"attempt={handle.attempt_count}/{self.config.auto_retry_max_retries + 1}\n".encode(
-                        "utf-8"
+                    encode_terminal_text(
+                        "\n[exp-scheduler] retry_scheduled=true "
+                        f"next_retry_at={next_retry_at} "
+                        f"attempt={handle.attempt_count}/{self.config.auto_retry_max_retries + 1}\n"
                     ),
                 )
                 self.database.schedule_task_retry(
@@ -708,8 +810,8 @@ class SchedulerService:
 
             self._append_terminal_bytes(
                 session,
-                f"\n[exp-scheduler] task={task_id} finished status={status} exit_code={exit_code}\n".encode(
-                    "utf-8"
+                encode_terminal_text(
+                    f"\n[exp-scheduler] task={task_id} finished status={status} exit_code={exit_code}\n"
                 ),
             )
             self.database.finish_task(
@@ -754,17 +856,33 @@ class SchedulerService:
             chosen_index: int | None = None
             if isinstance(requested_gpu, int):
                 for index, gpu in enumerate(remaining_gpus):
-                    if int(gpu["index"]) == requested_gpu:
+                    if int(gpu["index"]) == requested_gpu and self._can_task_run_on_gpu(task, gpu):
                         chosen_index = index
                         break
-            elif remaining_gpus:
-                chosen_index = 0
+            else:
+                for index, gpu in enumerate(remaining_gpus):
+                    if self._can_task_run_on_gpu(task, gpu):
+                        chosen_index = index
+                        break
             if chosen_index is None:
                 continue
             assignments.append((task, remaining_gpus.pop(chosen_index)))
             if not remaining_gpus:
                 break
         return assignments
+
+    def _can_task_run_on_gpu(
+        self,
+        task: dict[str, object],
+        gpu: dict[str, object],
+    ) -> bool:
+        if not bool(gpu.get("globally_enabled")) or bool(gpu.get("scheduler_occupied")):
+            return False
+        budget_mb = task.get("gpu_memory_budget_mb")
+        if isinstance(budget_mb, int):
+            free_mb = int(gpu.get("memory_total_mb") or 0) - int(gpu.get("memory_used_mb") or 0)
+            return free_mb > budget_mb + GPU_MEMORY_BUDGET_HEADROOM_MB
+        return bool(gpu.get("is_idle"))
 
     async def _interrupt_running_tasks(self) -> None:
         async with self._lock:
@@ -826,15 +944,44 @@ class SchedulerService:
             + timedelta(seconds=max(0, self.config.auto_retry_delay_seconds))
         ).isoformat()
 
+    async def _normalize_gpu_id(self, gpu_id: int) -> int:
+        value = int(gpu_id)
+        if value < 0:
+            raise ValueError("GPU 必须是非负整数")
+        known_gpu_ids = await self._known_gpu_ids()
+        if value not in known_gpu_ids:
+            raise ValueError(f"GPU 不存在: {value}")
+        return value
+
     async def _normalize_requested_gpu(self, requested_gpu: int | None) -> int | None:
         if requested_gpu is None:
             return None
-        if requested_gpu < 0:
-            raise ValueError("指定 GPU 必须是非负整数")
-        known_gpu_ids = await self._known_gpu_ids()
-        if requested_gpu not in known_gpu_ids:
-            raise ValueError(f"GPU 不存在: {requested_gpu}")
-        return requested_gpu
+        return await self._normalize_gpu_id(requested_gpu)
+
+    def _normalize_gpu_memory_budget_mb(self, budget_mb: int | None) -> int | None:
+        if budget_mb is None:
+            return None
+        value = int(budget_mb)
+        if value <= 0:
+            raise ValueError("显存预算必须是正整数 MB")
+        return value
+
+    def _normalize_gpu_schedule_action(self, action: str) -> str:
+        if action not in {"enable", "disable"}:
+            raise ValueError("GPU 定时动作必须是 enable 或 disable")
+        return action
+
+    def _normalize_gpu_schedule_time(self, run_at: str) -> datetime:
+        try:
+            scheduled = datetime.fromisoformat(run_at)
+        except ValueError as exc:
+            raise ValueError("GPU 定时时间格式无效") from exc
+        if scheduled.tzinfo is None:
+            scheduled = scheduled.replace(tzinfo=UTC)
+        scheduled = scheduled.astimezone(UTC)
+        if scheduled <= datetime.now(UTC):
+            raise ValueError("GPU 定时时间必须晚于当前时间")
+        return scheduled
 
     async def _normalize_allowed_gpu_ids(
         self,

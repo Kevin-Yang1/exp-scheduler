@@ -22,6 +22,12 @@ ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 ANSI_ESCAPE_RE = re.compile(r"\x1b[@-_]")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+PROGRESS_RETURN_RE = re.compile(r"(?:\d{1,3}%\||\|\s*\d+/\d+|\bit/s\b|[KMGT]?B/s)")
+
+
+def encode_terminal_text(text: str) -> bytes:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.replace("\n", "\r\n").encode("utf-8", errors="replace")
 
 
 @dataclass(slots=True, eq=False)
@@ -108,9 +114,27 @@ def normalize_terminal_bytes_to_text(data: bytes) -> str:
     text = ANSI_OSC_RE.sub("", text)
     text = ANSI_CSI_RE.sub("", text)
     text = ANSI_ESCAPE_RE.sub("", text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = collapse_progress_carriage_returns(text)
     text = CONTROL_CHAR_RE.sub("", text)
     return text
+
+
+def collapse_progress_carriage_returns(text: str) -> str:
+    text = text.replace("\r\n", "\n")
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if "\r" not in line:
+            lines.append(line)
+            continue
+        segments = [segment for segment in line.split("\r") if segment]
+        if not segments:
+            lines.append("")
+            continue
+        if any(PROGRESS_RETURN_RE.search(segment) for segment in segments):
+            lines.append(segments[-1])
+        else:
+            lines.extend(segments)
+    return "\n".join(lines)
 
 
 def read_text_tail(path: Path, *, tail_bytes: int) -> str:

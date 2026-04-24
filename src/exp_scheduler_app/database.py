@@ -57,6 +57,7 @@ class Database:
                     "attempt_count": "INTEGER",
                     "next_retry_at": "TEXT",
                     "requested_gpu": "INTEGER",
+                    "gpu_memory_budget_mb": "INTEGER",
                     "queue_name": "TEXT",
                 },
             )
@@ -109,6 +110,7 @@ class Database:
         env: dict[str, str],
         notes: str | None,
         requested_gpu: int | None = None,
+        gpu_memory_budget_mb: int | None = None,
         queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
@@ -124,8 +126,8 @@ class Database:
                     name, command, cwd, env, status, queue_rank, assigned_gpu, pid,
                     exit_code, created_at, started_at, finished_at, log_path, notes,
                     profile_id, profile_name, shell_setup, attempt_count, next_retry_at,
-                    requested_gpu, queue_name
-                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?)
+                    requested_gpu, gpu_memory_budget_mb, queue_name
+                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
                 """,
                 (
                     name,
@@ -139,6 +141,7 @@ class Database:
                     profile_name,
                     shell_setup,
                     requested_gpu,
+                    gpu_memory_budget_mb,
                     normalized_queue_name,
                 ),
             )
@@ -363,6 +366,7 @@ class Database:
         env: dict[str, str],
         notes: str | None,
         requested_gpu: int | None = None,
+        gpu_memory_budget_mb: int | None = None,
         queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
@@ -394,6 +398,7 @@ class Database:
                     env = ?,
                     notes = ?,
                     requested_gpu = ?,
+                    gpu_memory_budget_mb = ?,
                     queue_name = ?,
                     queue_rank = ?,
                     profile_id = ?,
@@ -411,6 +416,7 @@ class Database:
                     json.dumps(env),
                     notes,
                     requested_gpu,
+                    gpu_memory_budget_mb,
                     normalized_queue_name,
                     queue_rank,
                     profile_id,
@@ -507,6 +513,71 @@ class Database:
                 )
             conn.commit()
         return allowed_gpu_ids
+
+
+    def get_gpu_schedule(self) -> dict[str, dict[str, str | int]]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'gpu_schedule'"
+            ).fetchone()
+        if row is None:
+            return {}
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        schedule: dict[str, dict[str, str | int]] = {}
+        for key, value in payload.items():
+            if not isinstance(value, dict):
+                continue
+            action = value.get("action")
+            run_at = value.get("run_at")
+            if action not in {"enable", "disable"} or not isinstance(run_at, str):
+                continue
+            try:
+                gpu_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            schedule[str(gpu_id)] = {"action": str(action), "run_at": run_at}
+        return schedule
+
+    def set_gpu_schedule(
+        self,
+        schedule: dict[str, dict[str, str | int]],
+    ) -> dict[str, dict[str, str | int]]:
+        with self._lock, self._connect() as conn:
+            if schedule:
+                conn.execute(
+                    """
+                    INSERT INTO meta(key, value) VALUES('gpu_schedule', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (json.dumps(schedule),),
+                )
+            else:
+                conn.execute("DELETE FROM meta WHERE key = 'gpu_schedule'")
+            conn.commit()
+        return schedule
+
+    def set_gpu_schedule_entry(
+        self,
+        gpu_id: int,
+        *,
+        action: str,
+        run_at: str,
+    ) -> dict[str, dict[str, str | int]]:
+        if action not in {"enable", "disable"}:
+            raise ValueError("GPU 定时动作无效")
+        schedule = self.get_gpu_schedule()
+        schedule[str(int(gpu_id))] = {"action": action, "run_at": run_at}
+        return self.set_gpu_schedule(schedule)
+
+    def clear_gpu_schedule_entry(self, gpu_id: int) -> dict[str, dict[str, str | int]]:
+        schedule = self.get_gpu_schedule()
+        schedule.pop(str(int(gpu_id)), None)
+        return self.set_gpu_schedule(schedule)
 
     def mark_task_running(
         self,
@@ -673,6 +744,9 @@ class Database:
             requested_gpu=task["requested_gpu"]
             if isinstance(task["requested_gpu"], int)
             else None,
+            gpu_memory_budget_mb=task["gpu_memory_budget_mb"]
+            if isinstance(task.get("gpu_memory_budget_mb"), int)
+            else None,
             queue_name=str(task.get("queue_name") or NORMAL_QUEUE),
             profile_id=task["profile_id"] if isinstance(task["profile_id"], int) else None,
             profile_name=task["profile_name"]
@@ -778,6 +852,11 @@ class Database:
             "attempt_count": row["attempt_count"] if "attempt_count" in keys and row["attempt_count"] is not None else 0,
             "next_retry_at": row["next_retry_at"] if "next_retry_at" in keys else None,
             "requested_gpu": row["requested_gpu"] if "requested_gpu" in keys else None,
+            "gpu_memory_budget_mb": (
+                row["gpu_memory_budget_mb"]
+                if "gpu_memory_budget_mb" in keys and row["gpu_memory_budget_mb"] is not None
+                else None
+            ),
             "queue_name": (
                 self._normalize_queue_name(row["queue_name"])
                 if "queue_name" in keys
