@@ -235,6 +235,7 @@ export default function App() {
   const [showNewTask, setShowNewTask] = useState(false);
   const [taskDraft, setTaskDraft] = useState<Task | null>(null);
   const [enabledGpus, setEnabledGpus] = useState<number[]>([]);
+  const [appliedEnabledGpus, setAppliedEnabledGpus] = useState<number[]>([]);
   const [gpuSchedule, setGpuSchedule] = useState<Record<string, GpuScheduleEntry>>({});
   const [gpuScheduleDrafts, setGpuScheduleDrafts] = useState<Record<string, string>>({});
   const [statusFilter, setStatusFilter] = useState<string>('all');
@@ -316,7 +317,9 @@ export default function App() {
     setTasks(nextTasks);
     setProfiles(profilePayload.profiles || []);
     setIsPaused(Boolean(taskPayload.queue_paused));
-    setEnabledGpus(settingsPayload.allowed_gpu_ids ?? nextGpus.map(gpu => gpu.id));
+    const nextEnabledGpus = settingsPayload.allowed_gpu_ids ?? nextGpus.map(gpu => gpu.id);
+    setEnabledGpus(nextEnabledGpus);
+    setAppliedEnabledGpus(nextEnabledGpus);
     setGpuSchedule(settingsPayload.gpu_schedule || {});
     setServerIp(serverPayload.server_ip || serverPayload.server_name || 'unknown');
     setSelectedTaskId(prev => {
@@ -381,7 +384,20 @@ export default function App() {
   }, [selectedTaskId, selectedTask?.status]);
 
   const toggleQueue = async () => {
-    await api(isPaused ? '/api/queue/resume' : '/api/queue/pause', { method: 'POST' });
+    if (isPaused) {
+      await api('/api/queue/resume', { method: 'POST' });
+      await refreshAll();
+      return;
+    }
+    const stopRunning = runningTasks.length > 0
+      ? window.confirm(
+        `当前有 ${runningTasks.length} 个运行中任务。\n\n确定：暂停调度，并停止运行中任务后放回队首。\n取消：只暂停新任务调度，运行中任务继续执行。`
+      )
+      : false;
+    await api('/api/queue/pause', {
+      method: 'POST',
+      body: JSON.stringify({ stop_running: stopRunning }),
+    });
     await refreshAll();
   };
 
@@ -410,9 +426,29 @@ export default function App() {
 
   const applyGpuSettings = async () => {
     const allowed_gpu_ids = enabledGpus.length === gpus.length ? null : enabledGpus;
+    const disabledGpuIds = appliedEnabledGpus.filter(id => !enabledGpus.includes(id));
+    const runningOnDisabled = runningTasks.filter(task => (
+      typeof task.gpu === 'number' && disabledGpuIds.includes(task.gpu)
+    ));
+    let stop_running_gpu_ids: number[] = [];
+    if (runningOnDisabled.length > 0) {
+      const summary = runningOnDisabled
+        .map(task => `#${task.id} ${task.name} / GPU ${task.gpu}`)
+        .join('\n');
+      const shouldStop = window.confirm(
+        `本次关闭的 GPU 上有 ${runningOnDisabled.length} 个运行中任务。\n\n${summary}\n\n确定：停止这些任务并放回原队列队首。\n取消：只关闭后续调度，不停止当前任务。`
+      );
+      if (shouldStop) {
+        stop_running_gpu_ids = Array.from(new Set(
+          runningOnDisabled
+            .map(task => task.gpu)
+            .filter((gpuId): gpuId is number => typeof gpuId === 'number')
+        ));
+      }
+    }
     await api('/api/settings', {
       method: 'PUT',
-      body: JSON.stringify({ allowed_gpu_ids }),
+      body: JSON.stringify({ allowed_gpu_ids, stop_running_gpu_ids }),
     });
     await refreshAll();
   };

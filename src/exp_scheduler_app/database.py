@@ -729,6 +729,86 @@ class Database:
             raise ValueError(f"任务不存在: {task_id}")
         return task
 
+    def requeue_running_task_to_queue_head(
+        self,
+        task_id: int,
+        *,
+        exit_code: int | None,
+    ) -> dict[str, object]:
+        with self._lock, self._connect() as conn:
+            queue_name = self._queue_name_for_task(conn, task_id)
+            queue_rank = self._head_queue_rank(conn, queue_name)
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'queued',
+                    queue_rank = ?,
+                    assigned_gpu = NULL,
+                    pid = NULL,
+                    exit_code = ?,
+                    started_at = NULL,
+                    finished_at = NULL,
+                    next_retry_at = NULL
+                WHERE id = ? AND status = 'running'
+                """,
+                (queue_rank, exit_code, task_id),
+            )
+            conn.commit()
+        if cursor.rowcount == 0:
+            raise ValueError("只有运行中的任务可以中断后回队列")
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        return task
+
+    def requeue_running_tasks_to_queue_head(self) -> int:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, queue_name
+                FROM tasks
+                WHERE status = 'running'
+                ORDER BY COALESCE(started_at, created_at) ASC, id ASC
+                """
+            ).fetchall()
+            if not rows:
+                return 0
+
+            rows_by_queue: dict[str, list[sqlite3.Row]] = {}
+            for row in rows:
+                queue_name = self._normalize_queue_name(row["queue_name"])
+                rows_by_queue.setdefault(queue_name, []).append(row)
+
+            for queue_name, queue_rows in rows_by_queue.items():
+                min_row = conn.execute(
+                    """
+                    SELECT MIN(queue_rank) AS min_rank
+                    FROM tasks
+                    WHERE status = 'queued' AND queue_name = ?
+                    """,
+                    (queue_name,),
+                ).fetchone()
+                min_rank = min_row["min_rank"]
+                base_rank = 1 if min_rank is None else int(min_rank) - len(queue_rows)
+                for offset, row in enumerate(queue_rows):
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET status = 'queued',
+                            queue_rank = ?,
+                            assigned_gpu = NULL,
+                            pid = NULL,
+                            started_at = NULL,
+                            finished_at = NULL,
+                            next_retry_at = NULL,
+                            queue_name = ?
+                        WHERE id = ? AND status = 'running'
+                        """,
+                        (base_rank + offset, queue_name, row["id"]),
+                    )
+            conn.commit()
+            return len(rows)
+
     def clone_task_for_requeue(self, task_id: int) -> dict[str, object]:
         task = self.get_task(task_id)
         if task is None:
@@ -756,21 +836,6 @@ class Database:
             if isinstance(task["shell_setup"], str)
             else None,
         )
-
-    def mark_running_tasks_interrupted(self) -> int:
-        with self._lock, self._connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE tasks
-                SET status = 'interrupted',
-                    finished_at = ?,
-                    pid = NULL
-                WHERE status = 'running'
-                """,
-                (utc_now_iso(),),
-            )
-            conn.commit()
-            return cursor.rowcount
 
     def _next_queue_rank(self, conn: sqlite3.Connection, queue_name: str) -> int:
         row = conn.execute(

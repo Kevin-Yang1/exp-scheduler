@@ -59,6 +59,11 @@ class ReorderTasksRequest(BaseModel):
 
 class UpdateSettingsRequest(BaseModel):
     allowed_gpu_ids: list[int] | None = None
+    stop_running_gpu_ids: list[int] = Field(default_factory=list)
+
+
+class PauseQueueRequest(BaseModel):
+    stop_running: bool = False
 
 
 class ScheduleGpuRequest(BaseModel):
@@ -282,9 +287,12 @@ def create_app(
         return {"task": task}
 
     @app.post("/api/queue/pause")
-    async def pause_queue_endpoint() -> dict[str, object]:
+    async def pause_queue_endpoint(payload: PauseQueueRequest | None = None) -> dict[str, object]:
         paused = await scheduler.set_queue_paused(True)
-        return {"queue_paused": paused}
+        interrupted = 0
+        if payload is not None and payload.stop_running:
+            interrupted = await scheduler.interrupt_running_tasks_to_queue_head()
+        return {"queue_paused": paused, "interrupted": interrupted}
 
     @app.post("/api/queue/resume")
     async def resume_queue_endpoint() -> dict[str, object]:
@@ -304,6 +312,7 @@ def create_app(
         try:
             return await scheduler.update_settings(
                 allowed_gpu_ids=payload.allowed_gpu_ids,
+                stop_running_gpu_ids=payload.stop_running_gpu_ids,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

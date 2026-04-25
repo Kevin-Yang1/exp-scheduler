@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import signal
 import shlex
 import sys
 import time
@@ -531,6 +533,167 @@ def test_cancel_running_task_transitions_to_cancelled(tmp_path):
         assert client.app.state.scheduler._terminal_sessions == {}
 
 
+def test_cancel_running_task_sends_sigint_before_escalation(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    signal_file = tmp_path / "cancel-signal.txt"
+    ready_file = tmp_path / "cancel-ready.txt"
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "import signal, sys, time",
+                        "from pathlib import Path",
+                        f"path = Path({str(signal_file)!r})",
+                        f"ready_path = Path({str(ready_file)!r})",
+                        "def handle_sigint(signum, frame):",
+                        "    path.write_text('sigint', encoding='utf-8')",
+                        "    raise SystemExit(0)",
+                        "def handle_sigterm(signum, frame):",
+                        "    path.write_text('sigterm', encoding='utf-8')",
+                        "    raise SystemExit(0)",
+                        "signal.signal(signal.SIGINT, handle_sigint)",
+                        "signal.signal(signal.SIGTERM, handle_sigterm)",
+                        "ready_path.write_text('ready', encoding='utf-8')",
+                        "print('ready', flush=True)",
+                        "time.sleep(30)",
+                    ]
+                )
+            ),
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == task_id
+            ),
+            timeout=3,
+        )
+        wait_for(lambda: ready_file.exists(), timeout=3)
+        response = client.post(f"/api/tasks/{task_id}/cancel")
+        response.raise_for_status()
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id
+            ),
+            timeout=8,
+        )
+        assert history_task["status"] == "cancelled"
+        assert signal_file.read_text(encoding="utf-8") == "sigint"
+
+
+def test_pause_with_stop_running_requeues_running_task_to_head(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        first_id = create_task(
+            client,
+            command("import time; print('first running'); time.sleep(30)"),
+            name="first",
+        )
+        second_id = create_task(
+            client,
+            command("print('second')"),
+            name="second",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == first_id
+            ),
+            timeout=3,
+        )
+        response = client.post("/api/queue/pause", json={"stop_running": True})
+        response.raise_for_status()
+        assert response.json()["queue_paused"] is True
+        assert response.json()["interrupted"] == 1
+
+        queue_payload = wait_for(
+            lambda: (
+                client.get("/api/tasks").json()
+                if not client.get("/api/tasks").json()["running"]
+                else None
+            ),
+            timeout=8,
+        )
+        queued_ids = [task["id"] for task in queue_payload["queued"]]
+        assert queued_ids[:2] == [first_id, second_id]
+        assert queue_payload["queue_paused"] is True
+
+
+def test_pause_without_stop_running_keeps_running_task(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(client, command("import time; time.sleep(5)"))
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == task_id
+            ),
+            timeout=3,
+        )
+        response = client.post("/api/queue/pause", json={"stop_running": False})
+        response.raise_for_status()
+        assert response.json()["interrupted"] == 0
+        running = client.get("/api/tasks").json()["running"]
+        assert [task["id"] for task in running] == [task_id]
+
+
+def test_disabling_gpu_can_requeue_running_task_to_head(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        first_id = create_task(
+            client,
+            command("import time; print('first gpu0'); time.sleep(30)"),
+            name="first",
+            requested_gpu=0,
+        )
+        second_id = create_task(
+            client,
+            command("print('second gpu0')"),
+            name="second",
+            requested_gpu=0,
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == first_id and task["assigned_gpu"] == 0
+            ),
+            timeout=3,
+        )
+
+        response = client.put(
+            "/api/settings",
+            json={"allowed_gpu_ids": [1], "stop_running_gpu_ids": [0]},
+        )
+        response.raise_for_status()
+        assert response.json()["allowed_gpu_ids"] == [1]
+        assert response.json()["interrupted"] == 1
+
+        queue_payload = wait_for(
+            lambda: (
+                client.get("/api/tasks").json()
+                if not client.get("/api/tasks").json()["running"]
+                else None
+            ),
+            timeout=8,
+        )
+        assert [task["id"] for task in queue_payload["queued"]][:2] == [
+            first_id,
+            second_id,
+        ]
+
+
 def test_preempt_running_task_runs_urgent_queue_first_and_requeues_to_normal_head(tmp_path):
     provider = FakeGPUProvider([gpu(0, idle=True)])
     order_file = tmp_path / "preempt-order.log"
@@ -704,6 +867,33 @@ def test_pty_logs_keep_raw_terminal_bytes_but_text_endpoint_is_sanitized(tmp_pat
         assert "RED" in log_payload["content"]
         assert "GREEN" in log_payload["content"]
         assert client.app.state.scheduler._terminal_sessions == {}
+
+
+def test_text_log_default_tail_is_larger_than_32kb(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command(
+                "print('log-start-marker'); "
+                "print('x' * (40 * 1024)); "
+                "print('log-end-marker')"
+            ),
+            name="large-log-demo",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+
+        log_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        assert "log-start-marker" in log_payload["content"]
+        assert "log-end-marker" in log_payload["content"]
 
 
 def test_text_log_collapses_tqdm_carriage_return_updates(tmp_path):
@@ -884,7 +1074,7 @@ def test_retryable_task_requeues_to_queue_head(tmp_path):
     ]
 
 
-def test_startup_marks_stale_running_tasks_interrupted(tmp_path):
+def test_startup_requeues_stale_running_tasks_to_queue_head(tmp_path):
     config = make_config(tmp_path)
     database = Database(config.db_path)
     database.init()
@@ -895,15 +1085,153 @@ def test_startup_marks_stale_running_tasks_interrupted(tmp_path):
         env={},
         notes=None,
     )
+    queued = database.create_task(
+        name="queued",
+        command=command("print('queued')"),
+        cwd=None,
+        env={},
+        notes=None,
+    )
     database.mark_task_running(
         task_id=task["id"],
         gpu_id=0,
         pid=12345,
         log_path=str(config.log_dir / "task_stale.log"),
     )
+    database.set_queue_paused(True)
 
     provider = FakeGPUProvider([gpu(0, idle=True)])
     with TestClient(create_app(config, gpu_provider=provider)):
         current = database.get_task(task["id"])
+        queued_current = database.get_task(queued["id"])
         assert current is not None
-        assert current["status"] == "interrupted"
+        assert queued_current is not None
+        assert current["status"] == "queued"
+        assert current["pid"] is None
+        assert current["assigned_gpu"] is None
+        assert current["attempt_count"] == 1
+        assert int(current["queue_rank"]) < int(queued_current["queue_rank"])
+
+
+def test_scheduler_shutdown_requeues_running_task_to_queue_head(tmp_path):
+    config = make_config(tmp_path)
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    app = create_app(config, gpu_provider=provider)
+    database = Database(config.db_path)
+    with TestClient(app) as client:
+        first_id = create_task(
+            client,
+            command("import time; print('first running'); time.sleep(30)"),
+            name="first",
+        )
+        second_id = create_task(
+            client,
+            command("print('second')"),
+            name="second",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == first_id
+            ),
+            timeout=3,
+        )
+
+    first = database.get_task(first_id)
+    second = database.get_task(second_id)
+    assert first is not None
+    assert second is not None
+    assert first["status"] == "queued"
+    assert first["pid"] is None
+    assert first["assigned_gpu"] is None
+    assert first["attempt_count"] == 1
+    assert int(first["queue_rank"]) < int(second["queue_rank"])
+
+
+def test_external_signal_kill_requeues_running_task_to_head_and_retries(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    order_file = tmp_path / "signal-requeue-order.log"
+    with build_client(tmp_path, provider) as client:
+        first_task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "import os, time",
+                        "from pathlib import Path",
+                        "attempt = int(os.environ['EXP_SCHEDULER_ATTEMPT'])",
+                        f"path = Path({str(order_file)!r})",
+                        "with path.open('a', encoding='utf-8') as fh:",
+                        "    fh.write(f'first-attempt-{attempt}\\n')",
+                        "if attempt == 1:",
+                        "    time.sleep(30)",
+                        "print('first done')",
+                    ]
+                )
+            ),
+            name="first",
+        )
+        second_task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        f"path = Path({str(order_file)!r})",
+                        "with path.open('a', encoding='utf-8') as fh:",
+                        "    fh.write('second\\n')",
+                        "print('second done')",
+                    ]
+                )
+            ),
+            name="second",
+        )
+
+        running_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == first_task_id
+            ),
+            timeout=3,
+        )
+        wait_for(
+            lambda: (
+                order_file.exists()
+                and "first-attempt-1" in order_file.read_text(encoding="utf-8")
+            ),
+            timeout=3,
+        )
+
+        os.killpg(int(running_task["pid"]), signal.SIGTERM)
+
+        wait_for(
+            lambda: (
+                len(client.get("/api/tasks").json()["history"]) == 2
+                and {
+                    task["id"]: task["status"]
+                    for task in client.get("/api/tasks").json()["history"]
+                }.get(first_task_id)
+                == "succeeded"
+                and {
+                    task["id"]: task["status"]
+                    for task in client.get("/api/tasks").json()["history"]
+                }.get(second_task_id)
+                == "succeeded"
+            ),
+            timeout=8,
+        )
+        first_history = next(
+            task
+            for task in client.get("/api/tasks").json()["history"]
+            if task["id"] == first_task_id
+        )
+        assert first_history["attempt_count"] == 2
+
+    assert order_file.read_text(encoding="utf-8").splitlines() == [
+        "first-attempt-1",
+        "first-attempt-2",
+        "second",
+    ]

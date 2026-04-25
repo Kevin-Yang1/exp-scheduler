@@ -35,9 +35,20 @@ from .terminal import (
 
 
 LOGGER = logging.getLogger("exp_scheduler")
-LOG_TAIL_BYTES = 32 * 1024
+LOG_TAIL_BYTES = 1024 * 1024
 TERMINATE_GRACE_SECONDS = 5
 GPU_MEMORY_BUDGET_HEADROOM_MB = 2048
+INTERRUPTED_SIGNAL_NUMBERS = {
+    int(signal.SIGHUP),
+    int(signal.SIGINT),
+    int(signal.SIGQUIT),
+    int(signal.SIGTERM),
+    int(signal.SIGKILL),
+}
+INTERRUPTED_EXIT_CODES = {
+    *{-signal_number for signal_number in INTERRUPTED_SIGNAL_NUMBERS},
+    *{128 + signal_number for signal_number in INTERRUPTED_SIGNAL_NUMBERS},
+}
 RETRYABLE_OOM_PATTERN = re.compile(
     r"out of memory|cuda out of memory|cublas.*alloc|cuda error: out of memory|"
     r"failed to allocate|cuda runtime error|memory allocation|std::bad_alloc|"
@@ -86,12 +97,12 @@ class SchedulerService:
 
     async def startup(self) -> None:
         self.database.init()
-        interrupted = self.database.mark_running_tasks_interrupted()
-        if interrupted:
-            LOGGER.info("Marked %s stale running tasks as interrupted", interrupted)
+        requeued = self.database.requeue_running_tasks_to_queue_head()
+        if requeued:
+            LOGGER.info("Requeued %s stale running tasks to queue head", requeued)
         self._stop_event.clear()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="scheduler-loop")
-        await self.events.publish("service_started", {"interrupted": interrupted})
+        await self.events.publish("service_started", {"requeued": requeued})
 
     async def shutdown(self) -> None:
         self._stop_event.set()
@@ -358,8 +369,7 @@ class SchedulerService:
             if handle is None:
                 raise ValueError("只有运行中的任务可以取消")
             handle.stop_reason = "cancel"
-            self._signal_process_group(handle.process.pid, signal.SIGTERM)
-            asyncio.create_task(self._escalate_kill(handle.task_id), name=f"cancel-{task_id}")
+            self._start_process_stop_ladder(handle, name=f"cancel-{task_id}")
         await self.events.publish("task_cancelling", {"task_id": task_id})
 
     async def requeue_task(self, task_id: int) -> dict[str, object]:
@@ -381,11 +391,7 @@ class SchedulerService:
                 raise ValueError("当前没有等待中的紧急任务，请先加入紧急队列")
             handle.stop_reason = "preempt"
             handle.requeue_to_queue_name = NORMAL_QUEUE
-            self._signal_process_group(handle.process.pid, signal.SIGTERM)
-            asyncio.create_task(
-                self._escalate_kill(handle.task_id),
-                name=f"preempt-{task_id}",
-            )
+            self._start_process_stop_ladder(handle, name=f"preempt-{task_id}")
         await self.events.publish(
             "task_preempting",
             {
@@ -393,6 +399,34 @@ class SchedulerService:
                 "requeue_to_queue_name": NORMAL_QUEUE,
             },
         )
+
+    async def interrupt_running_tasks_to_queue_head(
+        self,
+        *,
+        gpu_ids: set[int] | None = None,
+    ) -> int:
+        async with self._lock:
+            handles = [
+                handle
+                for handle in self._running.values()
+                if (gpu_ids is None or handle.gpu_id in gpu_ids)
+                and handle.process.poll() is None
+            ]
+            for handle in handles:
+                handle.stop_reason = "interrupt"
+                self._start_process_stop_ladder(
+                    handle,
+                    name=f"interrupt-requeue-{handle.task_id}",
+                )
+        if handles:
+            await self.events.publish(
+                "tasks_interrupting_for_requeue",
+                {
+                    "task_ids": [handle.task_id for handle in handles],
+                    "gpu_ids": sorted(gpu_ids) if gpu_ids is not None else None,
+                },
+            )
+        return len(handles)
 
     async def set_queue_paused(self, paused: bool) -> bool:
         result = self.database.set_queue_paused(paused)
@@ -409,8 +443,16 @@ class SchedulerService:
             "gpu_schedule": self.database.get_gpu_schedule(),
         }
 
-    async def update_settings(self, *, allowed_gpu_ids: list[int] | None) -> dict[str, object]:
+    async def update_settings(
+        self,
+        *,
+        allowed_gpu_ids: list[int] | None,
+        stop_running_gpu_ids: list[int] | None = None,
+    ) -> dict[str, object]:
         normalized_allowed_gpu_ids = await self._normalize_allowed_gpu_ids(allowed_gpu_ids)
+        normalized_stop_gpu_ids: set[int] = set()
+        if stop_running_gpu_ids:
+            normalized_stop_gpu_ids = await self._normalize_gpu_id_set(stop_running_gpu_ids)
         self.database.set_allowed_gpu_ids(normalized_allowed_gpu_ids)
         await self.events.publish(
             "settings_updated",
@@ -419,8 +461,15 @@ class SchedulerService:
                 "gpu_schedule": self.database.get_gpu_schedule(),
             },
         )
+        interrupted = 0
+        if normalized_stop_gpu_ids:
+            interrupted = await self.interrupt_running_tasks_to_queue_head(
+                gpu_ids=normalized_stop_gpu_ids,
+            )
         await self._trigger_immediate_schedule()
-        return await self.get_settings()
+        settings = await self.get_settings()
+        settings["interrupted"] = interrupted
+        return settings
 
     async def schedule_gpu_state(
         self,
@@ -769,7 +818,31 @@ class SchedulerService:
             if handle.stop_reason == "cancel":
                 status = "cancelled"
             elif handle.stop_reason == "interrupt":
-                status = "interrupted"
+                await self._requeue_interrupted_task(
+                    handle=handle,
+                    session=session,
+                    exit_code=exit_code,
+                    reason="scheduler_interrupted",
+                )
+                final_exit_payload = {
+                    "task_id": task_id,
+                    "status": "interrupted_requeued",
+                    "exit_code": exit_code,
+                }
+                return
+            elif self._is_interrupted_exit(exit_code):
+                await self._requeue_interrupted_task(
+                    handle=handle,
+                    session=session,
+                    exit_code=exit_code,
+                    reason="signal_interrupted",
+                )
+                final_exit_payload = {
+                    "task_id": task_id,
+                    "status": "interrupted_requeued",
+                    "exit_code": exit_code,
+                }
+                return
             else:
                 status = "succeeded" if exit_code == 0 else "failed"
 
@@ -844,6 +917,38 @@ class SchedulerService:
                 self._watchers.pop(task_id, None)
             await self._trigger_immediate_schedule()
 
+    async def _requeue_interrupted_task(
+        self,
+        *,
+        handle: ProcessHandle,
+        session: TerminalSession,
+        exit_code: int,
+        reason: str,
+    ) -> None:
+        task_id = handle.task_id
+        self._append_terminal_bytes(
+            session,
+            encode_terminal_text(
+                "\n[exp-scheduler] interrupted_requeued=true "
+                f"reason={reason} exit_code={exit_code}\n"
+            ),
+        )
+        self.database.requeue_running_task_to_queue_head(
+            task_id,
+            exit_code=exit_code,
+        )
+        await self.events.publish(
+            "task_interrupted_requeued",
+            {
+                "task_id": task_id,
+                "reason": reason,
+                "exit_code": exit_code,
+            },
+        )
+
+    def _is_interrupted_exit(self, exit_code: int) -> bool:
+        return exit_code in INTERRUPTED_EXIT_CODES
+
     def _match_tasks_to_gpus(
         self,
         queued_tasks: list[dict[str, object]],
@@ -889,20 +994,39 @@ class SchedulerService:
             handles = list(self._running.values())
             for handle in handles:
                 handle.stop_reason = "interrupt"
-                self._signal_process_group(handle.process.pid, signal.SIGTERM)
+            self._signal_live_process_groups(handles, signal.SIGINT)
         if handles:
-            await asyncio.sleep(min(self.config.poll_interval_seconds, TERMINATE_GRACE_SECONDS))
-            for handle in handles:
-                if handle.process.returncode is None:
-                    self._signal_process_group(handle.process.pid, signal.SIGKILL)
+            await asyncio.sleep(TERMINATE_GRACE_SECONDS)
+            self._signal_live_process_groups(handles, signal.SIGTERM)
+            await asyncio.sleep(TERMINATE_GRACE_SECONDS)
+            self._signal_live_process_groups(handles, signal.SIGKILL)
 
-    async def _escalate_kill(self, task_id: int) -> None:
+    def _start_process_stop_ladder(self, handle: ProcessHandle, *, name: str) -> None:
+        self._signal_process_group(handle.process.pid, signal.SIGINT)
+        asyncio.create_task(self._escalate_process_stop(handle.task_id), name=name)
+
+    async def _escalate_process_stop(self, task_id: int) -> None:
+        await asyncio.sleep(TERMINATE_GRACE_SECONDS)
+        async with self._lock:
+            handle = self._running.get(task_id)
+            if handle is None or handle.process.poll() is not None:
+                return
+            self._signal_process_group(handle.process.pid, signal.SIGTERM)
         await asyncio.sleep(TERMINATE_GRACE_SECONDS)
         async with self._lock:
             handle = self._running.get(task_id)
             if handle is None or handle.process.poll() is not None:
                 return
             self._signal_process_group(handle.process.pid, signal.SIGKILL)
+
+    def _signal_live_process_groups(
+        self,
+        handles: list[ProcessHandle],
+        sig: signal.Signals,
+    ) -> None:
+        for handle in handles:
+            if handle.process.poll() is None:
+                self._signal_process_group(handle.process.pid, sig)
 
     def _signal_process_group(self, pid: int | None, sig: signal.Signals) -> None:
         if pid is None:
@@ -1005,6 +1129,10 @@ class SchedulerService:
             missing_text = ", ".join(str(item) for item in missing)
             raise ValueError(f"GPU 不存在: {missing_text}")
         return normalized
+
+    async def _normalize_gpu_id_set(self, gpu_ids: list[int]) -> set[int]:
+        normalized = await self._normalize_allowed_gpu_ids(gpu_ids)
+        return set(normalized or [])
 
     async def _known_gpu_ids(self) -> set[int]:
         gpus = await asyncio.to_thread(self._gpu_provider)
