@@ -15,6 +15,7 @@ def utc_now_iso() -> str:
 NORMAL_QUEUE = "normal"
 URGENT_QUEUE = "urgent"
 VALID_QUEUE_NAMES = {NORMAL_QUEUE, URGENT_QUEUE}
+SCHEDULER_SETTINGS_META_KEY = "scheduler_settings"
 
 
 class Database:
@@ -481,6 +482,43 @@ class Database:
             )
             conn.commit()
         return paused
+
+    def get_scheduler_settings(self) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (SCHEDULER_SETTINGS_META_KEY,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def set_scheduler_settings(
+        self,
+        *,
+        poll_interval_seconds: float,
+        gpu_idle_required_checks: int,
+    ) -> dict[str, object]:
+        settings: dict[str, object] = {
+            "poll_interval_seconds": poll_interval_seconds,
+            "gpu_idle_required_checks": gpu_idle_required_checks,
+        }
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (SCHEDULER_SETTINGS_META_KEY, json.dumps(settings)),
+            )
+            conn.commit()
+        return settings
 
     def get_allowed_gpu_ids(self) -> list[int] | None:
         with self._lock, self._connect() as conn:

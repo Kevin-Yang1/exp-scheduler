@@ -41,6 +41,8 @@ def run_init(config_path: Path, *, force: bool) -> int:
     print(f"数据库: {config.db_path}")
     print(f"服务器名称: {config.server_name}")
     print(f"服务器地址: {config.server_ip}")
+    print(f"检测间隔: {config.poll_interval_seconds}s")
+    print(f"连续检测次数: {config.gpu_idle_required_checks}")
     print(f"自动重试次数: {config.auto_retry_max_retries}")
     print(f"自动重试延迟: {config.auto_retry_delay_seconds}s")
     return 0
@@ -62,6 +64,8 @@ def run_doctor(config_path: Path) -> int:
     print(f"数据库: {config.db_path}")
     print(f"服务器名称: {config.server_name}")
     print(f"服务器地址: {config.server_ip}")
+    print(f"检测间隔: {config.poll_interval_seconds}s")
+    print(f"连续检测次数: {config.gpu_idle_required_checks}")
     print(f"自动重试次数: {config.auto_retry_max_retries}")
     print(f"自动重试延迟: {config.auto_retry_delay_seconds}s")
 

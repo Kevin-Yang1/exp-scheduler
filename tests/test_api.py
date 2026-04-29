@@ -65,6 +65,7 @@ def make_client(tmp_path, *, discovery_provider=None) -> TestClient:
         port=17861,
         poll_interval_seconds=0.1,
         gpu_idle_memory_mb=1000,
+        gpu_idle_required_checks=1,
         state_dir=tmp_path / "state",
         log_dir=(tmp_path / "state" / "logs"),
     )
@@ -112,6 +113,7 @@ def start_server(
         port=port,
         poll_interval_seconds=0.1,
         gpu_idle_memory_mb=1000,
+        gpu_idle_required_checks=1,
         state_dir=tmp_path / "state-live",
         log_dir=(tmp_path / "state-live" / "logs"),
     )
@@ -291,6 +293,36 @@ def test_gpu_settings_endpoint_and_requested_gpu_validation(tmp_path):
             },
         )
         assert invalid_task.status_code == 400
+
+
+def test_scheduler_settings_endpoint_updates_and_persists(tmp_path):
+    with make_client(tmp_path) as client:
+        settings = client.get("/api/scheduler/settings")
+        settings.raise_for_status()
+        assert settings.json()["poll_interval_seconds"] == 0.1
+        assert settings.json()["gpu_idle_required_checks"] == 1
+
+        update = client.put(
+            "/api/scheduler/settings",
+            json={"poll_interval_seconds": 0.2, "gpu_idle_required_checks": 3},
+        )
+        update.raise_for_status()
+        payload = update.json()
+        assert payload["poll_interval_seconds"] == 0.2
+        assert payload["gpu_idle_required_checks"] == 3
+        assert abs(payload["effective_wait_seconds"] - 0.6) < 0.001
+
+        invalid = client.put(
+            "/api/scheduler/settings",
+            json={"poll_interval_seconds": 0, "gpu_idle_required_checks": 3},
+        )
+        assert invalid.status_code == 400
+
+    with make_client(tmp_path) as client:
+        persisted = client.get("/api/scheduler/settings")
+        persisted.raise_for_status()
+        assert persisted.json()["poll_interval_seconds"] == 0.2
+        assert persisted.json()["gpu_idle_required_checks"] == 3
 
 
 def test_gpu_schedule_endpoint_sets_clears_and_applies_due_actions(tmp_path):

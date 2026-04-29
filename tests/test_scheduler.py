@@ -61,6 +61,7 @@ def make_config(
     tmp_path,
     *,
     poll_interval_seconds: float = 0.1,
+    gpu_idle_required_checks: int = 1,
     auto_retry_max_retries: int = 0,
     auto_retry_delay_seconds: int = 5,
 ) -> SchedulerConfig:
@@ -70,6 +71,7 @@ def make_config(
         port=17861,
         poll_interval_seconds=poll_interval_seconds,
         gpu_idle_memory_mb=1000,
+        gpu_idle_required_checks=gpu_idle_required_checks,
         auto_retry_max_retries=auto_retry_max_retries,
         auto_retry_delay_seconds=auto_retry_delay_seconds,
         state_dir=state_dir,
@@ -82,6 +84,7 @@ def build_client(
     provider: FakeGPUProvider,
     *,
     poll_interval_seconds: float = 0.1,
+    gpu_idle_required_checks: int = 1,
     auto_retry_max_retries: int = 0,
     auto_retry_delay_seconds: int = 5,
 ) -> TestClient:
@@ -89,6 +92,7 @@ def build_client(
         make_config(
             tmp_path,
             poll_interval_seconds=poll_interval_seconds,
+            gpu_idle_required_checks=gpu_idle_required_checks,
             auto_retry_max_retries=auto_retry_max_retries,
             auto_retry_delay_seconds=auto_retry_delay_seconds,
         ),
@@ -287,6 +291,33 @@ def test_scheduler_runs_task_when_gpu_becomes_free(tmp_path):
         assert "gpu=0" in log_payload["content"]
 
 
+def test_scheduler_waits_for_consecutive_idle_checks(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=False, has_processes=True)])
+    with build_client(
+        tmp_path,
+        provider,
+        poll_interval_seconds=0.1,
+        gpu_idle_required_checks=3,
+    ) as client:
+        task_id = create_task(client, command("print('stable-idle')"))
+        time.sleep(0.2)
+        assert [task["id"] for task in client.get("/api/tasks").json()["queued"]] == [task_id]
+
+        provider.set_gpus([gpu(0, idle=True)])
+        time.sleep(0.15)
+        assert [task["id"] for task in client.get("/api/tasks").json()["queued"]] == [task_id]
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=4,
+        )
+        assert history_task["assigned_gpu"] == 0
+
+
 def test_scheduler_does_not_schedule_over_external_process(tmp_path):
     provider = FakeGPUProvider([gpu(0, idle=True, has_processes=True)])
     with build_client(tmp_path, provider) as client:
@@ -376,6 +407,40 @@ def test_memory_budget_waits_until_free_memory_exceeds_budget_plus_headroom(tmp_
             ),
             timeout=8,
         )
+
+
+def test_memory_budget_also_waits_for_consecutive_checks(tmp_path):
+    provider = FakeGPUProvider([
+        gpu(0, idle=False, has_processes=True, memory_total_mb=24564, memory_used_mb=7000),
+    ])
+    with build_client(
+        tmp_path,
+        provider,
+        poll_interval_seconds=0.1,
+        gpu_idle_required_checks=3,
+    ) as client:
+        task_id = create_task(
+            client,
+            command("print('budget-stable')"),
+            name="budget-stable",
+            gpu_memory_budget_mb=16 * 1024,
+        )
+
+        provider.set_gpus([
+            gpu(0, idle=False, has_processes=True, memory_total_mb=24564, memory_used_mb=5000),
+        ])
+        time.sleep(0.15)
+        assert [task["id"] for task in client.get("/api/tasks").json()["queued"]] == [task_id]
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=4,
+        )
+        assert history_task["assigned_gpu"] == 0
 
 
 def test_requested_gpu_waits_for_specific_device_while_other_tasks_can_run(tmp_path):

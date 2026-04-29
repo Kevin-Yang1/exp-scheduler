@@ -62,6 +62,11 @@ class UpdateSettingsRequest(BaseModel):
     stop_running_gpu_ids: list[int] = Field(default_factory=list)
 
 
+class UpdateSchedulerSettingsRequest(BaseModel):
+    poll_interval_seconds: float
+    gpu_idle_required_checks: int
+
+
 class PauseQueueRequest(BaseModel):
     stop_running: bool = False
 
@@ -313,6 +318,22 @@ def create_app(
             return await scheduler.update_settings(
                 allowed_gpu_ids=payload.allowed_gpu_ids,
                 stop_running_gpu_ids=payload.stop_running_gpu_ids,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/scheduler/settings")
+    async def get_scheduler_settings_endpoint() -> dict[str, object]:
+        return await scheduler.get_scheduler_settings()
+
+    @app.put("/api/scheduler/settings")
+    async def update_scheduler_settings_endpoint(
+        payload: UpdateSchedulerSettingsRequest,
+    ) -> dict[str, object]:
+        try:
+            return await scheduler.update_scheduler_settings(
+                poll_interval_seconds=payload.poll_interval_seconds,
+                gpu_idle_required_checks=payload.gpu_idle_required_checks,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

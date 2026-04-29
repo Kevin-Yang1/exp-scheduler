@@ -118,6 +118,12 @@ interface Profile {
   notes?: string | null;
 }
 
+interface SchedulerSettings {
+  poll_interval_seconds: number;
+  gpu_idle_required_checks: number;
+  effective_wait_seconds: number;
+}
+
 interface DiscoveryItem {
   display_name: string;
   suggested_profile?: {
@@ -272,6 +278,8 @@ export default function App() {
   }, []);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [schedulerSettings, setSchedulerSettings] = useState<SchedulerSettings | null>(null);
+  const [schedulerSettingsDraft, setSchedulerSettingsDraft] = useState<Partial<SchedulerSettings>>({});
   const [discovery, setDiscovery] = useState<DiscoveryState>({ conda_envs: [], venvs: [] });
   const [selectedDiscoveryId, setSelectedDiscoveryId] = useState('');
   const [managedProfileId, setManagedProfileId] = useState('');
@@ -289,6 +297,7 @@ export default function App() {
   const enabledGpuSet = useMemo(() => new Set(enabledGpus), [enabledGpus]);
   const visibleGpus = useMemo(() => gpus.filter(gpu => enabledGpuSet.has(gpu.id)), [gpus, enabledGpuSet]);
   const queueDepth = urgentQueueTasks.filter(t => t.status === 'pending').length + standardQueueTasks.filter(t => t.status === 'pending').length;
+  const hasWaitingUrgentTask = urgentQueueTasks.some(task => task.status === 'pending');
   const failedCount = historyTasks.filter(t => t.status === 'failed' || t.status === 'interrupted').length;
   const failureRate = historyTasks.length ? `${((failedCount / historyTasks.length) * 100).toFixed(1)}%` : '0%';
   const canUseBatchDelete = activeTab === 'queue' || activeTab === 'history';
@@ -299,12 +308,13 @@ export default function App() {
   }, [activeTab]);
 
   const refreshAll = useCallback(async () => {
-    const [taskPayload, gpuPayload, settingsPayload, profilePayload, serverPayload] = await Promise.all([
+    const [taskPayload, gpuPayload, settingsPayload, profilePayload, serverPayload, schedulerSettingsPayload] = await Promise.all([
       api<{ queued: BackendTask[]; urgent_queued: BackendTask[]; running: BackendTask[]; history: BackendTask[]; queue_paused: boolean }>('/api/tasks'),
       api<{ gpus: BackendGPU[] }>('/api/gpus'),
       api<{ allowed_gpu_ids: number[] | null; gpu_schedule?: Record<string, GpuScheduleEntry> }>('/api/settings'),
       api<{ profiles: Profile[] }>('/api/profiles'),
       api<{ server_ip?: string; server_name?: string }>('/api/server'),
+      api<SchedulerSettings>('/api/scheduler/settings').catch(() => null),
     ]);
     const nextGpus = (gpuPayload.gpus || []).map(mapGpu);
     const nextTasks = [
@@ -316,6 +326,9 @@ export default function App() {
     setGpus(nextGpus);
     setTasks(nextTasks);
     setProfiles(profilePayload.profiles || []);
+    if (schedulerSettingsPayload) {
+      setSchedulerSettings(schedulerSettingsPayload);
+    }
     setIsPaused(Boolean(taskPayload.queue_paused));
     const nextEnabledGpus = settingsPayload.allowed_gpu_ids ?? nextGpus.map(gpu => gpu.id);
     setEnabledGpus(nextEnabledGpus);
@@ -424,6 +437,42 @@ export default function App() {
     );
   };
 
+  const saveSchedulerSettings = async () => {
+    try {
+      const current = schedulerSettings || { poll_interval_seconds: 1, gpu_idle_required_checks: 1, effective_wait_seconds: 1 };
+      const merged = {
+        ...current,
+        ...schedulerSettingsDraft
+      };
+      
+      if (merged.poll_interval_seconds <= 0) {
+        setMessage('轮询间隔必须大于 0');
+        return;
+      }
+      if (merged.gpu_idle_required_checks < 1 || !Number.isInteger(merged.gpu_idle_required_checks)) {
+        setMessage('GPU 空闲确认次数必须是大于等于 1 的整数');
+        return;
+      }
+      
+      const res = await api<SchedulerSettings>('/api/scheduler/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          poll_interval_seconds: merged.poll_interval_seconds,
+          gpu_idle_required_checks: merged.gpu_idle_required_checks,
+        }),
+      });
+      setSchedulerSettings(res);
+      setSchedulerSettingsDraft({});
+      setMessage('调控器设置已更新');
+    } catch (error) {
+      if (error instanceof Error) {
+        setMessage(`保存失败: ${error.message}`);
+      } else {
+        setMessage('保存失败');
+      }
+    }
+  };
+
   const applyGpuSettings = async () => {
     const allowed_gpu_ids = enabledGpus.length === gpus.length ? null : enabledGpus;
     const disabledGpuIds = appliedEnabledGpus.filter(id => !enabledGpus.includes(id));
@@ -514,6 +563,23 @@ export default function App() {
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '任务取消失败');
+    }
+  };
+
+  const preemptTask = async (task: Task) => {
+    if (!hasWaitingUrgentTask) {
+      setMessage('当前没有等待中的紧急任务，请先把任务加入紧急队列。');
+      return;
+    }
+    if (!window.confirm(`确认抢占任务 #${task.id} 吗？\n\n当前任务会被停止并放回普通队列队首，紧急队列会优先获得空出的 GPU。`)) {
+      return;
+    }
+    try {
+      await api(`/api/tasks/${task.id}/preempt`, { method: 'POST' });
+      setMessage(`任务 #${task.id} 正在被抢占，紧急队列将优先调度。`);
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '任务抢占失败');
     }
   };
 
@@ -960,6 +1026,8 @@ export default function App() {
                               setSelectedTaskId(task.id);
                             }}
                             onCancel={() => cancelTask(task.id)}
+                            onPreempt={() => preemptTask(task)}
+                            canPreempt={hasWaitingUrgentTask}
                             onDuplicate={() => duplicateTask(task)}
                             onEdit={() => editTask(task)}
                             isMarked={markedTaskIds.has(task.id)}
@@ -1317,6 +1385,77 @@ export default function App() {
                   ))}
                 </div>
 
+                {/* Scheduler Strategy Controls */}
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 text-slate-700 shadow-sm space-y-5 relative overflow-hidden">
+                  <div className="absolute top-0 right-0 p-6 opacity-[0.02]">
+                    <Clock className="w-32 h-32 text-slate-900" />
+                  </div>
+                  <div className="relative">
+                    <div className="flex items-center justify-between pointer-events-none">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-emerald-50 rounded-xl flex items-center justify-center border border-emerald-100">
+                          <Settings className="w-6 h-6 text-emerald-600" />
+                        </div>
+                        <div>
+                          <h3 className="text-xl font-black text-slate-900 tracking-tight">调度器策略 (调控器)</h3>
+                          <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Scheduler Controls</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-6">
+                      <div className="space-y-2">
+                        <label className="block text-xs font-bold text-slate-700">轮询间隔 (秒)</label>
+                        <input
+                          type="number"
+                          step="0.1"
+                          min="0.1"
+                          value={schedulerSettingsDraft.poll_interval_seconds ?? schedulerSettings?.poll_interval_seconds ?? ''}
+                          onChange={(e) => setSchedulerSettingsDraft(prev => ({ ...prev, poll_interval_seconds: parseFloat(e.target.value) }))}
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-colors"
+                        />
+                        <p className="text-[10px] text-slate-500 font-medium">调度器每次检查队首任务的间隔时间</p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="block text-xs font-bold text-slate-700">GPU 空闲确认次数</label>
+                        <input
+                          type="number"
+                          step="1"
+                          min="1"
+                          value={schedulerSettingsDraft.gpu_idle_required_checks ?? schedulerSettings?.gpu_idle_required_checks ?? ''}
+                          onChange={(e) => setSchedulerSettingsDraft(prev => ({ ...prev, gpu_idle_required_checks: parseInt(e.target.value, 10) }))}
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-colors"
+                        />
+                        <p className="text-[10px] text-slate-500 font-medium">连续 N 次轮询确认空闲后，才可分配任务</p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="block text-xs font-bold text-slate-700">实际生效等待时间 (只读)</label>
+                        <div className="w-full bg-slate-100 border border-slate-200 rounded-lg px-3 py-2 text-sm font-bold text-slate-600 flex items-center justify-between">
+                          <span>{schedulerSettings?.effective_wait_seconds ?? '-'} 秒</span>
+                          <Clock className="w-4 h-4 text-slate-400" />
+                        </div>
+                        <p className="text-[10px] text-slate-500 font-medium">任务派发前的实际最小等待时长</p>
+                      </div>
+                    </div>
+
+                    <div className="flex justify-end pt-4 border-t border-slate-100 mt-6">
+                      <button
+                        onClick={saveSchedulerSettings}
+                        disabled={Object.keys(schedulerSettingsDraft).length === 0}
+                        className={`px-8 py-2.5 rounded-lg text-sm font-bold shadow-sm transition-all focus:ring-2 focus:ring-emerald-500/20 focus:ring-offset-2 ${
+                          Object.keys(schedulerSettingsDraft).length === 0
+                            ? 'bg-slate-100 text-slate-400 border-transparent cursor-not-allowed'
+                            : 'bg-emerald-600 hover:bg-emerald-700 text-white border-transparent active:scale-95'
+                        }`}
+                      >
+                        保存调控器设置
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
                 {/* Environment Template Configuration */}
                 <div className="bg-white border border-slate-200 rounded-2xl p-6 text-slate-700 shadow-sm space-y-5">
                   <div className="flex items-center justify-between">
@@ -1669,7 +1808,7 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
   );
 };
 
-  const TaskCardInner = ({ task, isSelected, onSelect, onCancel, onDuplicate, onEdit, isMarked, toggleMark }: { task: Task; isSelected?: boolean; onSelect?: () => void; onCancel?: () => void; onDuplicate?: () => void; onEdit?: () => void; isMarked?: boolean; toggleMark?: (e: React.MouseEvent) => void; key?: React.Key }) => {
+  const TaskCardInner = ({ task, isSelected, onSelect, onCancel, onPreempt, canPreempt, onDuplicate, onEdit, isMarked, toggleMark }: { task: Task; isSelected?: boolean; onSelect?: () => void; onCancel?: () => void; onPreempt?: () => void; canPreempt?: boolean; onDuplicate?: () => void; onEdit?: () => void; isMarked?: boolean; toggleMark?: (e: React.MouseEvent) => void; key?: React.Key }) => {
   const canEdit = task.status === 'pending' || task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted';
 
   return (
@@ -1737,6 +1876,21 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
                 <Edit2 className="w-3.5 h-3.5" />
               </button>
             )}
+              <button
+                title={canPreempt ? "抢占给紧急队列" : "当前没有等待中的紧急任务"}
+                disabled={!canPreempt}
+                onClick={(e) => {
+                    e.stopPropagation();
+                    onPreempt?.();
+                  }}
+                className={`p-1.5 rounded-lg transition-all active:scale-90 ${
+                  canPreempt
+                    ? 'text-slate-400 hover:text-amber-600 hover:bg-amber-50'
+                    : 'text-slate-300 cursor-not-allowed'
+                }`}
+              >
+                <AlertCircle className="w-3.5 h-3.5" />
+              </button>
               <button
                 title={isMarked ? "取消标记" : "标记任务"}
                 onClick={toggleMark}

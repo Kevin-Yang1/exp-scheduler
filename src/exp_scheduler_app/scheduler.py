@@ -89,14 +89,17 @@ class SchedulerService:
         )
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._running: dict[int, ProcessHandle] = {}
         self._terminal_sessions: dict[int, TerminalSession] = {}
         self._watchers: dict[int, asyncio.Task[None]] = {}
         self._last_gpu_payload: list[dict[str, object]] = []
+        self._gpu_ready_counts: dict[tuple[int, str], int] = {}
 
     async def startup(self) -> None:
         self.database.init()
+        self._load_persisted_scheduler_settings()
         requeued = self.database.requeue_running_tasks_to_queue_head()
         if requeued:
             LOGGER.info("Requeued %s stale running tasks to queue head", requeued)
@@ -443,6 +446,29 @@ class SchedulerService:
             "gpu_schedule": self.database.get_gpu_schedule(),
         }
 
+    async def get_scheduler_settings(self) -> dict[str, object]:
+        return self._scheduler_settings_payload()
+
+    async def update_scheduler_settings(
+        self,
+        *,
+        poll_interval_seconds: float,
+        gpu_idle_required_checks: int,
+    ) -> dict[str, object]:
+        settings = self._normalize_scheduler_settings(
+            poll_interval_seconds=poll_interval_seconds,
+            gpu_idle_required_checks=gpu_idle_required_checks,
+        )
+        self._apply_scheduler_settings(settings)
+        self.database.set_scheduler_settings(**settings)
+        self._reset_gpu_ready_counts()
+        self._wake_scheduler_loop()
+        await self.events.publish(
+            "scheduler_settings_updated",
+            self._scheduler_settings_payload(),
+        )
+        return self._scheduler_settings_payload()
+
     async def update_settings(
         self,
         *,
@@ -570,23 +596,40 @@ class SchedulerService:
                 LOGGER.exception("Scheduler tick failed")
             try:
                 await asyncio.wait_for(
-                    self._stop_event.wait(),
+                    self._wait_for_next_tick(),
                     timeout=self.config.poll_interval_seconds,
                 )
             except asyncio.TimeoutError:
                 continue
 
+    async def _wait_for_next_tick(self) -> None:
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        wake_task = asyncio.create_task(self._wake_event.wait())
+        tasks = {stop_task, wake_task}
+        try:
+            await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._wake_event.clear()
+
     async def _tick(self) -> None:
         await self._apply_due_gpu_schedule()
         payload = await self._refresh_gpu_payload()
         async with self._lock:
-            if self.database.get_queue_paused():
-                return
             queued_tasks = [
                 task
                 for task in self.database.list_queued_tasks()
                 if self._is_task_ready_for_launch(task)
             ]
+            self._refresh_gpu_ready_counts(payload, queued_tasks)
+            if self.database.get_queue_paused():
+                return
             if not queued_tasks:
                 return
             available = [
@@ -669,6 +712,7 @@ class SchedulerService:
     ) -> None:
         task_id = int(task["id"])
         gpu_id = int(gpu["index"])
+        self._clear_gpu_ready_counts(gpu_id)
         next_attempt = int(task.get("attempt_count") or 0) + 1
         log_path = self._log_path_for_task(task_id, next_attempt)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -949,6 +993,31 @@ class SchedulerService:
     def _is_interrupted_exit(self, exit_code: int) -> bool:
         return exit_code in INTERRUPTED_EXIT_CODES
 
+    def _refresh_gpu_ready_counts(
+        self,
+        gpu_payload: list[dict[str, object]],
+        queued_tasks: list[dict[str, object]],
+    ) -> None:
+        budget_values: set[int] = set()
+        for task in queued_tasks:
+            budget_mb = task.get("gpu_memory_budget_mb")
+            if isinstance(budget_mb, int):
+                budget_values.add(budget_mb)
+        satisfied_keys: set[tuple[int, str]] = set()
+        for gpu in gpu_payload:
+            if not bool(gpu.get("globally_enabled")) or bool(gpu.get("scheduler_occupied")):
+                continue
+            gpu_id = int(gpu["index"])
+            if bool(gpu.get("is_idle")):
+                satisfied_keys.add((gpu_id, "idle"))
+            for budget_mb in budget_values:
+                if self._gpu_has_budget_capacity(gpu, budget_mb):
+                    satisfied_keys.add((gpu_id, self._budget_readiness_key(budget_mb)))
+        self._gpu_ready_counts = {
+            key: self._gpu_ready_counts.get(key, 0) + 1
+            for key in satisfied_keys
+        }
+
     def _match_tasks_to_gpus(
         self,
         queued_tasks: list[dict[str, object]],
@@ -981,13 +1050,37 @@ class SchedulerService:
         task: dict[str, object],
         gpu: dict[str, object],
     ) -> bool:
-        if not bool(gpu.get("globally_enabled")) or bool(gpu.get("scheduler_occupied")):
+        key = self._readiness_key_for_task(task, gpu)
+        if key is None:
             return False
+        return self._gpu_ready_counts.get(key, 0) >= self._required_gpu_ready_checks()
+
+    def _readiness_key_for_task(
+        self,
+        task: dict[str, object],
+        gpu: dict[str, object],
+    ) -> tuple[int, str] | None:
+        if not bool(gpu.get("globally_enabled")) or bool(gpu.get("scheduler_occupied")):
+            return None
+        gpu_id = int(gpu["index"])
         budget_mb = task.get("gpu_memory_budget_mb")
         if isinstance(budget_mb, int):
-            free_mb = int(gpu.get("memory_total_mb") or 0) - int(gpu.get("memory_used_mb") or 0)
-            return free_mb > budget_mb + GPU_MEMORY_BUDGET_HEADROOM_MB
-        return bool(gpu.get("is_idle"))
+            if self._gpu_has_budget_capacity(gpu, budget_mb):
+                return (gpu_id, self._budget_readiness_key(budget_mb))
+            return None
+        if bool(gpu.get("is_idle")):
+            return (gpu_id, "idle")
+        return None
+
+    def _gpu_has_budget_capacity(self, gpu: dict[str, object], budget_mb: int) -> bool:
+        free_mb = int(gpu.get("memory_total_mb") or 0) - int(gpu.get("memory_used_mb") or 0)
+        return free_mb > budget_mb + GPU_MEMORY_BUDGET_HEADROOM_MB
+
+    def _budget_readiness_key(self, budget_mb: int) -> str:
+        return f"budget:{budget_mb}"
+
+    def _required_gpu_ready_checks(self) -> int:
+        return max(1, int(self.config.gpu_idle_required_checks))
 
     async def _interrupt_running_tasks(self) -> None:
         async with self._lock:
@@ -1137,6 +1230,79 @@ class SchedulerService:
     async def _known_gpu_ids(self) -> set[int]:
         gpus = await asyncio.to_thread(self._gpu_provider)
         return {gpu.index for gpu in gpus}
+
+    def _load_persisted_scheduler_settings(self) -> None:
+        persisted = self.database.get_scheduler_settings()
+        source = persisted or {}
+        try:
+            settings = self._normalize_scheduler_settings(
+                poll_interval_seconds=source.get(
+                    "poll_interval_seconds",
+                    self.config.poll_interval_seconds,
+                ),
+                gpu_idle_required_checks=source.get(
+                    "gpu_idle_required_checks",
+                    self.config.gpu_idle_required_checks,
+                ),
+            )
+        except ValueError:
+            LOGGER.warning("Ignoring invalid persisted scheduler settings: %s", persisted)
+            settings = self._normalize_scheduler_settings(
+                poll_interval_seconds=self.config.poll_interval_seconds,
+                gpu_idle_required_checks=self.config.gpu_idle_required_checks,
+            )
+        self._apply_scheduler_settings(settings)
+
+    def _normalize_scheduler_settings(
+        self,
+        *,
+        poll_interval_seconds: object,
+        gpu_idle_required_checks: object,
+    ) -> dict[str, object]:
+        try:
+            interval = float(poll_interval_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("检测间隔必须是数字") from exc
+        if interval <= 0 or not interval < float("inf"):
+            raise ValueError("检测间隔必须大于 0")
+        try:
+            required_checks = int(gpu_idle_required_checks)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("连续检测次数必须是整数") from exc
+        if required_checks < 1:
+            raise ValueError("连续检测次数必须大于等于 1")
+        return {
+            "poll_interval_seconds": interval,
+            "gpu_idle_required_checks": required_checks,
+        }
+
+    def _apply_scheduler_settings(self, settings: dict[str, object]) -> None:
+        self.config.poll_interval_seconds = float(settings["poll_interval_seconds"])
+        self.config.gpu_idle_required_checks = int(settings["gpu_idle_required_checks"])
+
+    def _scheduler_settings_payload(self) -> dict[str, object]:
+        interval = float(self.config.poll_interval_seconds)
+        required_checks = int(self.config.gpu_idle_required_checks)
+        return {
+            "poll_interval_seconds": interval,
+            "gpu_idle_required_checks": required_checks,
+            "effective_wait_seconds": interval * required_checks,
+        }
+
+    def _reset_gpu_ready_counts(self) -> None:
+        self._gpu_ready_counts.clear()
+
+    def _clear_gpu_ready_counts(self, gpu_id: int) -> None:
+        stale_keys = [
+            key for key in self._gpu_ready_counts
+            if key[0] == gpu_id
+        ]
+        for key in stale_keys:
+            self._gpu_ready_counts.pop(key, None)
+
+    def _wake_scheduler_loop(self) -> None:
+        if not self._stop_event.is_set():
+            self._wake_event.set()
 
     async def _trigger_immediate_schedule(self) -> None:
         if self._stop_event.is_set():

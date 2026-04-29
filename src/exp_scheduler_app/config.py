@@ -10,6 +10,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17861
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_GPU_IDLE_MEMORY_MB = 2000
+DEFAULT_GPU_IDLE_REQUIRED_CHECKS = 6
 DEFAULT_AUTO_RETRY_MAX_RETRIES = 0
 DEFAULT_AUTO_RETRY_DELAY_SECONDS = 5
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "exp-scheduler" / "config.toml"
@@ -48,8 +49,9 @@ class SchedulerConfig:
     port: int = DEFAULT_PORT
     server_name: str = DEFAULT_SERVER_NAME
     server_ip: str = DEFAULT_SERVER_IP
-    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
     gpu_idle_memory_mb: int = DEFAULT_GPU_IDLE_MEMORY_MB
+    gpu_idle_required_checks: int = DEFAULT_GPU_IDLE_REQUIRED_CHECKS
     auto_retry_max_retries: int = DEFAULT_AUTO_RETRY_MAX_RETRIES
     auto_retry_delay_seconds: int = DEFAULT_AUTO_RETRY_DELAY_SECONDS
     state_dir: Path = DEFAULT_STATE_DIR
@@ -76,11 +78,14 @@ def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
         port=int(data.get("port", DEFAULT_PORT)),
         server_name=str(data.get("server_name", DEFAULT_SERVER_NAME)),
         server_ip=str(data.get("server_ip", DEFAULT_SERVER_IP)),
-        poll_interval_seconds=int(
+        poll_interval_seconds=float(
             data.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS)
         ),
         gpu_idle_memory_mb=int(
             data.get("gpu_idle_memory_mb", DEFAULT_GPU_IDLE_MEMORY_MB)
+        ),
+        gpu_idle_required_checks=int(
+            data.get("gpu_idle_required_checks", DEFAULT_GPU_IDLE_REQUIRED_CHECKS)
         ),
         auto_retry_max_retries=int(
             data.get("auto_retry_max_retries", DEFAULT_AUTO_RETRY_MAX_RETRIES)
@@ -102,6 +107,7 @@ def default_config_text() -> str:
             f'server_ip = "{DEFAULT_SERVER_IP}"',
             f"poll_interval_seconds = {DEFAULT_POLL_INTERVAL_SECONDS}",
             f"gpu_idle_memory_mb = {DEFAULT_GPU_IDLE_MEMORY_MB}",
+            f"gpu_idle_required_checks = {DEFAULT_GPU_IDLE_REQUIRED_CHECKS}",
             f"auto_retry_max_retries = {DEFAULT_AUTO_RETRY_MAX_RETRIES}",
             f"auto_retry_delay_seconds = {DEFAULT_AUTO_RETRY_DELAY_SECONDS}",
             f'state_dir = "{DEFAULT_STATE_DIR}"',
