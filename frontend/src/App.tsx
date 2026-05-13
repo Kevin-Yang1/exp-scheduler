@@ -27,9 +27,11 @@ import {
   Loader2,
   Maximize2,
   Minimize2,
-  Bookmark,
-  Edit2
-} from 'lucide-react';
+	  Bookmark,
+	  Edit2,
+	  Link2,
+	  Search
+	} from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import React, { useCallback, useEffect, useMemo, useRef, useState, ReactNode, FormEvent } from 'react';
 import { FitAddon } from '@xterm/addon-fit';
@@ -73,8 +75,15 @@ interface Task {
   gpuMemoryBudgetMb?: number | null;
   profileId?: number | null;
   queueName?: 'normal' | 'urgent';
+  dependsOn?: number[];
+  dependencyCount?: number;
+  hasDependencies?: boolean;
   raw?: BackendTask;
 }
+
+type DependencyCandidate = Pick<Task, 'id' | 'name' | 'status'> & {
+  isMissingDependency?: boolean;
+};
 
 interface BackendTask {
   id: number;
@@ -94,6 +103,9 @@ interface BackendTask {
   exit_code?: number | null;
   attempt_count?: number | null;
   queue_name?: 'normal' | 'urgent';
+  depends_on?: number[];
+  dependency_count?: number;
+  has_dependencies?: boolean;
 }
 
 interface BackendGPU {
@@ -104,6 +116,7 @@ interface BackendGPU {
   memory_free_mb?: number;
   utilization_gpu: number;
   is_idle: boolean;
+  physically_idle?: boolean;
   globally_enabled: boolean;
   scheduler_occupied?: boolean;
   has_processes?: boolean;
@@ -122,6 +135,26 @@ interface SchedulerSettings {
   poll_interval_seconds: number;
   gpu_idle_required_checks: number;
   effective_wait_seconds: number;
+  auto_restore_idle_gpu_seconds: number | null;
+  auto_restore_idle_gpu_enabled?: boolean;
+  auto_retry_enabled: boolean;
+  auto_retry_max_retries: number;
+  auto_retry_delay_seconds: number;
+}
+
+type ActivityLogLevel = 'info' | 'success' | 'warning' | 'error';
+
+interface ActivityLogEntry {
+  id: number;
+  created_at: string;
+  level: ActivityLogLevel;
+  source: string;
+  action: string;
+  entity_type?: string | null;
+  entity_id?: number | null;
+  title: string;
+  detail?: string | null;
+  metadata?: Record<string, unknown>;
 }
 
 interface DiscoveryItem {
@@ -196,6 +229,47 @@ function formatScheduleTime(value?: string) {
   });
 }
 
+function taskStatusLabel(status: Task['status']) {
+  switch (status) {
+    case 'pending': return '排队中';
+    case 'running': return '运行中';
+    case 'succeeded': return '成功';
+    case 'failed': return '失败';
+    case 'cancelled': return '取消';
+    case 'interrupted': return '中断';
+    default: return status;
+  }
+}
+
+function activityLevelLabel(level: string) {
+  switch (level) {
+    case 'success': return '成功';
+    case 'warning': return '警告';
+    case 'error': return '错误';
+    default: return '信息';
+  }
+}
+
+function activityLevelStyle(level: string) {
+  switch (level) {
+    case 'success': return 'bg-emerald-50 text-emerald-700 border-emerald-100';
+    case 'warning': return 'bg-amber-50 text-amber-700 border-amber-100';
+    case 'error': return 'bg-rose-50 text-rose-700 border-rose-100';
+    default: return 'bg-blue-50 text-blue-700 border-blue-100';
+  }
+}
+
+function activityEntityLabel(entityType?: string | null) {
+  switch (entityType) {
+    case 'task': return '任务';
+    case 'queue': return '队列';
+    case 'gpu': return 'GPU';
+    case 'profile': return '环境';
+    case 'scheduler': return '调度器';
+    default: return '系统';
+  }
+}
+
 function mapTask(task: BackendTask): Task {
   return {
     id: String(task.id),
@@ -216,6 +290,9 @@ function mapTask(task: BackendTask): Task {
     gpuMemoryBudgetMb: task.gpu_memory_budget_mb ?? null,
     profileId: task.profile_id ?? null,
     queueName: task.queue_name || 'normal',
+    dependsOn: task.depends_on || [],
+    dependencyCount: task.dependency_count ?? (task.depends_on?.length || 0),
+    hasDependencies: task.has_dependencies ?? ((task.depends_on?.length || 0) > 0),
     raw: task,
   };
 }
@@ -228,11 +305,11 @@ function mapGpu(gpu: BackendGPU): GPUStatus {
     memoryTotal: gpu.memory_total_mb || 0,
     memoryFree: gpu.memory_free_mb ?? Math.max(0, (gpu.memory_total_mb || 0) - (gpu.memory_used_mb || 0)),
     utilization: gpu.utilization_gpu || 0,
-    isBusy: !gpu.is_idle || Boolean(gpu.scheduler_occupied || gpu.has_processes),
+    isBusy: !(gpu.physically_idle ?? gpu.is_idle) || Boolean(gpu.scheduler_occupied || gpu.has_processes),
   };
 }
 
-type AppTab = 'dashboard' | 'queue' | 'history' | 'nvitop' | 'settings';
+type AppTab = 'dashboard' | 'queue' | 'history' | 'activity' | 'nvitop' | 'settings';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('dashboard');
@@ -245,6 +322,11 @@ export default function App() {
   const [gpuSchedule, setGpuSchedule] = useState<Record<string, GpuScheduleEntry>>({});
   const [gpuScheduleDrafts, setGpuScheduleDrafts] = useState<Record<string, string>>({});
   const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [activityLogs, setActivityLogs] = useState<ActivityLogEntry[]>([]);
+  const [activityLevelFilter, setActivityLevelFilter] = useState('all');
+  const [activityEntityFilter, setActivityEntityFilter] = useState('all');
+  const [activitySearch, setActivitySearch] = useState('');
+  const [expandedActivityLogId, setExpandedActivityLogId] = useState<number | null>(null);
   const [isConsoleFullScreen, setIsConsoleFullScreen] = useState(false);
   const [isNvitopFullScreen, setIsNvitopFullScreen] = useState(false);
   const [gpus, setGpus] = useState<GPUStatus[]>([]);
@@ -280,6 +362,7 @@ export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [schedulerSettings, setSchedulerSettings] = useState<SchedulerSettings | null>(null);
   const [schedulerSettingsDraft, setSchedulerSettingsDraft] = useState<Partial<SchedulerSettings>>({});
+  const [autoRestoreMinutesDraft, setAutoRestoreMinutesDraft] = useState<string | null>(null);
   const [discovery, setDiscovery] = useState<DiscoveryState>({ conda_envs: [], venvs: [] });
   const [selectedDiscoveryId, setSelectedDiscoveryId] = useState('');
   const [managedProfileId, setManagedProfileId] = useState('');
@@ -301,6 +384,44 @@ export default function App() {
   const failedCount = historyTasks.filter(t => t.status === 'failed' || t.status === 'interrupted').length;
   const failureRate = historyTasks.length ? `${((failedCount / historyTasks.length) * 100).toFixed(1)}%` : '0%';
   const canUseBatchDelete = activeTab === 'queue' || activeTab === 'history';
+  const dependencyCandidates = useMemo<DependencyCandidate[]>(() => {
+    const currentTaskId = taskDraft?.id;
+    const selectedIds = new Set((taskDraft?.dependsOn || []).map(String));
+    const knownCandidates: DependencyCandidate[] = tasks.filter(task =>
+      task.id !== currentTaskId &&
+      (task.status === 'pending' || task.status === 'running' || selectedIds.has(task.id))
+    );
+    const knownIds = new Set(knownCandidates.map(task => task.id));
+    const missingCandidates: DependencyCandidate[] = Array.from(selectedIds)
+      .filter(id => id !== currentTaskId && !knownIds.has(id))
+      .map(id => ({
+        id,
+        name: '当前列表外任务',
+        status: 'pending',
+        isMissingDependency: true,
+    }));
+    return [...knownCandidates, ...missingCandidates];
+  }, [taskDraft, tasks]);
+  const isMetadataOnlyTaskEdit = Boolean(isEditingTask && taskDraft && taskDraft.status !== 'pending');
+  const autoRestoreIdleGpuSeconds = schedulerSettingsDraft.auto_restore_idle_gpu_seconds !== undefined
+    ? schedulerSettingsDraft.auto_restore_idle_gpu_seconds
+    : (schedulerSettings?.auto_restore_idle_gpu_seconds ?? 300);
+  const autoRestoreIdleGpuEnabled = typeof autoRestoreIdleGpuSeconds === 'number' && autoRestoreIdleGpuSeconds > 0;
+  const autoRestoreIdleGpuMinutes = autoRestoreMinutesDraft ?? (
+    autoRestoreIdleGpuEnabled && typeof autoRestoreIdleGpuSeconds === 'number'
+      ? String(Number((autoRestoreIdleGpuSeconds / 60).toFixed(2)))
+      : ''
+  );
+  const autoRetryEnabled = schedulerSettingsDraft.auto_retry_enabled
+    ?? schedulerSettings?.auto_retry_enabled
+    ?? false;
+  const autoRetryMaxRetries = schedulerSettingsDraft.auto_retry_max_retries
+    ?? schedulerSettings?.auto_retry_max_retries
+    ?? (autoRetryEnabled ? 1 : 0);
+  const autoRetryDelaySeconds = schedulerSettingsDraft.auto_retry_delay_seconds
+    ?? schedulerSettings?.auto_retry_delay_seconds
+    ?? 5;
+  const hasSchedulerSettingsDraft = Object.keys(schedulerSettingsDraft).length > 0 || autoRestoreMinutesDraft !== null;
 
   useEffect(() => {
     setIsBatchDeleteMode(false);
@@ -348,6 +469,22 @@ export default function App() {
     });
   }, []);
 
+  const loadActivityLogs = useCallback(async () => {
+    const params = new URLSearchParams({ limit: '300' });
+    if (activityLevelFilter !== 'all') {
+      params.set('level', activityLevelFilter);
+    }
+    if (activityEntityFilter !== 'all') {
+      params.set('entity_type', activityEntityFilter);
+    }
+    const query = activitySearch.trim();
+    if (query) {
+      params.set('query', query);
+    }
+    const payload = await api<{ logs: ActivityLogEntry[] }>(`/api/activity/logs?${params.toString()}`);
+    setActivityLogs(payload.logs || []);
+  }, [activityEntityFilter, activityLevelFilter, activitySearch]);
+
   useEffect(() => {
     refreshAll().catch(error => setMessage(error.message));
     const source = new EventSource('/api/events');
@@ -365,6 +502,17 @@ export default function App() {
       window.clearInterval(timer);
     };
   }, [refreshAll]);
+
+  useEffect(() => {
+    if (activeTab !== 'activity') return;
+    loadActivityLogs().catch(error => setMessage(error.message));
+    const timer = window.setInterval(() => {
+      loadActivityLogs().catch(() => {});
+    }, 5000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [activeTab, loadActivityLogs]);
 
   useEffect(() => {
     if (!selectedTaskId) {
@@ -439,18 +587,58 @@ export default function App() {
 
   const saveSchedulerSettings = async () => {
     try {
-      const current = schedulerSettings || { poll_interval_seconds: 1, gpu_idle_required_checks: 1, effective_wait_seconds: 1 };
+      const current = schedulerSettings || {
+        poll_interval_seconds: 1,
+        gpu_idle_required_checks: 1,
+        effective_wait_seconds: 1,
+        auto_restore_idle_gpu_seconds: 300,
+        auto_retry_enabled: false,
+        auto_retry_max_retries: 0,
+        auto_retry_delay_seconds: 5,
+      };
       const merged = {
         ...current,
         ...schedulerSettingsDraft
       };
+      const retryEnabled = Boolean(merged.auto_retry_enabled);
+      let autoRestoreIdleGpuSecondsForSave = merged.auto_restore_idle_gpu_seconds ?? null;
+      if (autoRestoreMinutesDraft !== null && autoRestoreIdleGpuSecondsForSave !== null) {
+        const minutesText = autoRestoreMinutesDraft.trim();
+        const minutes = Number(minutesText);
+        if (!minutesText || !Number.isFinite(minutes) || minutes <= 0) {
+          setMessage('GPU 自动恢复等待时间必须大于 0，或关闭此功能');
+          return;
+        }
+        autoRestoreIdleGpuSecondsForSave = minutes * 60;
+      }
       
-      if (merged.poll_interval_seconds <= 0) {
+      if (merged.poll_interval_seconds <= 0 || !Number.isFinite(merged.poll_interval_seconds)) {
         setMessage('轮询间隔必须大于 0');
         return;
       }
       if (merged.gpu_idle_required_checks < 1 || !Number.isInteger(merged.gpu_idle_required_checks)) {
         setMessage('GPU 空闲确认次数必须是大于等于 1 的整数');
+        return;
+      }
+      if (
+        autoRestoreIdleGpuSecondsForSave !== null &&
+        autoRestoreIdleGpuSecondsForSave <= 0
+      ) {
+        setMessage('GPU 自动恢复等待时间必须大于 0，或关闭此功能');
+        return;
+      }
+      if (
+        retryEnabled &&
+        (merged.auto_retry_max_retries < 1 || !Number.isInteger(merged.auto_retry_max_retries))
+      ) {
+        setMessage('自动重试开启时，重试次数必须是大于等于 1 的整数');
+        return;
+      }
+      if (
+        merged.auto_retry_delay_seconds < 0 ||
+        !Number.isInteger(merged.auto_retry_delay_seconds)
+      ) {
+        setMessage('自动重试延迟必须是大于等于 0 的整数秒');
         return;
       }
       
@@ -459,10 +647,15 @@ export default function App() {
         body: JSON.stringify({
           poll_interval_seconds: merged.poll_interval_seconds,
           gpu_idle_required_checks: merged.gpu_idle_required_checks,
+          auto_restore_idle_gpu_seconds: autoRestoreIdleGpuSecondsForSave,
+          auto_retry_enabled: retryEnabled,
+          auto_retry_max_retries: retryEnabled ? merged.auto_retry_max_retries : 0,
+          auto_retry_delay_seconds: merged.auto_retry_delay_seconds,
         }),
       });
       setSchedulerSettings(res);
       setSchedulerSettingsDraft({});
+      setAutoRestoreMinutesDraft(null);
       setMessage('调控器设置已更新');
     } catch (error) {
       if (error instanceof Error) {
@@ -525,16 +718,32 @@ export default function App() {
     event.preventDefault();
     const formData = new FormData(event.currentTarget);
     try {
+      const name = String(formData.get('name') || '').trim() || null;
+      const notes = String(formData.get('notes') || '').trim() || null;
+      if (isMetadataOnlyTaskEdit && taskDraft) {
+        await api(`/api/tasks/${taskDraft.id}/metadata`, {
+          method: 'PATCH',
+          body: JSON.stringify({ name, notes }),
+        });
+        setMessage(`任务 #${taskDraft.id} 记录信息已更新。`);
+        closeNewTaskModal();
+        await refreshAll();
+        return;
+      }
+
+      const dependsOnRaw = formData.getAll('depends_on');
+      const depends_on = dependsOnRaw.map(Number).filter(n => !isNaN(n));
       const payload = {
-        name: String(formData.get('name') || '').trim() || null,
+        name,
         command: String(formData.get('command') || ''),
         cwd: String(formData.get('cwd') || '').trim() || null,
-        notes: String(formData.get('notes') || '').trim() || null,
+        notes,
         env: parseEnv(String(formData.get('env') || '')),
         is_urgent: Boolean(formData.get('is_urgent')),
         requested_gpu: formData.get('requested_gpu') ? Number(formData.get('requested_gpu')) : null,
         gpu_memory_budget_mb: formData.get('gpu_memory_budget_gb') ? Math.round(Number(formData.get('gpu_memory_budget_gb')) * 1024) : null,
         profile_id: formData.get('profile_id') ? Number(formData.get('profile_id')) : null,
+        depends_on,
       };
 
       if (isEditingTask && taskDraft) {
@@ -742,7 +951,16 @@ export default function App() {
     setTaskDraft(task);
     setIsEditingTask(true);
     setShowNewTask(true);
-    setMessage(`正在重新编辑任务 #${task.id}。`);
+    setMessage(task.status === 'pending' ? `正在重新编辑任务 #${task.id}。` : `正在编辑任务 #${task.id} 的记录信息。`);
+  };
+
+  const copyActivityLog = async (log: ActivityLogEntry) => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(log, null, 2));
+      setMessage(`日志 #${log.id} 已复制。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '日志复制失败');
+    }
   };
 
   const saveProfile = async (event: FormEvent<HTMLFormElement>) => {
@@ -842,6 +1060,12 @@ export default function App() {
             icon={<Settings className="w-5 h-5" />}
             label="资源与环境"
           />
+          <NavItem
+            active={activeTab === 'activity'}
+            onClick={() => setActiveTab('activity')}
+            icon={<FileText className="w-5 h-5" />}
+            label="系统日志"
+          />
 
           <div className="mt-8 pt-6 border-t border-slate-100">
             <p className="px-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3">活跃流水线</p>
@@ -892,18 +1116,20 @@ export default function App() {
         <header className="h-16 bg-white border-b border-slate-200 px-6 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-3">
             <div className="p-2 bg-slate-50 text-slate-400 rounded-lg border border-slate-100">
-              {activeTab === 'dashboard' && <Monitor className="w-4 h-4" />}
-              {activeTab === 'queue' && <Layers className="w-4 h-4" />}
-              {activeTab === 'history' && <History className="w-4 h-4" />}
-              {activeTab === 'nvitop' && <Terminal className="w-4 h-4" />}
-              {activeTab === 'settings' && <Settings className="w-4 h-4" />}
+	              {activeTab === 'dashboard' && <Monitor className="w-4 h-4" />}
+	              {activeTab === 'queue' && <Layers className="w-4 h-4" />}
+	              {activeTab === 'history' && <History className="w-4 h-4" />}
+	              {activeTab === 'activity' && <FileText className="w-4 h-4" />}
+	              {activeTab === 'nvitop' && <Terminal className="w-4 h-4" />}
+	              {activeTab === 'settings' && <Settings className="w-4 h-4" />}
             </div>
             <h2 className="text-lg font-bold text-slate-900 tracking-tight">
-              {activeTab === 'dashboard' && '控制台概览'}
-              {activeTab === 'queue' && '任务队列'}
-              {activeTab === 'history' && '历史记录'}
-              {activeTab === 'nvitop' && 'GPU 监控'}
-              {activeTab === 'settings' && '资源与环境'}
+	              {activeTab === 'dashboard' && '控制台概览'}
+	              {activeTab === 'queue' && '任务队列'}
+	              {activeTab === 'history' && '历史记录'}
+	              {activeTab === 'activity' && '系统日志'}
+	              {activeTab === 'nvitop' && 'GPU 监控'}
+	              {activeTab === 'settings' && '资源与环境'}
             </h2>
           </div>
 
@@ -1166,12 +1392,155 @@ export default function App() {
                     </div>
                   )}
                 </div>
-              </motion.div>
-            )}
+	              </motion.div>
+	            )}
 
-            {activeTab === 'queue' && (
-              <motion.div
-                key="queue"
+	            {activeTab === 'activity' && (
+	              <motion.div
+	                key="activity"
+	                initial={{ opacity: 0, y: 10 }}
+	                animate={{ opacity: 1, y: 0 }}
+	                exit={{ opacity: 0, y: -10 }}
+	                className="space-y-4"
+	              >
+	                <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+	                  <div className="p-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between gap-4 flex-wrap">
+	                    <div className="flex items-center gap-3">
+	                      <div className="p-2 bg-blue-600 rounded-lg text-white">
+	                        <FileText className="w-5 h-5" />
+	                      </div>
+	                      <div>
+	                        <h3 className="font-bold text-slate-800 text-base">系统日志</h3>
+	                        <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Activity Log</p>
+	                      </div>
+	                    </div>
+	                    <div className="flex items-center gap-2">
+	                      <button
+	                        onClick={() => loadActivityLogs().catch(error => setMessage(error.message))}
+	                        className="flex items-center gap-2 px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 rounded-lg text-xs font-bold transition-colors shadow-sm"
+	                      >
+	                        <RefreshCcw className="w-3.5 h-3.5" />
+	                        刷新
+	                      </button>
+	                    </div>
+	                  </div>
+
+	                  <div className="p-4 border-b border-slate-100 bg-white grid grid-cols-1 lg:grid-cols-12 gap-3">
+	                    <div className="lg:col-span-6 relative">
+	                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+	                      <input
+	                        value={activitySearch}
+	                        onChange={(event) => setActivitySearch(event.target.value)}
+	                        placeholder="搜索任务 ID、任务名、命令、环境变量、备注..."
+	                        className="w-full bg-slate-50 border border-slate-200 rounded-lg pl-9 pr-3 py-2 text-sm text-slate-700 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+	                      />
+	                    </div>
+	                    <select
+	                      value={activityLevelFilter}
+	                      onChange={(event) => setActivityLevelFilter(event.target.value)}
+	                      className="lg:col-span-3 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer"
+	                    >
+	                      <option value="all">全部级别</option>
+	                      <option value="success">成功</option>
+	                      <option value="info">信息</option>
+	                      <option value="warning">警告</option>
+	                      <option value="error">错误</option>
+	                    </select>
+	                    <select
+	                      value={activityEntityFilter}
+	                      onChange={(event) => setActivityEntityFilter(event.target.value)}
+	                      className="lg:col-span-3 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer"
+	                    >
+	                      <option value="all">全部对象</option>
+	                      <option value="task">任务</option>
+	                      <option value="queue">队列</option>
+	                      <option value="gpu">GPU</option>
+	                      <option value="profile">环境模板</option>
+	                      <option value="scheduler">调度器</option>
+	                    </select>
+	                  </div>
+
+	                  <div className="p-4 bg-slate-50/50 space-y-3">
+	                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+	                      <StatCard label="当前列表" value={String(activityLogs.length)} type="neutral" />
+	                      <StatCard label="错误" value={String(activityLogs.filter(log => log.level === 'error').length)} type="rose" />
+	                      <StatCard label="警告" value={String(activityLogs.filter(log => log.level === 'warning').length)} type="amber" />
+	                      <StatCard label="成功" value={String(activityLogs.filter(log => log.level === 'success').length)} type="blue" />
+	                    </div>
+
+	                    {activityLogs.map(log => {
+	                      const expanded = expandedActivityLogId === log.id;
+	                      const metadataText = JSON.stringify(log.metadata || {}, null, 2);
+	                      return (
+	                        <div key={log.id} className="bg-white border border-slate-200 rounded-xl shadow-sm hover:border-blue-200 transition-colors overflow-hidden">
+	                          <button
+	                            type="button"
+	                            onClick={() => setExpandedActivityLogId(expanded ? null : log.id)}
+	                            className="w-full text-left p-4 flex items-start justify-between gap-4"
+	                          >
+	                            <div className="min-w-0 flex-1 space-y-2">
+	                              <div className="flex items-center gap-2 min-w-0 flex-wrap">
+	                                <span className={`px-2 py-0.5 rounded border text-[9px] font-bold ${activityLevelStyle(log.level)}`}>
+	                                  {activityLevelLabel(log.level)}
+	                                </span>
+	                                <span className="text-[10px] text-slate-400 font-mono">#{log.id}</span>
+	                                <span className="text-[10px] text-slate-400 font-mono">{formatTime(log.created_at)}</span>
+	                                <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{log.source}</span>
+	                                <span className="text-[10px] text-slate-400 font-mono truncate">{log.action}</span>
+	                              </div>
+	                              <div className="flex items-center gap-2 min-w-0">
+	                                <h4 className="font-bold text-slate-900 text-[13px] truncate">{log.title}</h4>
+	                                <span className="shrink-0 px-1.5 py-0.5 rounded bg-slate-50 border border-slate-100 text-[9px] text-slate-500 font-bold">
+	                                  {activityEntityLabel(log.entity_type)}
+	                                  {log.entity_id !== null && log.entity_id !== undefined ? ` #${log.entity_id}` : ''}
+	                                </span>
+	                              </div>
+	                              {log.detail && (
+	                                <p className="text-[11px] text-slate-500 truncate">{log.detail}</p>
+	                              )}
+	                            </div>
+	                            <ChevronRight className={`w-4 h-4 text-slate-300 shrink-0 mt-1 transition-transform ${expanded ? 'rotate-90' : ''}`} />
+	                          </button>
+	                          {expanded && (
+	                            <div className="px-4 pb-4 space-y-3 border-t border-slate-100 bg-slate-50/40">
+	                              <div className="pt-3 flex items-center justify-between">
+	                                <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">完整详情</span>
+	                                <button
+	                                  onClick={() => copyActivityLog(log)}
+	                                  className="flex items-center gap-1.5 px-2.5 py-1 bg-white border border-slate-200 hover:bg-slate-50 text-slate-500 rounded text-[10px] font-bold transition-colors"
+	                                >
+	                                  <Copy className="w-3 h-3" />
+	                                  复制 JSON
+	                                </button>
+	                              </div>
+	                              {log.detail && (
+	                                <div className="bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-600 whitespace-pre-wrap">
+	                                  {log.detail}
+	                                </div>
+	                              )}
+	                              <pre className="bg-slate-950 text-slate-200 rounded-lg p-4 text-[11px] leading-relaxed overflow-auto max-h-[520px] custom-scrollbar">
+	                                {metadataText}
+	                              </pre>
+	                            </div>
+	                          )}
+	                        </div>
+	                      );
+	                    })}
+
+	                    {activityLogs.length === 0 && (
+	                      <div className="p-12 text-center text-slate-400 space-y-2 bg-white rounded-xl border border-slate-200">
+	                        <FileText className="w-8 h-8 mx-auto opacity-20" />
+	                        <p className="text-sm">暂无符合条件的系统日志</p>
+	                      </div>
+	                    )}
+	                  </div>
+	                </div>
+	              </motion.div>
+	            )}
+
+	            {activeTab === 'queue' && (
+	              <motion.div
+	                key="queue"
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
@@ -1313,7 +1682,7 @@ export default function App() {
                     <div className="space-y-6">
                       <div className="space-y-3">
                         <p className="text-xs font-bold text-slate-500 uppercase tracking-widest">全局可用 GPU (Global Select)</p>
-                        <div className="flex gap-4">
+                        <div className="flex flex-wrap items-start gap-4">
                           {gpus.map(gpu => {
                             const schedule = gpuSchedule[String(gpu.id)];
                             return (
@@ -1361,6 +1730,60 @@ export default function App() {
                             </div>
                           );
                           })}
+                          <div className="flex w-[210px] max-w-full self-start flex-col gap-3 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3">
+                            <label className="flex items-start gap-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={autoRestoreIdleGpuEnabled}
+                                onChange={(event) => {
+                                  setAutoRestoreMinutesDraft(null);
+                                  setSchedulerSettingsDraft(prev => ({
+                                    ...prev,
+                                    auto_restore_idle_gpu_seconds: event.target.checked
+                                      ? (schedulerSettings?.auto_restore_idle_gpu_seconds || 300)
+                                      : null,
+                                  }));
+                                }}
+                                className="mt-0.5 w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                              />
+                              <span>
+                                <span className="block text-sm font-bold text-slate-900">空闲自动恢复可用</span>
+                                <span className="block text-[10px] font-bold uppercase tracking-widest text-emerald-700">Idle Auto Restore</span>
+                              </span>
+                            </label>
+                            <div className="space-y-1">
+                              <span className="block text-xs font-bold text-slate-700">等待时间 (分钟)</span>
+                              <div className="flex items-center gap-2">
+                                <input
+                                  type="number"
+                                  min="0.1"
+                                  step="1"
+                                  disabled={!autoRestoreIdleGpuEnabled}
+                                  value={autoRestoreIdleGpuMinutes}
+                                  onChange={(event) => {
+                                    setAutoRestoreMinutesDraft(event.target.value);
+                                    setSchedulerSettingsDraft(prev => ({
+                                      ...prev,
+                                      auto_restore_idle_gpu_seconds: autoRestoreIdleGpuSeconds || 300,
+                                    }));
+                                  }}
+                                  className="w-[112px] rounded-lg border border-emerald-100 bg-white px-3 py-2 text-sm font-bold text-slate-900 outline-none transition-colors focus:border-emerald-500 disabled:bg-slate-100 disabled:text-slate-400"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={saveSchedulerSettings}
+                                  disabled={!hasSchedulerSettingsDraft}
+                                  className={`px-4 py-2.5 rounded-lg text-sm font-bold transition-all ${
+                                    !hasSchedulerSettingsDraft
+                                      ? 'bg-white/70 text-slate-400 border border-emerald-100 cursor-not-allowed'
+                                      : 'bg-emerald-600 text-white shadow-sm hover:bg-emerald-700 active:scale-95'
+                                  }`}
+                                >
+                                  保存
+                                </button>
+                              </div>
+                            </div>
+                          </div>
                         </div>
                       </div>
 
@@ -1431,21 +1854,100 @@ export default function App() {
                       </div>
 
                       <div className="space-y-2">
-                        <label className="block text-xs font-bold text-slate-700">实际生效等待时间 (只读)</label>
+                        <label className="block text-xs font-bold text-slate-700">外部空闲等待时间 (只读)</label>
                         <div className="w-full bg-slate-100 border border-slate-200 rounded-lg px-3 py-2 text-sm font-bold text-slate-600 flex items-center justify-between">
                           <span>{schedulerSettings?.effective_wait_seconds ?? '-'} 秒</span>
                           <Clock className="w-4 h-4 text-slate-400" />
                         </div>
-                        <p className="text-[10px] text-slate-500 font-medium">任务派发前的实际最小等待时长</p>
+                        <p className="text-[10px] text-slate-500 font-medium">外部释放或未知占用后使用；调度器任务结束后快速接续</p>
+                      </div>
+                    </div>
+
+                    <div className="mt-6 border-t border-slate-100 pt-5 space-y-4">
+                      <label className="inline-flex items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoRetryEnabled}
+                          onChange={(event) => {
+                            const enabled = event.target.checked;
+                            setSchedulerSettingsDraft(prev => ({
+                              ...prev,
+                              auto_retry_enabled: enabled,
+                              auto_retry_max_retries: enabled
+                                ? Math.max(1, schedulerSettings?.auto_retry_max_retries ?? 1)
+                                : 0,
+                            }));
+                          }}
+                          className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                        />
+                        <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600 border border-emerald-100">
+                          <RefreshCcw className="h-4 w-4" />
+                        </span>
+                        <span>
+                          <span className="block text-sm font-bold text-slate-900">OOM / CUDA 资源错误自动重试</span>
+                          <span className="block text-[10px] font-bold uppercase tracking-widest text-slate-400">Auto Retry</span>
+                        </span>
+                      </label>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <div className="space-y-2">
+                          <label className="block text-xs font-bold text-slate-700">额外重试次数</label>
+                          <input
+                            type="number"
+                            step="1"
+                            min="1"
+                            disabled={!autoRetryEnabled}
+                            value={autoRetryEnabled ? autoRetryMaxRetries : 0}
+                            onChange={(event) => {
+                              const value = parseInt(event.target.value, 10);
+                              setSchedulerSettingsDraft(prev => ({
+                                ...prev,
+                                auto_retry_enabled: true,
+                                auto_retry_max_retries: Number.isFinite(value) ? value : 1,
+                              }));
+                            }}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 disabled:bg-slate-100 disabled:text-slate-400 transition-colors"
+                          />
+                          <p className="text-[10px] text-slate-500 font-medium">1 表示失败后最多再跑一次</p>
+                        </div>
+
+                        <div className="space-y-2">
+                          <label className="block text-xs font-bold text-slate-700">重试延迟 (秒)</label>
+                          <input
+                            type="number"
+                            step="1"
+                            min="0"
+                            disabled={!autoRetryEnabled}
+                            value={autoRetryDelaySeconds}
+                            onChange={(event) => {
+                              const value = parseInt(event.target.value, 10);
+                              setSchedulerSettingsDraft(prev => ({
+                                ...prev,
+                                auto_retry_delay_seconds: Number.isFinite(value) ? value : 0,
+                              }));
+                            }}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 disabled:bg-slate-100 disabled:text-slate-400 transition-colors"
+                          />
+                          <p className="text-[10px] text-slate-500 font-medium">重新回队列前等待的时间</p>
+                        </div>
+
+                        <div className="space-y-2">
+                          <label className="block text-xs font-bold text-slate-700">当前状态</label>
+                          <div className="w-full bg-slate-100 border border-slate-200 rounded-lg px-3 py-2 text-sm font-bold text-slate-600 flex items-center justify-between">
+                            <span>{autoRetryEnabled ? `开启，最多 ${autoRetryMaxRetries + 1} 次尝试` : '关闭'}</span>
+                            <AlertCircle className="w-4 h-4 text-slate-400" />
+                          </div>
+                          <p className="text-[10px] text-slate-500 font-medium">普通业务失败仍然不会自动重试</p>
+                        </div>
                       </div>
                     </div>
 
                     <div className="flex justify-end pt-4 border-t border-slate-100 mt-6">
                       <button
                         onClick={saveSchedulerSettings}
-                        disabled={Object.keys(schedulerSettingsDraft).length === 0}
+                        disabled={!hasSchedulerSettingsDraft}
                         className={`px-8 py-2.5 rounded-lg text-sm font-bold shadow-sm transition-all focus:ring-2 focus:ring-emerald-500/20 focus:ring-offset-2 ${
-                          Object.keys(schedulerSettingsDraft).length === 0
+                          !hasSchedulerSettingsDraft
                             ? 'bg-slate-100 text-slate-400 border-transparent cursor-not-allowed'
                             : 'bg-emerald-600 hover:bg-emerald-700 text-white border-transparent active:scale-95'
                         }`}
@@ -1575,8 +2077,8 @@ export default function App() {
             >
               <div className="px-8 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
                 <div>
-                  <h2 className="text-lg font-bold text-slate-900 tracking-tight">{taskDraft ? (isEditingTask ? '编辑任务' : '复用任务创建新任务') : '创建新运行时任务'}</h2>
-                  <p className="text-xs text-slate-500 font-medium">{taskDraft ? (isEditingTask ? `配置任务 #${taskDraft.id} 并提交更新` : `已填入任务 #${taskDraft.id} 的参数，可修改后提交`) : '配置参数并提交给调度系统'}</p>
+                  <h2 className="text-lg font-bold text-slate-900 tracking-tight">{isMetadataOnlyTaskEdit ? '编辑记录信息' : taskDraft ? (isEditingTask ? '编辑任务' : '复用任务创建新任务') : '创建新运行时任务'}</h2>
+                  <p className="text-xs text-slate-500 font-medium">{isMetadataOnlyTaskEdit ? `任务 #${taskDraft?.id} 的名称和备注` : taskDraft ? (isEditingTask ? `配置任务 #${taskDraft.id} 并提交更新` : `已填入任务 #${taskDraft.id} 的参数，可修改后提交`) : '配置参数并提交给调度系统'}</p>
                 </div>
                 <button onClick={closeNewTaskModal} className="p-2 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-900 transition-colors">
                   <Plus className="w-5 h-5 rotate-45" />
@@ -1586,113 +2088,157 @@ export default function App() {
               <form key={taskDraft?.id || 'new'} onSubmit={submitTask} className="px-8 py-5 space-y-4 overflow-y-auto max-h-[80vh] custom-scrollbar">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
                   {/* Task Name */}
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">任务名称</label>
-                      <input
+	                  <div className="space-y-1.5 md:col-span-2">
+	                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">任务名称</label>
+	                      <input
                         type="text"
                           name="name"
                           defaultValue={taskDraft?.name || ''}
                         placeholder="例如: llama-sft"
-                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-                      />
-                  </div>
+	                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+	                      />
+	                  </div>
 
-                  {/* Environment Template */}
+	                  {isMetadataOnlyTaskEdit && (
+	                    <div className="space-y-1.5 md:col-span-2">
+	                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">备注说明</label>
+	                      <input
+	                        type="text"
+	                        name="notes"
+	                        defaultValue={taskDraft?.notes || ''}
+	                        placeholder="可选备注"
+	                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+	                      />
+	                    </div>
+	                  )}
+
+	                  {!isMetadataOnlyTaskEdit && (
+	                    <>
+	                      {/* Environment Template */}
+	                      <div className="space-y-1.5">
+	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">环境模板</label>
+	                          <select name="profile_id" defaultValue={taskDraft?.profileId ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
+	                            <option value="">不使用环境模板</option>
+	                              {profiles.map(profile => (
+	                                <option key={profile.id} value={profile.id}>{profile.name}</option>
+	                              ))}
+	                          </select>
+	                      </div>
+
+	                      {/* GPU Selection */}
+	                      <div className="space-y-1.5">
+	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">指定 GPU</label>
+	                          <select name="requested_gpu" defaultValue={taskDraft?.requestedGpu ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
+	                            <option value="">自动分配</option>
+	                              {gpus.map(gpu => (
+	                                <option key={gpu.id} value={gpu.id}>GPU {gpu.id} ({gpu.name})</option>
+	                              ))}
+	                          </select>
+	                      </div>
+
+	                      {/* Queue Type */}
+	                      <div className="space-y-1.5">
+	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">队列策略</label>
+	                        <div className="flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-lg px-4 py-[7px] cursor-pointer hover:bg-slate-100 transition-all">
+	                            <input type="checkbox" name="is_urgent" defaultChecked={Boolean(taskDraft?.isUrgent)} className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+	                          <span className="text-sm font-semibold text-slate-600">加入紧急队列 (Priority)</span>
+	                        </div>
+	                      </div>
+
+	                      {/* GPU Memory Budget */}
+	                      <div className="space-y-1.5">
+	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">显存预算 (GB)</label>
+	                        <input
+	                          type="number"
+	                          min="0"
+	                          step="0.1"
+	                          name="gpu_memory_budget_gb"
+	                          defaultValue={taskDraft?.gpuMemoryBudgetMb ? taskDraft.gpuMemoryBudgetMb / 1024 : ''}
+	                          placeholder="不填写则使用默认空闲阈值"
+	                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+	                        />
+	                      </div>
+	                    </>
+	                  )}
+	                </div>
+
+	                {/* Dependencies */}
+	                {!isMetadataOnlyTaskEdit && dependencyCandidates.length > 0 && (
                   <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">环境模板</label>
-                      <select name="profile_id" defaultValue={taskDraft?.profileId ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
-                        <option value="">不使用环境模板</option>
-                          {profiles.map(profile => (
-                            <option key={profile.id} value={profile.id}>{profile.name}</option>
-                          ))}
-                      </select>
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">依赖任务 (Dependencies)</label>
+                    <p className="text-[11px] text-slate-400">选择前置任务，全部成功完成后才会调度当前任务</p>
+                    <select
+                      name="depends_on"
+                      multiple
+                      size={Math.min(4, dependencyCandidates.length)}
+                      defaultValue={taskDraft?.dependsOn?.map(String) || []}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors"
+                    >
+                      {dependencyCandidates
+                        .map(candidate => (
+                          <option key={candidate.id} value={candidate.id}>
+                            #{candidate.id} {candidate.name} ({candidate.isMissingDependency ? '当前列表外' : taskStatusLabel(candidate.status)})
+                          </option>
+                        ))}
+                    </select>
+                    <p className="text-[10px] text-slate-400">按住 Ctrl/Cmd 多选，不选则无依赖</p>
                   </div>
+                )}
 
-                  {/* GPU Selection */}
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">指定 GPU</label>
-                      <select name="requested_gpu" defaultValue={taskDraft?.requestedGpu ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
-                        <option value="">自动分配</option>
-                          {gpus.map(gpu => (
-                            <option key={gpu.id} value={gpu.id}>GPU {gpu.id} ({gpu.name})</option>
-                          ))}
-                      </select>
-                  </div>
+	                {!isMetadataOnlyTaskEdit && (
+	                  <>
+	                    {/* Command */}
+	                    <div className="space-y-1.5">
+	                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">启动命令</label>
+	                        <textarea
+	                          rows={2}
+	                            name="command"
+	                            defaultValue={taskDraft?.command || ''}
+	                          placeholder="python main.py --model llama --dataset sft..."
+	                            required
+	                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors resize-none"
+	                        />
+	                    </div>
 
-                  {/* Queue Type */}
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">队列策略</label>
-                    <div className="flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-lg px-4 py-[7px] cursor-pointer hover:bg-slate-100 transition-all">
-                        <input type="checkbox" name="is_urgent" defaultChecked={Boolean(taskDraft?.isUrgent)} className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
-                      <span className="text-sm font-semibold text-slate-600">加入紧急队列 (Priority)</span>
-                    </div>
-                  </div>
+	                    <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+	                      {/* Working Directory */}
+	                      <div className="space-y-1.5">
+	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">工作目录</label>
+	                          <input
+	                            type="text"
+	                              name="cwd"
+	                              defaultValue={taskDraft?.workingDir || ''}
+	                            placeholder="/path/to/project (可选)"
+	                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+	                          />
+	                      </div>
 
-                  {/* GPU Memory Budget */}
-                  <div className="space-y-1.5 md:col-span-2">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">显存预算 (GB)</label>
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.1"
-                      name="gpu_memory_budget_gb"
-                      defaultValue={taskDraft?.gpuMemoryBudgetMb ? taskDraft.gpuMemoryBudgetMb / 1024 : ''}
-                      placeholder="不填写则使用默认空闲阈值"
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-                    />
-                  </div>
-                </div>
+	                      {/* Remarks */}
+	                      <div className="space-y-1.5">
+	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">备注说明</label>
+	                          <input
+	                            type="text"
+	                              name="notes"
+	                              defaultValue={taskDraft?.notes || ''}
+	                            placeholder="可选备注"
+	                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+	                          />
+	                      </div>
+	                    </div>
 
-                {/* Command */}
-                <div className="space-y-1.5">
-                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">启动命令</label>
-                    <textarea
-                      rows={2}
-                        name="command"
-                        defaultValue={taskDraft?.command || ''}
-                      placeholder="python main.py --model llama --dataset sft..."
-                        required
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors resize-none"
-                    />
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
-                  {/* Working Directory */}
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">工作目录</label>
-                      <input
-                        type="text"
-                          name="cwd"
-                          defaultValue={taskDraft?.workingDir || ''}
-                        placeholder="/path/to/project (可选)"
-                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-                      />
-                  </div>
-
-                  {/* Remarks */}
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">备注说明</label>
-                      <input
-                        type="text"
-                          name="notes"
-                          defaultValue={taskDraft?.notes || ''}
-                        placeholder="可选备注"
-                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-                      />
-                  </div>
-                </div>
-
-                {/* Env Vars */}
-                <div className="space-y-1.5">
-                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">独立环境变量</label>
-                    <textarea
-                      rows={1}
-                        name="env"
-                        defaultValue={envToText(taskDraft?.env)}
-                      placeholder="WANDB_MODE=offline"
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors resize-none"
-                    />
-                </div>
+	                    {/* Env Vars */}
+	                    <div className="space-y-1.5">
+	                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">独立环境变量</label>
+	                        <textarea
+	                          rows={1}
+	                            name="env"
+	                            defaultValue={envToText(taskDraft?.env)}
+	                          placeholder="WANDB_MODE=offline"
+	                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors resize-none"
+	                        />
+	                    </div>
+	                  </>
+	                )}
 
                 <div className="flex justify-end gap-3 pt-4 border-t border-slate-100">
                     <button
@@ -1705,11 +2251,13 @@ export default function App() {
                     <button
                         type="submit"
                       className="px-10 py-2 bg-blue-600 text-white rounded-lg font-bold shadow-md shadow-blue-600/20 hover:bg-blue-700 active:scale-95 transition-all text-sm"
-                    >
-                      {taskDraft
-                      ? (isEditingTask ? '更新任务并加入队列' : '创建复用任务')
-                      : '部署任务至调度器'}
-                    </button>
+	                    >
+	                      {isMetadataOnlyTaskEdit
+	                      ? '保存记录信息'
+	                      : taskDraft
+	                      ? (isEditingTask ? '更新任务并加入队列' : '创建复用任务')
+	                      : '部署任务至调度器'}
+	                    </button>
                 </div>
               </form>
               </motion.div>
@@ -1808,8 +2356,22 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
   );
 };
 
+function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: string }) {
+  if (!notes) return null;
+  return (
+    <div
+      title={notes}
+      className={`min-w-0 flex items-center gap-1.5 px-2 py-0.5 bg-amber-50/70 border border-amber-100 rounded text-[9px] text-amber-700 shadow-sm ${className}`}
+    >
+      <span className="text-amber-500 font-bold uppercase tracking-tight text-[8px] whitespace-nowrap">备注</span>
+      <span className="truncate">{notes}</span>
+    </div>
+  );
+}
+
   const TaskCardInner = ({ task, isSelected, onSelect, onCancel, onPreempt, canPreempt, onDuplicate, onEdit, isMarked, toggleMark }: { task: Task; isSelected?: boolean; onSelect?: () => void; onCancel?: () => void; onPreempt?: () => void; canPreempt?: boolean; onDuplicate?: () => void; onEdit?: () => void; isMarked?: boolean; toggleMark?: (e: React.MouseEvent) => void; key?: React.Key }) => {
-  const canEdit = task.status === 'pending' || task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted';
+  const canEdit = Boolean(onEdit);
+  const editTitle = task.status === 'pending' ? '编辑任务' : '编辑记录信息';
 
   return (
     <div
@@ -1848,6 +2410,15 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
                   <span className="normal-case font-mono">{task.workingDir}</span>
                 </>
               )}
+              {task.hasDependencies && task.status === 'pending' && (
+                <>
+                  <span>•</span>
+                  <span className="inline-flex items-center gap-0.5 text-amber-600">
+                    <Link2 className="w-3 h-3" />
+                    等待 {task.dependencyCount}
+                  </span>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -1866,7 +2437,7 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
             </button>
             {canEdit && (
               <button
-                title="编辑任务"
+                title={editTitle}
                 onClick={(e) => {
                   e.stopPropagation();
                   onEdit?.();
@@ -1921,13 +2492,14 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
       </div>
 
       <div className={`rounded-lg px-3 py-2 border transition-colors ${isSelected ? 'bg-slate-900/5 border-slate-200' : 'bg-slate-50/50 border-slate-100'}`}>
-        <code className={`text-[10px] font-mono block truncate ${isSelected ? 'text-slate-800' : 'text-slate-600'}`}>
-          {task.command}
-        </code>
-      </div>
-    </div>
-  );
-}
+	        <code className={`text-[10px] font-mono block truncate ${isSelected ? 'text-slate-800' : 'text-slate-600'}`}>
+	          {task.command}
+	        </code>
+	      </div>
+	      <TaskNotesPill notes={task.notes} className="w-full" />
+	    </div>
+	  );
+	}
 
   const HistoryRowInner = ({
   task,
@@ -1972,7 +2544,8 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
   onToggleSelectForDelete?: () => void;
 }) => {
   const canRequeue = task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted';
-  const canEdit = isQueueView && task.status === 'pending';
+	  const canEdit = Boolean(onEdit);
+	  const editTitle = task.status === 'pending' ? '编辑任务' : '编辑记录信息';
   const canBatchDelete = task.status !== 'running';
 
   const [isLogExpanded, setIsLogExpanded] = useState(false);
@@ -2056,6 +2629,12 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
             )}
             <h5 className="font-bold text-slate-900 text-[13px] tracking-tight">{task.name}</h5>
             <span className="text-[10px] text-slate-400 font-mono">ID:{task.id}</span>
+            {task.hasDependencies && task.status === 'pending' && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-50 text-amber-600 border border-amber-200" title={`依赖 ${task.dependencyCount} 个前置任务`}>
+                <Link2 className="w-3 h-3" />
+                {task.dependencyCount}
+              </span>
+            )}
           </div>
 
           {isBatchDeleteMode ? (
@@ -2086,8 +2665,8 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
                 <button title="复用新建" onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onDuplicate?.(); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all active:scale-90">
                   <Copy className="w-3.5 h-3.5" />
                 </button>
-                {canEdit && (
-                  <button title="编辑任务" onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onEdit?.(); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all active:scale-90">
+	                {canEdit && (
+	                  <button title={editTitle} onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onEdit?.(); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all active:scale-90">
                     <Edit2 className="w-3.5 h-3.5" />
                   </button>
                 )}
@@ -2116,11 +2695,11 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
         </div>
 
         {/* Bottom: Metadata Labels and Timestamps */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 max-w-[75%]">
-             <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm whitespace-nowrap">
-               <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px]">环境</span>
-               <span className="font-medium text-slate-700">{task.profile || 'default'}</span>
+	        <div className="flex items-center justify-between gap-4">
+	          <div className="flex items-center gap-2 min-w-0 flex-1">
+	             <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm whitespace-nowrap">
+	               <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px]">环境</span>
+	               <span className="font-medium text-slate-700">{task.profile || 'default'}</span>
              </div>
              <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm whitespace-nowrap">
                <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px]">尝试次数</span>
@@ -2137,12 +2716,13 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
                </div>
              )}
              <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm w-full max-w-[150px] sm:max-w-xs xl:max-w-md flex-1">
-               <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px] whitespace-nowrap">目录</span>
-               <span className="font-mono text-slate-700 w-full truncate">{task.workingDir || '/root'}</span>
-             </div>
-          </div>
+	               <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px] whitespace-nowrap">目录</span>
+	               <span className="font-mono text-slate-700 w-full truncate">{task.workingDir || '/root'}</span>
+	             </div>
+	             <TaskNotesPill notes={task.notes} className="flex-1" />
+	          </div>
 
-          {!isQueueView && (
+	          {!isQueueView && (
              <div className="flex items-center gap-5 text-[9px] font-medium shrink-0">
                <div className="flex items-center gap-2 text-slate-400">
                  <span className="uppercase tracking-widest text-[8px] font-bold text-slate-300">开始</span>

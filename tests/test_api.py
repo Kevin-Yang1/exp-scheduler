@@ -301,16 +301,33 @@ def test_scheduler_settings_endpoint_updates_and_persists(tmp_path):
         settings.raise_for_status()
         assert settings.json()["poll_interval_seconds"] == 0.1
         assert settings.json()["gpu_idle_required_checks"] == 1
+        assert settings.json()["auto_restore_idle_gpu_seconds"] == 300
+        assert settings.json()["auto_retry_enabled"] is False
+        assert settings.json()["auto_retry_max_retries"] == 0
+        assert settings.json()["auto_retry_delay_seconds"] == 5
 
         update = client.put(
             "/api/scheduler/settings",
-            json={"poll_interval_seconds": 0.2, "gpu_idle_required_checks": 3},
+            json={
+                "poll_interval_seconds": 0.2,
+                "gpu_idle_required_checks": 3,
+                "auto_restore_idle_gpu_seconds": 120,
+                "auto_retry_enabled": True,
+                "auto_retry_max_retries": 2,
+                "auto_retry_delay_seconds": 7,
+            },
         )
         update.raise_for_status()
         payload = update.json()
         assert payload["poll_interval_seconds"] == 0.2
         assert payload["gpu_idle_required_checks"] == 3
+        assert payload["auto_restore_idle_gpu_seconds"] == 120
         assert abs(payload["effective_wait_seconds"] - 0.6) < 0.001
+        assert payload["auto_retry_enabled"] is True
+        assert payload["auto_retry_max_retries"] == 2
+        assert payload["auto_retry_delay_seconds"] == 7
+        assert client.app.state.scheduler.config.auto_retry_max_retries == 2
+        assert client.app.state.scheduler.config.auto_retry_delay_seconds == 7
 
         invalid = client.put(
             "/api/scheduler/settings",
@@ -318,11 +335,26 @@ def test_scheduler_settings_endpoint_updates_and_persists(tmp_path):
         )
         assert invalid.status_code == 400
 
+        disabled = client.put(
+            "/api/scheduler/settings",
+            json={
+                "poll_interval_seconds": 0.2,
+                "gpu_idle_required_checks": 3,
+                "auto_restore_idle_gpu_seconds": None,
+            },
+        )
+        disabled.raise_for_status()
+        assert disabled.json()["auto_restore_idle_gpu_seconds"] is None
+
     with make_client(tmp_path) as client:
         persisted = client.get("/api/scheduler/settings")
         persisted.raise_for_status()
         assert persisted.json()["poll_interval_seconds"] == 0.2
         assert persisted.json()["gpu_idle_required_checks"] == 3
+        assert persisted.json()["auto_restore_idle_gpu_seconds"] is None
+        assert persisted.json()["auto_retry_enabled"] is True
+        assert persisted.json()["auto_retry_max_retries"] == 2
+        assert persisted.json()["auto_retry_delay_seconds"] == 7
 
 
 def test_gpu_schedule_endpoint_sets_clears_and_applies_due_actions(tmp_path):
@@ -590,6 +622,148 @@ def test_update_running_task_is_rejected(tmp_path):
             },
         )
         assert update.status_code == 409
+
+
+def test_update_running_task_metadata_keeps_runtime_fields(tmp_path):
+    with make_client(tmp_path) as client:
+        client.fake_gpu_provider.set_gpus([gpu(0, idle=True)])
+        original_command = command("import time; time.sleep(5)")
+        create = client.post(
+            "/api/tasks",
+            json={
+                "name": "running-job",
+                "command": original_command,
+                "cwd": str(tmp_path),
+                "env": {"KEEP": "1"},
+                "notes": "before",
+                "requested_gpu": 0,
+            },
+        )
+        create.raise_for_status()
+        task_id = create.json()["task"]["id"]
+
+        running_task = wait_for(
+            lambda: next(
+                task for task in client.get("/api/tasks").json()["running"] if task["id"] == task_id
+            ),
+            timeout=3,
+        )
+
+        update = client.patch(
+            f"/api/tasks/{task_id}/metadata",
+            json={"name": "renamed-running", "notes": "after"},
+        )
+        update.raise_for_status()
+        updated_task = update.json()["task"]
+
+        assert updated_task["id"] == task_id
+        assert updated_task["name"] == "renamed-running"
+        assert updated_task["notes"] == "after"
+        assert updated_task["status"] == "running"
+        assert updated_task["command"] == original_command
+        assert updated_task["cwd"] == str(tmp_path)
+        assert updated_task["env"] == {"KEEP": "1"}
+        assert updated_task["requested_gpu"] == 0
+        assert updated_task["assigned_gpu"] == running_task["assigned_gpu"]
+
+
+def test_update_history_task_metadata_keeps_runtime_fields(tmp_path):
+    with make_client(tmp_path) as client:
+        original_command = command("print('history')")
+        create = client.post(
+            "/api/tasks",
+            json={
+                "name": "history-job",
+                "command": original_command,
+                "cwd": str(tmp_path),
+                "env": {"KEEP": "history"},
+                "notes": "before",
+                "requested_gpu": None,
+            },
+        )
+        create.raise_for_status()
+        task_id = create.json()["task"]["id"]
+        client.app.state.scheduler.database.finish_task(
+            task_id=task_id,
+            status="succeeded",
+            exit_code=0,
+        )
+
+        update = client.patch(
+            f"/api/tasks/{task_id}/metadata",
+            json={"name": "renamed-history", "notes": "archived"},
+        )
+        update.raise_for_status()
+        updated_task = update.json()["task"]
+
+        assert updated_task["id"] == task_id
+        assert updated_task["name"] == "renamed-history"
+        assert updated_task["notes"] == "archived"
+        assert updated_task["status"] == "succeeded"
+        assert updated_task["command"] == original_command
+        assert updated_task["cwd"] == str(tmp_path)
+        assert updated_task["env"] == {"KEEP": "history"}
+        assert updated_task["exit_code"] == 0
+
+        tasks = client.get("/api/tasks")
+        tasks.raise_for_status()
+        assert any(task["id"] == task_id and task["name"] == "renamed-history" for task in tasks.json()["history"])
+
+        missing = client.patch(
+            "/api/tasks/999999/metadata",
+            json={"name": "missing"},
+        )
+        assert missing.status_code == 404
+
+        empty = client.patch(f"/api/tasks/{task_id}/metadata", json={})
+        assert empty.status_code == 400
+
+
+def test_activity_logs_endpoint_records_task_details_and_filters(tmp_path):
+    with make_client(tmp_path) as client:
+        original_command = command("print('activity')")
+        create = client.post(
+            "/api/tasks",
+            json={
+                "name": "activity-job",
+                "command": original_command,
+                "cwd": str(tmp_path),
+                "env": {"FULL_ENV_VALUE": "visible"},
+                "notes": "activity-note",
+                "requested_gpu": None,
+            },
+        )
+        create.raise_for_status()
+        task_id = create.json()["task"]["id"]
+
+        logs = client.get(
+            "/api/activity/logs",
+            params={"entity_type": "task", "query": "FULL_ENV_VALUE"},
+        )
+        logs.raise_for_status()
+        payload = logs.json()["logs"]
+
+        assert payload
+        created_log = next(log for log in payload if log["action"] == "task_created")
+        assert created_log["entity_type"] == "task"
+        assert created_log["entity_id"] == task_id
+        assert created_log["metadata"]["command"] == original_command
+        assert created_log["metadata"]["env"] == {"FULL_ENV_VALUE": "visible"}
+        assert created_log["metadata"]["notes"] == "activity-note"
+
+        success_logs = client.get(
+            "/api/activity/logs",
+            params={"level": "success", "entity_type": "task"},
+        )
+        success_logs.raise_for_status()
+        assert all(log["level"] == "success" for log in success_logs.json()["logs"])
+
+        clear = client.delete("/api/activity/logs")
+        clear.raise_for_status()
+        assert clear.json()["deleted"] >= 1
+        empty = client.get("/api/activity/logs")
+        empty.raise_for_status()
+        assert empty.json()["logs"] == []
 
 
 def test_pause_resume_delete_and_requeue(tmp_path):

@@ -34,10 +34,20 @@ class CreateTaskRequest(BaseModel):
     requested_gpu: int | None = None
     gpu_memory_budget_mb: int | None = Field(default=None, gt=0)
     profile_id: int | None = None
+    depends_on: list[int] = Field(default_factory=list)
 
 
 class UpdateTaskRequest(CreateTaskRequest):
-    pass
+    depends_on: list[int] | None = None
+
+
+class UpdateTaskMetadataRequest(BaseModel):
+    name: str | None = None
+    notes: str | None = None
+
+
+class SetDependenciesRequest(BaseModel):
+    depends_on: list[int]
 
 
 class ProfileRequest(BaseModel):
@@ -63,8 +73,12 @@ class UpdateSettingsRequest(BaseModel):
 
 
 class UpdateSchedulerSettingsRequest(BaseModel):
-    poll_interval_seconds: float
-    gpu_idle_required_checks: int
+    poll_interval_seconds: float | None = None
+    gpu_idle_required_checks: int | None = None
+    auto_restore_idle_gpu_seconds: float | None = Field(default=None, ge=0)
+    auto_retry_enabled: bool | None = None
+    auto_retry_max_retries: int | None = Field(default=None, ge=0)
+    auto_retry_delay_seconds: int | None = Field(default=None, ge=0)
 
 
 class PauseQueueRequest(BaseModel):
@@ -117,6 +131,19 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.nvitop_terminal = nvitop_terminal
 
+    def add_dependency_payload(
+        task: dict[str, object],
+        *,
+        include_details: bool = False,
+    ) -> dict[str, object]:
+        dep_ids = scheduler.database.get_dependency_ids(int(task["id"]))
+        task["depends_on"] = dep_ids
+        task["dependency_count"] = len(dep_ids)
+        task["has_dependencies"] = bool(dep_ids)
+        if include_details:
+            task["dependencies"] = scheduler.database.get_dependencies(int(task["id"]))
+        return task
+
     @app.middleware("http")
     async def disable_cache(request, call_next):
         response = await call_next(request)
@@ -131,7 +158,11 @@ def create_app(
 
     @app.get("/api/tasks")
     async def list_tasks() -> dict[str, object]:
-        return await scheduler.list_tasks()
+        result = await scheduler.list_tasks()
+        for key in ("queued", "urgent_queued", "running", "history"):
+            for task in result.get(key, []):
+                add_dependency_payload(task)
+        return result
 
     @app.get("/api/server")
     async def get_server_info() -> dict[str, object]:
@@ -217,9 +248,11 @@ def create_app(
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
                 profile_id=payload.profile_id,
+                depends_on_ids=payload.depends_on,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        add_dependency_payload(task, include_details=True)
         return {"task": task}
 
     @app.put("/api/tasks/{task_id}")
@@ -239,11 +272,37 @@ def create_app(
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
                 profile_id=payload.profile_id,
+                depends_on_ids=payload.depends_on,
             )
         except ValueError as exc:
             message = str(exc)
             status_code = 409 if "排队中" in message else 400
             raise HTTPException(status_code=status_code, detail=message) from exc
+        add_dependency_payload(task, include_details=True)
+        return {"task": task}
+
+    @app.patch("/api/tasks/{task_id}/metadata")
+    async def update_task_metadata_endpoint(
+        task_id: int,
+        payload: UpdateTaskMetadataRequest,
+    ) -> dict[str, object]:
+        raw_fields_set = getattr(payload, "model_fields_set", None)
+        if raw_fields_set is None:
+            raw_fields_set = getattr(payload, "__fields_set__", set())
+        fields_set = set(raw_fields_set)
+        try:
+            task = await scheduler.update_task_metadata(
+                task_id,
+                name=payload.name,
+                notes=payload.notes,
+                update_name="name" in fields_set,
+                update_notes="notes" in fields_set,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "不存在" in message else 400
+            raise HTTPException(status_code=status_code, detail=message) from exc
+        add_dependency_payload(task, include_details=True)
         return {"task": task}
 
     @app.delete("/api/tasks/{task_id}")
@@ -291,6 +350,24 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"task": task}
 
+    @app.get("/api/tasks/{task_id}/dependencies")
+    async def get_task_dependencies_endpoint(task_id: int) -> dict[str, object]:
+        try:
+            info = await scheduler.get_task_dependencies_info(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return info
+
+    @app.put("/api/tasks/{task_id}/dependencies")
+    async def set_task_dependencies_endpoint(
+        task_id: int, payload: SetDependenciesRequest
+    ) -> dict[str, object]:
+        try:
+            await scheduler.set_task_dependencies(task_id, payload.depends_on)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True}
+
     @app.post("/api/queue/pause")
     async def pause_queue_endpoint(payload: PauseQueueRequest | None = None) -> dict[str, object]:
         paused = await scheduler.set_queue_paused(True)
@@ -330,10 +407,49 @@ def create_app(
     async def update_scheduler_settings_endpoint(
         payload: UpdateSchedulerSettingsRequest,
     ) -> dict[str, object]:
+        raw_fields_set = getattr(payload, "model_fields_set", None)
+        if raw_fields_set is None:
+            raw_fields_set = getattr(payload, "__fields_set__", set())
+        fields_set = set(raw_fields_set)
+        current_settings = await scheduler.get_scheduler_settings()
+        poll_interval_seconds = (
+            payload.poll_interval_seconds
+            if "poll_interval_seconds" in fields_set
+            else current_settings.get("poll_interval_seconds")
+        )
+        gpu_idle_required_checks = (
+            payload.gpu_idle_required_checks
+            if "gpu_idle_required_checks" in fields_set
+            else current_settings.get("gpu_idle_required_checks")
+        )
+        auto_restore_idle_gpu_seconds = (
+            payload.auto_restore_idle_gpu_seconds
+            if "auto_restore_idle_gpu_seconds" in fields_set
+            else current_settings.get("auto_restore_idle_gpu_seconds")
+        )
+        auto_retry_enabled = (
+            payload.auto_retry_enabled
+            if "auto_retry_enabled" in fields_set
+            else None
+        )
+        auto_retry_max_retries = (
+            payload.auto_retry_max_retries
+            if "auto_retry_max_retries" in fields_set
+            else current_settings.get("auto_retry_max_retries")
+        )
+        auto_retry_delay_seconds = (
+            payload.auto_retry_delay_seconds
+            if "auto_retry_delay_seconds" in fields_set
+            else current_settings.get("auto_retry_delay_seconds")
+        )
         try:
             return await scheduler.update_scheduler_settings(
-                poll_interval_seconds=payload.poll_interval_seconds,
-                gpu_idle_required_checks=payload.gpu_idle_required_checks,
+                poll_interval_seconds=poll_interval_seconds,
+                gpu_idle_required_checks=gpu_idle_required_checks,
+                auto_restore_idle_gpu_seconds=auto_restore_idle_gpu_seconds,
+                auto_retry_enabled=auto_retry_enabled,
+                auto_retry_max_retries=auto_retry_max_retries,
+                auto_retry_delay_seconds=auto_retry_delay_seconds,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -489,6 +605,30 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True}
+
+    @app.get("/api/activity/logs")
+    async def list_activity_logs_endpoint(
+        limit: int = Query(default=200, ge=1, le=1000),
+        level: str | None = None,
+        source: str | None = None,
+        action: str | None = None,
+        entity_type: str | None = None,
+        query: str | None = None,
+    ) -> dict[str, object]:
+        logs = await scheduler.list_operation_logs(
+            limit=limit,
+            level=level,
+            source=source,
+            action=action,
+            entity_type=entity_type,
+            query=query,
+        )
+        return {"logs": logs}
+
+    @app.delete("/api/activity/logs")
+    async def clear_activity_logs_endpoint() -> dict[str, object]:
+        count = await scheduler.clear_operation_logs()
+        return {"ok": True, "deleted": count}
 
     @app.get("/api/events")
     async def events_endpoint() -> StreamingResponse:

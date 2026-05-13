@@ -27,12 +27,12 @@ class GPUInfo:
         scheduler_occupied: bool,
         globally_enabled: bool,
     ) -> dict[str, object]:
-        is_idle = (
+        physically_idle = (
             self.memory_used_mb < threshold_mb
             and not self.has_processes
             and not scheduler_occupied
-            and globally_enabled
         )
+        is_idle = physically_idle and globally_enabled
         free_memory_mb = max(0, self.memory_total_mb - self.memory_used_mb)
         return {
             "index": self.index,
@@ -45,6 +45,7 @@ class GPUInfo:
             "has_processes": self.has_processes,
             "scheduler_occupied": scheduler_occupied,
             "globally_enabled": globally_enabled,
+            "physically_idle": physically_idle,
             "is_idle": is_idle,
         }
 

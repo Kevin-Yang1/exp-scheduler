@@ -72,6 +72,16 @@ class Database:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS task_dependencies (
+                    task_id INTEGER NOT NULL,
+                    depends_on_task_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(task_id, depends_on_task_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -90,6 +100,34 @@ class Database:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operation_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    entity_type TEXT,
+                    entity_id INTEGER,
+                    title TEXT NOT NULL,
+                    detail TEXT,
+                    metadata TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_operation_logs_created_at
+                ON operation_logs(created_at DESC, id DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_operation_logs_entity
+                ON operation_logs(entity_type, entity_id)
                 """
             )
             conn.execute(
@@ -116,6 +154,7 @@ class Database:
         profile_id: int | None = None,
         profile_name: str | None = None,
         shell_setup: str | None = None,
+        depends_on_ids: Sequence[int] | None = None,
     ) -> dict[str, object]:
         normalized_queue_name = self._normalize_queue_name(queue_name)
         with self._lock, self._connect() as conn:
@@ -146,8 +185,11 @@ class Database:
                     normalized_queue_name,
                 ),
             )
+            task_id = int(cursor.lastrowid)
+            if depends_on_ids is not None:
+                self._replace_dependencies(conn, task_id, depends_on_ids)
             conn.commit()
-            return self.get_task(cursor.lastrowid)
+            return self.get_task(task_id)
 
     def list_profiles(self) -> list[dict[str, object]]:
         with self._lock, self._connect() as conn:
@@ -257,6 +299,116 @@ class Database:
             conn.commit()
             return cursor.rowcount > 0
 
+    def add_operation_log(
+        self,
+        *,
+        level: str,
+        source: str,
+        action: str,
+        entity_type: str | None = None,
+        entity_id: int | None = None,
+        title: str,
+        detail: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO operation_logs(
+                    created_at, level, source, action, entity_type, entity_id,
+                    title, detail, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    level,
+                    source,
+                    action,
+                    entity_type,
+                    entity_id,
+                    title,
+                    detail,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+        log = self.get_operation_log(int(cursor.lastrowid))
+        if log is None:
+            raise ValueError("操作日志写入失败")
+        return log
+
+    def get_operation_log(self, log_id: int) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM operation_logs WHERE id = ?",
+                (log_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_operation_log(row)
+
+    def list_operation_logs(
+        self,
+        *,
+        limit: int = 200,
+        level: str | None = None,
+        source: str | None = None,
+        action: str | None = None,
+        entity_type: str | None = None,
+        query: str | None = None,
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if level:
+            clauses.append("level = ?")
+            params.append(level)
+        if source:
+            clauses.append("source = ?")
+            params.append(source)
+        if action:
+            clauses.append("action = ?")
+            params.append(action)
+        if entity_type:
+            clauses.append("entity_type = ?")
+            params.append(entity_type)
+        if query:
+            like_query = f"%{query}%"
+            clauses.append(
+                """
+                (
+                    title LIKE ?
+                    OR detail LIKE ?
+                    OR action LIKE ?
+                    OR source LIKE ?
+                    OR entity_type LIKE ?
+                    OR CAST(entity_id AS TEXT) LIKE ?
+                    OR metadata LIKE ?
+                )
+                """
+            )
+            params.extend([like_query] * 7)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        safe_limit = max(1, min(int(limit), 1000))
+        params.append(safe_limit)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM operation_logs
+                {where_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [self._row_to_operation_log(row) for row in rows]
+
+    def clear_operation_logs(self) -> int:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM operation_logs")
+            conn.commit()
+            return cursor.rowcount
+
     def get_task(self, task_id: int) -> dict[str, object] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -351,6 +503,10 @@ class Database:
             if row["status"] == "running":
                 raise ValueError("运行中的任务不能删除")
             conn.execute(
+                "DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?",
+                (task_id, task_id),
+            )
+            conn.execute(
                 "DELETE FROM tasks WHERE id = ?",
                 (task_id,),
             )
@@ -372,6 +528,7 @@ class Database:
         profile_id: int | None = None,
         profile_name: str | None = None,
         shell_setup: str | None = None,
+        depends_on_ids: Sequence[int] | None = None,
     ) -> dict[str, object]:
         normalized_queue_name = self._normalize_queue_name(queue_name)
         with self._lock, self._connect() as conn:
@@ -426,7 +583,34 @@ class Database:
                     task_id,
                 ),
             )
+            if depends_on_ids is not None:
+                self._replace_dependencies(conn, task_id, depends_on_ids)
             conn.commit()
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        return task
+
+    def update_task_metadata(
+        self,
+        task_id: int,
+        *,
+        name: str,
+        notes: str | None,
+    ) -> dict[str, object]:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET name = ?,
+                    notes = ?
+                WHERE id = ?
+                """,
+                (name, notes, task_id),
+            )
+            conn.commit()
+        if cursor.rowcount == 0:
+            raise ValueError(f"任务不存在: {task_id}")
         task = self.get_task(task_id)
         if task is None:
             raise ValueError(f"任务不存在: {task_id}")
@@ -504,10 +688,16 @@ class Database:
         *,
         poll_interval_seconds: float,
         gpu_idle_required_checks: int,
+        auto_restore_idle_gpu_seconds: float | None,
+        auto_retry_max_retries: int,
+        auto_retry_delay_seconds: int,
     ) -> dict[str, object]:
         settings: dict[str, object] = {
             "poll_interval_seconds": poll_interval_seconds,
             "gpu_idle_required_checks": gpu_idle_required_checks,
+            "auto_restore_idle_gpu_seconds": auto_restore_idle_gpu_seconds,
+            "auto_retry_max_retries": auto_retry_max_retries,
+            "auto_retry_delay_seconds": auto_retry_delay_seconds,
         }
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -978,3 +1168,223 @@ class Database:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def _row_to_operation_log(self, row: sqlite3.Row) -> dict[str, object]:
+        metadata_raw = row["metadata"] or "{}"
+        try:
+            metadata = json.loads(metadata_raw)
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "level": row["level"],
+            "source": row["source"],
+            "action": row["action"],
+            "entity_type": row["entity_type"],
+            "entity_id": row["entity_id"],
+            "title": row["title"],
+            "detail": row["detail"],
+            "metadata": metadata,
+        }
+
+    # ── task dependencies ──────────────────────────────────────────
+
+    def add_dependencies(
+        self, task_id: int, depends_on_ids: Sequence[int]
+    ) -> None:
+        if not depends_on_ids:
+            return
+        with self._lock, self._connect() as conn:
+            normalized_ids = self._normalize_dependency_ids(task_id, depends_on_ids)
+            if not normalized_ids:
+                return
+            self._ensure_task_exists(conn, task_id)
+            for dep_id in normalized_ids:
+                if conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ?", (dep_id,)
+                ).fetchone() is None:
+                    raise ValueError(f"依赖任务不存在: {dep_id}")
+            if self._would_create_cycle(conn, task_id, normalized_ids):
+                raise ValueError("添加依赖会形成循环")
+            now = utc_now_iso()
+            for dep_id in normalized_ids:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_dependencies(task_id, depends_on_task_id, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (task_id, dep_id, now),
+                )
+            conn.commit()
+
+    def remove_dependencies(
+        self,
+        task_id: int,
+        depends_on_ids: list[int] | None = None,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            if depends_on_ids is None:
+                conn.execute(
+                    "DELETE FROM task_dependencies WHERE task_id = ?",
+                    (task_id,),
+                )
+            else:
+                for dep_id in depends_on_ids:
+                    conn.execute(
+                        "DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?",
+                        (task_id, dep_id),
+                    )
+            conn.commit()
+
+    def replace_dependencies(
+        self, task_id: int, depends_on_ids: Sequence[int]
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            self._replace_dependencies(conn, task_id, depends_on_ids)
+            conn.commit()
+
+    def get_dependency_ids(self, task_id: int) -> list[int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT depends_on_task_id
+                FROM task_dependencies
+                WHERE task_id = ?
+                ORDER BY depends_on_task_id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [int(row["depends_on_task_id"]) for row in rows]
+
+    def get_dependencies(self, task_id: int) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.* FROM task_dependencies d
+                JOIN tasks t ON t.id = d.depends_on_task_id
+                WHERE d.task_id = ?
+                ORDER BY d.depends_on_task_id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def get_dependents(self, task_id: int) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.* FROM task_dependencies d
+                JOIN tasks t ON t.id = d.task_id
+                WHERE d.depends_on_task_id = ?
+                ORDER BY d.task_id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def are_dependencies_satisfied(self, task_id: int) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN t.status = 'succeeded' THEN 1 ELSE 0 END) AS satisfied
+                FROM task_dependencies d
+                JOIN tasks t ON t.id = d.depends_on_task_id
+                WHERE d.task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        total = int(row["total"] or 0)
+        satisfied = int(row["satisfied"] or 0)
+        return total == 0 or total == satisfied
+
+    def get_dependency_count(self, task_id: int) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM task_dependencies WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return int(row["cnt"] or 0)
+
+    def _would_create_cycle(
+        self,
+        conn: sqlite3.Connection,
+        task_id: int,
+        depends_on_ids: Sequence[int],
+    ) -> bool:
+        for dep_id in depends_on_ids:
+            row = conn.execute(
+                """
+                WITH RECURSIVE ancestors(id) AS (
+                    SELECT depends_on_task_id
+                    FROM task_dependencies WHERE task_id = ?
+                    UNION
+                    SELECT d.depends_on_task_id
+                    FROM task_dependencies d
+                    JOIN ancestors a ON d.task_id = a.id
+                )
+                SELECT 1 FROM ancestors WHERE id = ? LIMIT 1
+                """,
+                (dep_id, task_id),
+            ).fetchone()
+            if row is not None:
+                return True
+        return False
+
+    def _replace_dependencies(
+        self,
+        conn: sqlite3.Connection,
+        task_id: int,
+        depends_on_ids: Sequence[int],
+    ) -> None:
+        normalized_ids = self._normalize_dependency_ids(task_id, depends_on_ids)
+        self._ensure_task_exists(conn, task_id)
+        for dep_id in normalized_ids:
+            self._ensure_task_exists(conn, dep_id, message=f"依赖任务不存在: {dep_id}")
+        if self._would_create_cycle(conn, task_id, normalized_ids):
+            raise ValueError("添加依赖会形成循环")
+        conn.execute(
+            "DELETE FROM task_dependencies WHERE task_id = ?",
+            (task_id,),
+        )
+        if not normalized_ids:
+            return
+        now = utc_now_iso()
+        for dep_id in normalized_ids:
+            conn.execute(
+                """
+                INSERT INTO task_dependencies(task_id, depends_on_task_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (task_id, dep_id, now),
+            )
+
+    def _normalize_dependency_ids(
+        self,
+        task_id: int,
+        depends_on_ids: Sequence[int],
+    ) -> list[int]:
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for raw_id in depends_on_ids:
+            dep_id = int(raw_id)
+            if dep_id == task_id:
+                raise ValueError("任务不能依赖自身")
+            if dep_id in seen:
+                continue
+            seen.add(dep_id)
+            normalized.append(dep_id)
+        return normalized
+
+    def _ensure_task_exists(
+        self,
+        conn: sqlite3.Connection,
+        task_id: int,
+        *,
+        message: str | None = None,
+    ) -> None:
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            raise ValueError(message or f"任务不存在: {task_id}")

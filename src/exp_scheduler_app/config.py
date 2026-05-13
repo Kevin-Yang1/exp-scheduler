@@ -11,6 +11,7 @@ DEFAULT_PORT = 17861
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_GPU_IDLE_MEMORY_MB = 2000
 DEFAULT_GPU_IDLE_REQUIRED_CHECKS = 6
+DEFAULT_AUTO_RESTORE_IDLE_GPU_SECONDS = 5 * 60
 DEFAULT_AUTO_RETRY_MAX_RETRIES = 0
 DEFAULT_AUTO_RETRY_DELAY_SECONDS = 5
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "exp-scheduler" / "config.toml"
@@ -52,6 +53,9 @@ class SchedulerConfig:
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
     gpu_idle_memory_mb: int = DEFAULT_GPU_IDLE_MEMORY_MB
     gpu_idle_required_checks: int = DEFAULT_GPU_IDLE_REQUIRED_CHECKS
+    auto_restore_idle_gpu_seconds: float | None = (
+        DEFAULT_AUTO_RESTORE_IDLE_GPU_SECONDS
+    )
     auto_retry_max_retries: int = DEFAULT_AUTO_RETRY_MAX_RETRIES
     auto_retry_delay_seconds: int = DEFAULT_AUTO_RETRY_DELAY_SECONDS
     state_dir: Path = DEFAULT_STATE_DIR
@@ -70,6 +74,17 @@ def _resolve_path(value: str | Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _optional_positive_seconds(value: object) -> float | None:
+    if value is None:
+        return None
+    seconds = float(value)
+    if seconds <= 0:
+        return None
+    if not seconds < float("inf"):
+        raise ValueError("auto_restore_idle_gpu_seconds must be finite")
+    return seconds
+
+
 def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
     state_dir = _resolve_path(data.get("state_dir", DEFAULT_STATE_DIR))
     log_dir = _resolve_path(data.get("log_dir", state_dir / "logs"))
@@ -86,6 +101,12 @@ def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
         ),
         gpu_idle_required_checks=int(
             data.get("gpu_idle_required_checks", DEFAULT_GPU_IDLE_REQUIRED_CHECKS)
+        ),
+        auto_restore_idle_gpu_seconds=_optional_positive_seconds(
+            data.get(
+                "auto_restore_idle_gpu_seconds",
+                DEFAULT_AUTO_RESTORE_IDLE_GPU_SECONDS,
+            )
         ),
         auto_retry_max_retries=int(
             data.get("auto_retry_max_retries", DEFAULT_AUTO_RETRY_MAX_RETRIES)
@@ -108,6 +129,7 @@ def default_config_text() -> str:
             f"poll_interval_seconds = {DEFAULT_POLL_INTERVAL_SECONDS}",
             f"gpu_idle_memory_mb = {DEFAULT_GPU_IDLE_MEMORY_MB}",
             f"gpu_idle_required_checks = {DEFAULT_GPU_IDLE_REQUIRED_CHECKS}",
+            f"auto_restore_idle_gpu_seconds = {DEFAULT_AUTO_RESTORE_IDLE_GPU_SECONDS}",
             f"auto_retry_max_retries = {DEFAULT_AUTO_RETRY_MAX_RETRIES}",
             f"auto_retry_delay_seconds = {DEFAULT_AUTO_RETRY_DELAY_SECONDS}",
             f'state_dir = "{DEFAULT_STATE_DIR}"',

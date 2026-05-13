@@ -535,9 +535,100 @@ def test_global_allowed_gpu_ids_limit_scheduling_and_apply_live(tmp_path):
         assert second_history["assigned_gpu"] == 0
 
 
+def test_disabled_gpu_auto_restores_after_continuous_idle(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
+    with build_client(tmp_path, provider, poll_interval_seconds=0.05) as client:
+        update = client.put(
+            "/api/scheduler/settings",
+            json={
+                "poll_interval_seconds": 0.05,
+                "gpu_idle_required_checks": 1,
+                "auto_restore_idle_gpu_seconds": 0.2,
+            },
+        )
+        update.raise_for_status()
+
+        disable = client.put("/api/settings", json={"allowed_gpu_ids": [1]})
+        disable.raise_for_status()
+        assert disable.json()["allowed_gpu_ids"] == [1]
+
+        def restored_settings():
+            payload = client.get("/api/settings").json()
+            return payload if payload["allowed_gpu_ids"] is None else None
+
+        restored = wait_for(
+            restored_settings,
+            timeout=3,
+        )
+        assert restored["allowed_gpu_ids"] is None
+
+
+def test_disabled_gpu_auto_restore_can_be_disabled(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
+    with build_client(tmp_path, provider, poll_interval_seconds=0.05) as client:
+        update = client.put(
+            "/api/scheduler/settings",
+            json={
+                "poll_interval_seconds": 0.05,
+                "gpu_idle_required_checks": 1,
+                "auto_restore_idle_gpu_seconds": None,
+            },
+        )
+        update.raise_for_status()
+
+        disable = client.put("/api/settings", json={"allowed_gpu_ids": [1]})
+        disable.raise_for_status()
+        time.sleep(0.4)
+
+        settings = client.get("/api/settings")
+        settings.raise_for_status()
+        assert settings.json()["allowed_gpu_ids"] == [1]
+
+
 def test_task_completion_triggers_immediate_reschedule_without_waiting_for_poll(tmp_path):
     provider = FakeGPUProvider([gpu(0, idle=True)])
     with build_client(tmp_path, provider, poll_interval_seconds=0.1) as client:
+        first_id = create_task(
+            client,
+            command("import time; time.sleep(0.3)"),
+            name="first",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == first_id
+            ),
+            timeout=3,
+        )
+        client.app.state.scheduler.config.poll_interval_seconds = 5
+
+        second_id = create_task(
+            client,
+            command("print('second')"),
+            name="second",
+        )
+
+        second_history = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == second_id and task["status"] == "succeeded"
+            ),
+            timeout=2,
+        )
+        assert second_history["assigned_gpu"] == 0
+
+
+def test_managed_task_completion_skips_full_idle_confirmation_window(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(
+        tmp_path,
+        provider,
+        poll_interval_seconds=0.1,
+        gpu_idle_required_checks=3,
+    ) as client:
         first_id = create_task(
             client,
             command("import time; time.sleep(0.3)"),

@@ -96,6 +96,8 @@ class SchedulerService:
         self._watchers: dict[int, asyncio.Task[None]] = {}
         self._last_gpu_payload: list[dict[str, object]] = []
         self._gpu_ready_counts: dict[tuple[int, str], int] = {}
+        self._recently_released_gpu_ids: set[int] = set()
+        self._disabled_gpu_idle_since: dict[int, datetime] = {}
 
     async def startup(self) -> None:
         self.database.init()
@@ -105,6 +107,14 @@ class SchedulerService:
             LOGGER.info("Requeued %s stale running tasks to queue head", requeued)
         self._stop_event.clear()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="scheduler-loop")
+        await self._record_operation(
+            level="info",
+            action="service_started",
+            entity_type="scheduler",
+            title="调度服务已启动",
+            detail=f"服务启动完成，恢复排队任务 {requeued} 个。",
+            metadata={"requeued": requeued},
+        )
         await self.events.publish("service_started", {"requeued": requeued})
 
     async def shutdown(self) -> None:
@@ -126,6 +136,12 @@ class SchedulerService:
                 ],
                 return_exceptions=True,
             )
+        await self._record_operation(
+            level="info",
+            action="service_stopped",
+            entity_type="scheduler",
+            title="调度服务已停止",
+        )
         await self.events.publish("service_stopped", {})
 
     async def list_tasks(self) -> dict[str, object]:
@@ -136,6 +152,68 @@ class SchedulerService:
         if self._last_gpu_payload:
             return self._last_gpu_payload
         return await self._refresh_gpu_payload()
+
+    async def list_operation_logs(
+        self,
+        *,
+        limit: int = 200,
+        level: str | None = None,
+        source: str | None = None,
+        action: str | None = None,
+        entity_type: str | None = None,
+        query: str | None = None,
+    ) -> list[dict[str, object]]:
+        return self.database.list_operation_logs(
+            limit=limit,
+            level=level,
+            source=source,
+            action=action,
+            entity_type=entity_type,
+            query=query,
+        )
+
+    async def clear_operation_logs(self) -> int:
+        count = self.database.clear_operation_logs()
+        await self.events.publish("operation_logs_cleared", {"count": count})
+        return count
+
+    async def set_task_dependencies(
+        self, task_id: int, depends_on_ids: list[int]
+    ) -> None:
+        task = self.database.get_task(task_id)
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        self.database.replace_dependencies(task_id, depends_on_ids)
+        normalized_ids = self.database.get_dependency_ids(task_id)
+        task = self.database.get_task(task_id) or task
+        await self._record_operation(
+            level="info",
+            action="task_dependencies_updated",
+            entity_type="task",
+            entity_id=task_id,
+            title=f"任务 #{task_id} 依赖已更新",
+            detail=f"任务 #{task_id} 的前置依赖更新为: {normalized_ids}",
+            metadata=self._task_log_metadata(task, extra={"depends_on": normalized_ids}),
+        )
+        await self.events.publish(
+            "task_dependencies_updated",
+            {"task_id": task_id, "depends_on": normalized_ids},
+        )
+        await self._trigger_immediate_schedule()
+
+    async def get_task_dependencies_info(self, task_id: int) -> dict[str, object]:
+        task = self.database.get_task(task_id)
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        deps = self.database.get_dependencies(task_id)
+        dependents = self.database.get_dependents(task_id)
+        satisfied = self.database.are_dependencies_satisfied(task_id)
+        return {
+            "task": task,
+            "dependencies": deps,
+            "dependents": dependents,
+            "dependencies_satisfied": satisfied,
+        }
 
     async def create_task(
         self,
@@ -149,6 +227,7 @@ class SchedulerService:
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
         profile_id: int | None = None,
+        depends_on_ids: list[int] | None = None,
     ) -> dict[str, object]:
         normalized_requested_gpu = await self._normalize_requested_gpu(requested_gpu)
         normalized_gpu_memory_budget_mb = self._normalize_gpu_memory_budget_mb(
@@ -186,6 +265,16 @@ class SchedulerService:
             profile_id=profile_id,
             profile_name=profile_name,
             shell_setup=shell_setup,
+            depends_on_ids=depends_on_ids,
+        )
+        await self._record_operation(
+            level="success",
+            action="task_created",
+            entity_type="task",
+            entity_id=int(task["id"]),
+            title=f"任务 #{task['id']} 已加入队列",
+            detail=f"任务 {task['name']} 已加入{'紧急' if queue_name == URGENT_QUEUE else '普通'}队列。",
+            metadata=self._task_log_metadata(task),
         )
         await self.events.publish("task_created", {"task_id": task["id"]})
         return task
@@ -213,6 +302,14 @@ class SchedulerService:
             if isinstance(shell_setup, str) and shell_setup.strip()
             else None,
             notes=notes.strip() if isinstance(notes, str) and notes.strip() else None,
+        )
+        await self._record_operation(
+            level="success",
+            action="profile_created",
+            entity_type="profile",
+            entity_id=int(profile["id"]),
+            title=f"环境模板 {profile['name']} 已创建",
+            metadata=self._profile_log_metadata(profile),
         )
         await self.events.publish("profile_created", {"profile_id": profile["id"]})
         return profile
@@ -269,13 +366,30 @@ class SchedulerService:
             else None,
             notes=notes.strip() if isinstance(notes, str) and notes.strip() else None,
         )
+        await self._record_operation(
+            level="info",
+            action="profile_updated",
+            entity_type="profile",
+            entity_id=int(profile["id"]),
+            title=f"环境模板 {profile['name']} 已更新",
+            metadata=self._profile_log_metadata(profile),
+        )
         await self.events.publish("profile_updated", {"profile_id": profile["id"]})
         return profile
 
     async def delete_profile(self, profile_id: int) -> None:
+        profile = self.database.get_profile(profile_id)
         deleted = self.database.delete_profile(profile_id)
         if not deleted:
             raise ValueError("环境配置不存在")
+        await self._record_operation(
+            level="warning",
+            action="profile_deleted",
+            entity_type="profile",
+            entity_id=profile_id,
+            title=f"环境模板 #{profile_id} 已删除",
+            metadata=self._profile_log_metadata(profile) if profile is not None else {"profile_id": profile_id},
+        )
         await self.events.publish("profile_deleted", {"profile_id": profile_id})
 
     async def delete_task(self, task_id: int) -> None:
@@ -291,6 +405,15 @@ class SchedulerService:
                 pass
             except OSError:
                 LOGGER.warning("Failed to delete log file for task %s: %s", task_id, log_path)
+        await self._record_operation(
+            level="warning",
+            action="task_deleted",
+            entity_type="task",
+            entity_id=task_id,
+            title=f"任务 #{task_id} 已删除",
+            detail=f"任务 {task.get('name')} 及其日志文件已删除。",
+            metadata=self._task_log_metadata(task),
+        )
         await self.events.publish(
             "task_deleted",
             {"task_id": task_id, "status": task["status"]},
@@ -309,6 +432,7 @@ class SchedulerService:
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
         profile_id: int | None = None,
+        depends_on_ids: list[int] | None = None,
     ) -> dict[str, object]:
         normalized_requested_gpu = await self._normalize_requested_gpu(requested_gpu)
         normalized_gpu_memory_budget_mb = self._normalize_gpu_memory_budget_mb(
@@ -348,9 +472,57 @@ class SchedulerService:
                 profile_id=profile_id,
                 profile_name=profile_name,
                 shell_setup=shell_setup,
+                depends_on_ids=depends_on_ids,
             )
+        await self._record_operation(
+            level="info",
+            action="task_updated",
+            entity_type="task",
+            entity_id=int(task["id"]),
+            title=f"任务 #{task['id']} 已更新",
+            detail=f"任务 {task['name']} 的运行参数已更新。",
+            metadata=self._task_log_metadata(task),
+        )
         await self.events.publish("task_updated", {"task_id": task["id"]})
         await self._trigger_immediate_schedule()
+        return task
+
+    async def update_task_metadata(
+        self,
+        task_id: int,
+        *,
+        name: str | None,
+        notes: str | None,
+        update_name: bool = True,
+        update_notes: bool = True,
+    ) -> dict[str, object]:
+        if not update_name and not update_notes:
+            raise ValueError("没有可更新的记录字段")
+        current = self.database.get_task(task_id)
+        if current is None:
+            raise ValueError("任务不存在")
+        final_name = str(current["name"])
+        if update_name:
+            final_name = (name or "").strip() or str(current["command"]).strip()[:80]
+        final_notes = current["notes"] if isinstance(current["notes"], str) else None
+        if update_notes:
+            final_notes = notes.strip() if isinstance(notes, str) and notes.strip() else None
+        async with self._lock:
+            task = self.database.update_task_metadata(
+                task_id,
+                name=final_name,
+                notes=final_notes,
+            )
+        await self._record_operation(
+            level="info",
+            action="task_metadata_updated",
+            entity_type="task",
+            entity_id=int(task["id"]),
+            title=f"任务 #{task['id']} 记录信息已更新",
+            detail=f"任务 {task['name']} 的名称或备注已更新。",
+            metadata=self._task_log_metadata(task),
+        )
+        await self.events.publish("task_metadata_updated", {"task_id": task["id"]})
         return task
 
     async def reorder_tasks(
@@ -360,6 +532,14 @@ class SchedulerService:
         queue_name: str = NORMAL_QUEUE,
     ) -> list[dict[str, object]]:
         queue = self.database.reorder_queue(task_ids, queue_name=queue_name)
+        await self._record_operation(
+            level="info",
+            action="queue_reordered",
+            entity_type="queue",
+            title=f"{'紧急' if queue_name == URGENT_QUEUE else '普通'}队列已重排",
+            detail=f"新的任务顺序: {task_ids}",
+            metadata={"queue_name": queue_name, "task_ids": task_ids},
+        )
         await self.events.publish(
             "queue_reordered",
             {"task_ids": task_ids, "queue_name": queue_name},
@@ -373,10 +553,27 @@ class SchedulerService:
                 raise ValueError("只有运行中的任务可以取消")
             handle.stop_reason = "cancel"
             self._start_process_stop_ladder(handle, name=f"cancel-{task_id}")
+        task = self.database.get_task(task_id)
+        await self._record_operation(
+            level="warning",
+            action="task_cancelling",
+            entity_type="task",
+            entity_id=task_id,
+            title=f"任务 #{task_id} 正在取消",
+            metadata=self._task_log_metadata(task) if task is not None else {"task_id": task_id},
+        )
         await self.events.publish("task_cancelling", {"task_id": task_id})
 
     async def requeue_task(self, task_id: int) -> dict[str, object]:
         task = self.database.clone_task_for_requeue(task_id)
+        await self._record_operation(
+            level="success",
+            action="task_requeued",
+            entity_type="task",
+            entity_id=int(task["id"]),
+            title=f"任务 #{task_id} 已重新入队为 #{task['id']}",
+            metadata=self._task_log_metadata(task, extra={"source_task_id": task_id}),
+        )
         await self.events.publish("task_requeued", {"task_id": task["id"], "source_task_id": task_id})
         return task
 
@@ -395,6 +592,19 @@ class SchedulerService:
             handle.stop_reason = "preempt"
             handle.requeue_to_queue_name = NORMAL_QUEUE
             self._start_process_stop_ladder(handle, name=f"preempt-{task_id}")
+        task = self.database.get_task(task_id)
+        await self._record_operation(
+            level="warning",
+            action="task_preempting",
+            entity_type="task",
+            entity_id=task_id,
+            title=f"任务 #{task_id} 正在被抢占",
+            detail="当前任务会被停止并放回普通队列队首。",
+            metadata=self._task_log_metadata(
+                task,
+                extra={"requeue_to_queue_name": NORMAL_QUEUE},
+            ) if task is not None else {"task_id": task_id, "requeue_to_queue_name": NORMAL_QUEUE},
+        )
         await self.events.publish(
             "task_preempting",
             {
@@ -429,10 +639,28 @@ class SchedulerService:
                     "gpu_ids": sorted(gpu_ids) if gpu_ids is not None else None,
                 },
             )
+            await self._record_operation(
+                level="warning",
+                action="tasks_interrupting_for_requeue",
+                entity_type="queue",
+                title="运行中任务正在中断回队列",
+                detail=f"正在中断 {len(handles)} 个运行中任务并放回队列。",
+                metadata={
+                    "task_ids": [handle.task_id for handle in handles],
+                    "gpu_ids": sorted(gpu_ids) if gpu_ids is not None else None,
+                },
+            )
         return len(handles)
 
     async def set_queue_paused(self, paused: bool) -> bool:
         result = self.database.set_queue_paused(paused)
+        await self._record_operation(
+            level="warning" if paused else "success",
+            action="queue_paused" if paused else "queue_resumed",
+            entity_type="queue",
+            title="调度队列已暂停" if paused else "调度队列已恢复",
+            metadata={"paused": result},
+        )
         await self.events.publish(
             "queue_paused" if paused else "queue_resumed",
             {"paused": result},
@@ -452,17 +680,40 @@ class SchedulerService:
     async def update_scheduler_settings(
         self,
         *,
-        poll_interval_seconds: float,
-        gpu_idle_required_checks: int,
+        poll_interval_seconds: object,
+        gpu_idle_required_checks: object,
+        auto_restore_idle_gpu_seconds: object,
+        auto_retry_enabled: object | None,
+        auto_retry_max_retries: object,
+        auto_retry_delay_seconds: object,
     ) -> dict[str, object]:
         settings = self._normalize_scheduler_settings(
             poll_interval_seconds=poll_interval_seconds,
             gpu_idle_required_checks=gpu_idle_required_checks,
+            auto_restore_idle_gpu_seconds=auto_restore_idle_gpu_seconds,
+            auto_retry_enabled=auto_retry_enabled,
+            auto_retry_max_retries=auto_retry_max_retries,
+            auto_retry_delay_seconds=auto_retry_delay_seconds,
         )
         self._apply_scheduler_settings(settings)
         self.database.set_scheduler_settings(**settings)
         self._reset_gpu_ready_counts()
         self._wake_scheduler_loop()
+        await self._record_operation(
+            level="info",
+            action="scheduler_settings_updated",
+            entity_type="scheduler",
+            title="调控器设置已更新",
+            detail=(
+                f"轮询间隔 {settings['poll_interval_seconds']} 秒，"
+                f"连续空闲确认 {settings['gpu_idle_required_checks']} 次，"
+                "自动恢复等待 "
+                f"{self._format_auto_restore_idle_gpu_seconds(settings['auto_restore_idle_gpu_seconds'])}，"
+                "自动重试 "
+                f"{self._format_auto_retry_settings(settings)}。"
+            ),
+            metadata=self._scheduler_settings_payload(),
+        )
         await self.events.publish(
             "scheduler_settings_updated",
             self._scheduler_settings_payload(),
@@ -495,6 +746,22 @@ class SchedulerService:
         await self._trigger_immediate_schedule()
         settings = await self.get_settings()
         settings["interrupted"] = interrupted
+        await self._record_operation(
+            level="warning" if interrupted else "info",
+            action="settings_updated",
+            entity_type="gpu",
+            title="GPU 调度范围已更新",
+            detail=(
+                "已切换可调度 GPU，"
+                f"中断并回队列的运行中任务数: {interrupted}。"
+            ),
+            metadata={
+                "allowed_gpu_ids": normalized_allowed_gpu_ids,
+                "stop_running_gpu_ids": sorted(normalized_stop_gpu_ids),
+                "interrupted": interrupted,
+                "gpu_schedule": settings.get("gpu_schedule"),
+            },
+        )
         return settings
 
     async def schedule_gpu_state(
@@ -516,6 +783,20 @@ class SchedulerService:
             "gpu_schedule_updated",
             {"gpu_id": normalized_gpu_id, "gpu_schedule": schedule},
         )
+        await self._record_operation(
+            level="info",
+            action="gpu_schedule_updated",
+            entity_type="gpu",
+            entity_id=normalized_gpu_id,
+            title=f"GPU {normalized_gpu_id} 定时计划已设置",
+            detail=f"GPU {normalized_gpu_id} 将在 {normalized_run_at.isoformat()} 执行 {normalized_action}。",
+            metadata={
+                "gpu_id": normalized_gpu_id,
+                "action": normalized_action,
+                "run_at": normalized_run_at.isoformat(),
+                "gpu_schedule": schedule,
+            },
+        )
         await self._trigger_immediate_schedule()
         return await self.get_settings()
 
@@ -525,6 +806,14 @@ class SchedulerService:
         await self.events.publish(
             "gpu_schedule_updated",
             {"gpu_id": normalized_gpu_id, "gpu_schedule": schedule},
+        )
+        await self._record_operation(
+            level="info",
+            action="gpu_schedule_cleared",
+            entity_type="gpu",
+            entity_id=normalized_gpu_id,
+            title=f"GPU {normalized_gpu_id} 定时计划已清除",
+            metadata={"gpu_id": normalized_gpu_id, "gpu_schedule": schedule},
         )
         return await self.get_settings()
 
@@ -621,6 +910,9 @@ class SchedulerService:
     async def _tick(self) -> None:
         await self._apply_due_gpu_schedule()
         payload = await self._refresh_gpu_payload()
+        restored_gpu_ids = await self._apply_auto_restore_idle_gpus(payload)
+        if restored_gpu_ids:
+            payload = await self._refresh_gpu_payload()
         async with self._lock:
             queued_tasks = [
                 task
@@ -679,6 +971,17 @@ class SchedulerService:
         self.database.set_allowed_gpu_ids(normalized_allowed_gpu_ids)
         self.database.set_gpu_schedule(remaining)
         self._last_gpu_payload = []
+        await self._record_operation(
+            level="info",
+            action="gpu_schedule_applied",
+            entity_type="gpu",
+            title="GPU 定时计划已执行",
+            detail=f"当前可调度 GPU: {normalized_allowed_gpu_ids if normalized_allowed_gpu_ids is not None else '全部'}。",
+            metadata={
+                "allowed_gpu_ids": normalized_allowed_gpu_ids,
+                "gpu_schedule": remaining,
+            },
+        )
         await self.events.publish(
             "gpu_schedule_applied",
             {
@@ -686,6 +989,80 @@ class SchedulerService:
                 "gpu_schedule": remaining,
             },
         )
+
+    async def _apply_auto_restore_idle_gpus(
+        self,
+        gpu_payload: list[dict[str, object]],
+    ) -> list[int]:
+        restore_after_seconds = self.config.auto_restore_idle_gpu_seconds
+        if restore_after_seconds is None or restore_after_seconds <= 0:
+            self._disabled_gpu_idle_since.clear()
+            return []
+        known_gpu_ids = {int(gpu["index"]) for gpu in gpu_payload}
+        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
+        if allowed_gpu_ids is None:
+            self._disabled_gpu_idle_since.clear()
+            return []
+        enabled_gpu_ids = {gpu_id for gpu_id in allowed_gpu_ids if gpu_id in known_gpu_ids}
+        disabled_gpu_ids = known_gpu_ids - enabled_gpu_ids
+        if not disabled_gpu_ids:
+            self._disabled_gpu_idle_since.clear()
+            return []
+
+        now = datetime.now(UTC)
+        restored_gpu_ids: list[int] = []
+        for gpu in gpu_payload:
+            gpu_id = int(gpu["index"])
+            if gpu_id not in disabled_gpu_ids:
+                continue
+            if self._is_gpu_physically_idle(gpu):
+                idle_since = self._disabled_gpu_idle_since.setdefault(gpu_id, now)
+                idle_seconds = (now - idle_since).total_seconds()
+                if idle_seconds >= restore_after_seconds:
+                    restored_gpu_ids.append(gpu_id)
+            else:
+                self._disabled_gpu_idle_since.pop(gpu_id, None)
+
+        for gpu_id in set(self._disabled_gpu_idle_since) - disabled_gpu_ids:
+            self._disabled_gpu_idle_since.pop(gpu_id, None)
+
+        if not restored_gpu_ids:
+            return []
+
+        restored_set = set(restored_gpu_ids)
+        enabled_gpu_ids.update(restored_set)
+        normalized_allowed_gpu_ids: list[int] | None
+        if enabled_gpu_ids == known_gpu_ids:
+            normalized_allowed_gpu_ids = None
+        else:
+            normalized_allowed_gpu_ids = sorted(enabled_gpu_ids)
+        self.database.set_allowed_gpu_ids(normalized_allowed_gpu_ids)
+        for gpu_id in restored_set:
+            self._disabled_gpu_idle_since.pop(gpu_id, None)
+        self._last_gpu_payload = []
+        await self._record_operation(
+            level="success",
+            action="gpu_auto_restored",
+            entity_type="gpu",
+            title="GPU 已按空闲策略自动恢复可用",
+            detail=(
+                f"GPU {sorted(restored_set)} 已连续空闲 "
+                f"{restore_after_seconds:g} 秒，恢复到全局可用列表。"
+            ),
+            metadata={
+                "gpu_ids": sorted(restored_set),
+                "allowed_gpu_ids": normalized_allowed_gpu_ids,
+                "auto_restore_idle_gpu_seconds": restore_after_seconds,
+            },
+        )
+        payload = {
+            "gpu_ids": sorted(restored_set),
+            "allowed_gpu_ids": normalized_allowed_gpu_ids,
+            "gpu_schedule": self.database.get_gpu_schedule(),
+        }
+        await self.events.publish("gpu_auto_restored", payload)
+        await self.events.publish("settings_updated", payload)
+        return sorted(restored_set)
 
     async def _refresh_gpu_payload(self) -> list[dict[str, object]]:
         gpus = await asyncio.to_thread(self._gpu_provider)
@@ -779,10 +1156,28 @@ class SchedulerService:
             self._close_master_fd(terminal_session)
             log_file.close()
             os.close(slave_fd)
-            self.database.mark_task_launch_failed(
+            failed_task = self.database.mark_task_launch_failed(
                 task_id=task_id,
                 log_path=str(log_path),
                 message=f"启动失败: {exc}",
+            )
+            await self._record_operation(
+                level="error",
+                action="task_failed_to_launch",
+                entity_type="task",
+                entity_id=task_id,
+                title=f"任务 #{task_id} 启动失败",
+                detail=str(exc),
+                metadata=self._task_log_metadata(
+                    failed_task,
+                    extra={
+                        "gpu_id": gpu_id,
+                        "attempt": next_attempt,
+                        "launch_command": launch_command,
+                        "launch_env": env,
+                        "exception": "".join(traceback.format_exception(exc)),
+                    },
+                ),
             )
             await self.events.publish("task_failed_to_launch", {"task_id": task_id})
             return
@@ -816,6 +1211,24 @@ class SchedulerService:
             self._watch_process(handle),
             name=f"watch-task-{task_id}",
         )
+        await self._record_operation(
+            level="success",
+            action="task_started",
+            entity_type="task",
+            entity_id=task_id,
+            title=f"任务 #{task_id} 已启动",
+            detail=f"任务 {running_task['name']} 已在 GPU {gpu_id} 启动，PID {running_task['pid']}。",
+            metadata=self._task_log_metadata(
+                running_task,
+                extra={
+                    "gpu_id": gpu_id,
+                    "pid": running_task["pid"],
+                    "attempt": next_attempt,
+                    "launch_command": launch_command,
+                    "launch_env": env,
+                },
+            ),
+        )
         await self.events.publish(
             "task_started",
             {
@@ -845,6 +1258,22 @@ class SchedulerService:
                 self.database.preempt_running_task_to_queue_head(
                     task_id,
                     queue_name=requeue_queue_name,
+                )
+                task = self.database.get_task(task_id)
+                await self._record_operation(
+                    level="warning",
+                    action="task_preempted",
+                    entity_type="task",
+                    entity_id=task_id,
+                    title=f"任务 #{task_id} 已被抢占并回队列",
+                    metadata=self._task_log_metadata(
+                        task,
+                        extra={"requeue_to_queue_name": requeue_queue_name, "exit_code": exit_code},
+                    ) if task is not None else {
+                        "task_id": task_id,
+                        "requeue_to_queue_name": requeue_queue_name,
+                        "exit_code": exit_code,
+                    },
                 )
                 await self.events.publish(
                     "task_preempted",
@@ -908,6 +1337,30 @@ class SchedulerService:
                     next_retry_at=next_retry_at,
                     exit_code=exit_code,
                 )
+                task = self.database.get_task(task_id)
+                await self._record_operation(
+                    level="warning",
+                    action="task_retry_scheduled",
+                    entity_type="task",
+                    entity_id=task_id,
+                    title=f"任务 #{task_id} 已安排自动重试",
+                    detail=f"退出码 {exit_code}，下一次重试时间 {next_retry_at}。",
+                    metadata=self._task_log_metadata(
+                        task,
+                        extra={
+                            "attempt_count": handle.attempt_count,
+                            "max_retries": self.config.auto_retry_max_retries,
+                            "next_retry_at": next_retry_at,
+                            "exit_code": exit_code,
+                        },
+                    ) if task is not None else {
+                        "task_id": task_id,
+                        "attempt_count": handle.attempt_count,
+                        "max_retries": self.config.auto_retry_max_retries,
+                        "next_retry_at": next_retry_at,
+                        "exit_code": exit_code,
+                    },
+                )
                 await self.events.publish(
                     "task_retry_scheduled",
                     {
@@ -931,11 +1384,23 @@ class SchedulerService:
                     f"\n[exp-scheduler] task={task_id} finished status={status} exit_code={exit_code}\n"
                 ),
             )
-            self.database.finish_task(
+            finished_task = self.database.finish_task(
                 task_id=task_id,
                 status=status,
                 exit_code=exit_code,
                 pid=None,
+            )
+            await self._record_operation(
+                level="success" if status == "succeeded" else "error",
+                action="task_finished",
+                entity_type="task",
+                entity_id=task_id,
+                title=f"任务 #{task_id} {'完成' if status == 'succeeded' else '失败'}",
+                detail=f"任务退出状态 {status}，退出码 {exit_code}。",
+                metadata=self._task_log_metadata(
+                    finished_task,
+                    extra={"status": status, "exit_code": exit_code},
+                ),
             )
             await self.events.publish(
                 "task_finished",
@@ -959,6 +1424,7 @@ class SchedulerService:
                 self._running.pop(task_id, None)
                 self._terminal_sessions.pop(task_id, None)
                 self._watchers.pop(task_id, None)
+                self._mark_gpu_recently_released(handle.gpu_id)
             await self._trigger_immediate_schedule()
 
     async def _requeue_interrupted_task(
@@ -977,9 +1443,21 @@ class SchedulerService:
                 f"reason={reason} exit_code={exit_code}\n"
             ),
         )
-        self.database.requeue_running_task_to_queue_head(
+        task = self.database.requeue_running_task_to_queue_head(
             task_id,
             exit_code=exit_code,
+        )
+        await self._record_operation(
+            level="warning",
+            action="task_interrupted_requeued",
+            entity_type="task",
+            entity_id=task_id,
+            title=f"任务 #{task_id} 已中断并回队列",
+            detail=f"原因: {reason}，退出码: {exit_code}。",
+            metadata=self._task_log_metadata(
+                task,
+                extra={"reason": reason, "exit_code": exit_code},
+            ),
         )
         await self.events.publish(
             "task_interrupted_requeued",
@@ -1004,19 +1482,29 @@ class SchedulerService:
             if isinstance(budget_mb, int):
                 budget_values.add(budget_mb)
         satisfied_keys: set[tuple[int, str]] = set()
+        observed_recently_released_gpu_ids: set[int] = set()
+        recently_released_gpu_ids = set(self._recently_released_gpu_ids)
         for gpu in gpu_payload:
+            gpu_id = int(gpu["index"])
+            if gpu_id in recently_released_gpu_ids and not bool(gpu.get("scheduler_occupied")):
+                observed_recently_released_gpu_ids.add(gpu_id)
             if not bool(gpu.get("globally_enabled")) or bool(gpu.get("scheduler_occupied")):
                 continue
-            gpu_id = int(gpu["index"])
             if bool(gpu.get("is_idle")):
                 satisfied_keys.add((gpu_id, "idle"))
             for budget_mb in budget_values:
                 if self._gpu_has_budget_capacity(gpu, budget_mb):
                     satisfied_keys.add((gpu_id, self._budget_readiness_key(budget_mb)))
-        self._gpu_ready_counts = {
-            key: self._gpu_ready_counts.get(key, 0) + 1
-            for key in satisfied_keys
-        }
+        previous_counts = self._gpu_ready_counts
+        required_checks = self._required_gpu_ready_checks()
+        refreshed_counts: dict[tuple[int, str], int] = {}
+        for key in satisfied_keys:
+            count = previous_counts.get(key, 0) + 1
+            if key[0] in recently_released_gpu_ids:
+                count = max(count, required_checks)
+            refreshed_counts[key] = count
+        self._gpu_ready_counts = refreshed_counts
+        self._recently_released_gpu_ids.difference_update(observed_recently_released_gpu_ids)
 
     def _match_tasks_to_gpus(
         self,
@@ -1076,6 +1564,15 @@ class SchedulerService:
         free_mb = int(gpu.get("memory_total_mb") or 0) - int(gpu.get("memory_used_mb") or 0)
         return free_mb > budget_mb + GPU_MEMORY_BUDGET_HEADROOM_MB
 
+    def _is_gpu_physically_idle(self, gpu: dict[str, object]) -> bool:
+        if "physically_idle" in gpu:
+            return bool(gpu.get("physically_idle"))
+        return (
+            int(gpu.get("memory_used_mb") or 0) < self.config.gpu_idle_memory_mb
+            and not bool(gpu.get("has_processes"))
+            and not bool(gpu.get("scheduler_occupied"))
+        )
+
     def _budget_readiness_key(self, budget_mb: int) -> str:
         return f"budget:{budget_mb}"
 
@@ -1133,6 +1630,8 @@ class SchedulerService:
         return self.config.log_dir / f"task_{task_id}_attempt_{attempt_count}.log"
 
     def _is_task_ready_for_launch(self, task: dict[str, object]) -> bool:
+        if not self.database.are_dependencies_satisfied(int(task["id"])):
+            return False
         next_retry_at = task.get("next_retry_at")
         if not isinstance(next_retry_at, str) or not next_retry_at:
             return True
@@ -1244,12 +1743,31 @@ class SchedulerService:
                     "gpu_idle_required_checks",
                     self.config.gpu_idle_required_checks,
                 ),
+                auto_restore_idle_gpu_seconds=source.get(
+                    "auto_restore_idle_gpu_seconds",
+                    self.config.auto_restore_idle_gpu_seconds,
+                ),
+                auto_retry_enabled=None,
+                auto_retry_max_retries=source.get(
+                    "auto_retry_max_retries",
+                    self.config.auto_retry_max_retries,
+                ),
+                auto_retry_delay_seconds=source.get(
+                    "auto_retry_delay_seconds",
+                    self.config.auto_retry_delay_seconds,
+                ),
             )
         except ValueError:
             LOGGER.warning("Ignoring invalid persisted scheduler settings: %s", persisted)
             settings = self._normalize_scheduler_settings(
                 poll_interval_seconds=self.config.poll_interval_seconds,
                 gpu_idle_required_checks=self.config.gpu_idle_required_checks,
+                auto_restore_idle_gpu_seconds=(
+                    self.config.auto_restore_idle_gpu_seconds
+                ),
+                auto_retry_enabled=None,
+                auto_retry_max_retries=self.config.auto_retry_max_retries,
+                auto_retry_delay_seconds=self.config.auto_retry_delay_seconds,
             )
         self._apply_scheduler_settings(settings)
 
@@ -1258,6 +1776,10 @@ class SchedulerService:
         *,
         poll_interval_seconds: object,
         gpu_idle_required_checks: object,
+        auto_restore_idle_gpu_seconds: object,
+        auto_retry_enabled: object | None,
+        auto_retry_max_retries: object,
+        auto_retry_delay_seconds: object,
     ) -> dict[str, object]:
         try:
             interval = float(poll_interval_seconds)
@@ -1271,26 +1793,104 @@ class SchedulerService:
             raise ValueError("连续检测次数必须是整数") from exc
         if required_checks < 1:
             raise ValueError("连续检测次数必须大于等于 1")
+        auto_restore_seconds = self._normalize_auto_restore_idle_gpu_seconds(
+            auto_restore_idle_gpu_seconds
+        )
+        retry_max_retries = self._normalize_auto_retry_max_retries(
+            auto_retry_max_retries
+        )
+        if auto_retry_enabled is False:
+            retry_max_retries = 0
+        elif auto_retry_enabled is True and retry_max_retries < 1:
+            retry_max_retries = 1
+        retry_delay_seconds = self._normalize_auto_retry_delay_seconds(
+            auto_retry_delay_seconds
+        )
         return {
             "poll_interval_seconds": interval,
             "gpu_idle_required_checks": required_checks,
+            "auto_restore_idle_gpu_seconds": auto_restore_seconds,
+            "auto_retry_max_retries": retry_max_retries,
+            "auto_retry_delay_seconds": retry_delay_seconds,
         }
+
+    def _normalize_auto_restore_idle_gpu_seconds(self, value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("GPU 自动恢复等待时间必须是数字") from exc
+        if seconds < 0 or not seconds < float("inf"):
+            raise ValueError("GPU 自动恢复等待时间必须大于等于 0")
+        if seconds == 0:
+            return None
+        return seconds
+
+    def _format_auto_restore_idle_gpu_seconds(self, value: object) -> str:
+        if value is None:
+            return "关闭"
+        seconds = float(value)
+        return f"{seconds:g} 秒"
+
+    def _normalize_auto_retry_max_retries(self, value: object) -> int:
+        try:
+            max_retries = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("自动重试次数必须是整数") from exc
+        if max_retries < 0:
+            raise ValueError("自动重试次数必须大于等于 0")
+        return max_retries
+
+    def _normalize_auto_retry_delay_seconds(self, value: object) -> int:
+        try:
+            delay_seconds = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("自动重试延迟必须是整数秒") from exc
+        if delay_seconds < 0:
+            raise ValueError("自动重试延迟必须大于等于 0")
+        return delay_seconds
+
+    def _format_auto_retry_settings(self, settings: dict[str, object]) -> str:
+        max_retries = int(settings["auto_retry_max_retries"])
+        if max_retries <= 0:
+            return "关闭"
+        delay_seconds = int(settings["auto_retry_delay_seconds"])
+        return f"开启，额外 {max_retries} 次，延迟 {delay_seconds} 秒"
 
     def _apply_scheduler_settings(self, settings: dict[str, object]) -> None:
         self.config.poll_interval_seconds = float(settings["poll_interval_seconds"])
         self.config.gpu_idle_required_checks = int(settings["gpu_idle_required_checks"])
+        auto_restore_seconds = settings.get("auto_restore_idle_gpu_seconds")
+        self.config.auto_restore_idle_gpu_seconds = (
+            None if auto_restore_seconds is None else float(auto_restore_seconds)
+        )
+        self.config.auto_retry_max_retries = int(settings["auto_retry_max_retries"])
+        self.config.auto_retry_delay_seconds = int(settings["auto_retry_delay_seconds"])
 
     def _scheduler_settings_payload(self) -> dict[str, object]:
         interval = float(self.config.poll_interval_seconds)
         required_checks = int(self.config.gpu_idle_required_checks)
+        auto_restore_seconds = self.config.auto_restore_idle_gpu_seconds
+        auto_retry_max_retries = int(self.config.auto_retry_max_retries)
+        auto_retry_delay_seconds = int(self.config.auto_retry_delay_seconds)
         return {
             "poll_interval_seconds": interval,
             "gpu_idle_required_checks": required_checks,
             "effective_wait_seconds": interval * required_checks,
+            "auto_restore_idle_gpu_seconds": auto_restore_seconds,
+            "auto_restore_idle_gpu_enabled": (
+                auto_restore_seconds is not None and auto_restore_seconds > 0
+            ),
+            "auto_retry_enabled": auto_retry_max_retries > 0,
+            "auto_retry_max_retries": auto_retry_max_retries,
+            "auto_retry_delay_seconds": auto_retry_delay_seconds,
         }
 
     def _reset_gpu_ready_counts(self) -> None:
         self._gpu_ready_counts.clear()
+        self._recently_released_gpu_ids.clear()
+        self._disabled_gpu_idle_since.clear()
 
     def _clear_gpu_ready_counts(self, gpu_id: int) -> None:
         stale_keys = [
@@ -1299,6 +1899,94 @@ class SchedulerService:
         ]
         for key in stale_keys:
             self._gpu_ready_counts.pop(key, None)
+        self._recently_released_gpu_ids.discard(gpu_id)
+
+    def _mark_gpu_recently_released(self, gpu_id: int) -> None:
+        self._recently_released_gpu_ids.add(gpu_id)
+
+    async def _record_operation(
+        self,
+        *,
+        level: str,
+        action: str,
+        title: str,
+        source: str = "scheduler",
+        entity_type: str | None = None,
+        entity_id: int | None = None,
+        detail: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        try:
+            log = self.database.add_operation_log(
+                level=level,
+                source=source,
+                action=action,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                title=title,
+                detail=detail,
+                metadata=metadata,
+            )
+        except Exception:
+            LOGGER.warning("Failed to write operation log: %s", action, exc_info=True)
+            return None
+        await self.events.publish(
+            "operation_log_created",
+            {"log_id": log["id"], "action": action},
+        )
+        return log
+
+    def _task_log_metadata(
+        self,
+        task: dict[str, object],
+        *,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "task_id": task.get("id"),
+            "task_name": task.get("name"),
+            "status": task.get("status"),
+            "command": task.get("command"),
+            "cwd": task.get("cwd"),
+            "env": task.get("env") if isinstance(task.get("env"), dict) else {},
+            "notes": task.get("notes"),
+            "requested_gpu": task.get("requested_gpu"),
+            "assigned_gpu": task.get("assigned_gpu"),
+            "gpu_memory_budget_mb": task.get("gpu_memory_budget_mb"),
+            "queue_name": task.get("queue_name"),
+            "queue_rank": task.get("queue_rank"),
+            "profile_id": task.get("profile_id"),
+            "profile_name": task.get("profile_name"),
+            "shell_setup": task.get("shell_setup"),
+            "attempt_count": task.get("attempt_count"),
+            "pid": task.get("pid"),
+            "exit_code": task.get("exit_code"),
+            "log_path": task.get("log_path"),
+            "depends_on": self.database.get_dependency_ids(int(task["id"]))
+            if task.get("id") is not None
+            else [],
+        }
+        if extra:
+            metadata.update(extra)
+        return metadata
+
+    def _profile_log_metadata(
+        self,
+        profile: dict[str, object],
+        *,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "profile_id": profile.get("id"),
+            "name": profile.get("name"),
+            "cwd": profile.get("cwd"),
+            "env": profile.get("env") if isinstance(profile.get("env"), dict) else {},
+            "shell_setup": profile.get("shell_setup"),
+            "notes": profile.get("notes"),
+        }
+        if extra:
+            metadata.update(extra)
+        return metadata
 
     def _wake_scheduler_loop(self) -> None:
         if not self._stop_event.is_set():
