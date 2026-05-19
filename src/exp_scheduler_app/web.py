@@ -79,6 +79,7 @@ class UpdateSchedulerSettingsRequest(BaseModel):
     auto_retry_enabled: bool | None = None
     auto_retry_max_retries: int | None = Field(default=None, ge=0)
     auto_retry_delay_seconds: int | None = Field(default=None, ge=0)
+    external_kill_gpu_cooldown_seconds: float | None = Field(default=None, ge=0)
 
 
 class PauseQueueRequest(BaseModel):
@@ -442,6 +443,11 @@ def create_app(
             if "auto_retry_delay_seconds" in fields_set
             else current_settings.get("auto_retry_delay_seconds")
         )
+        external_kill_gpu_cooldown_seconds = (
+            payload.external_kill_gpu_cooldown_seconds
+            if "external_kill_gpu_cooldown_seconds" in fields_set
+            else current_settings.get("external_kill_gpu_cooldown_seconds")
+        )
         try:
             return await scheduler.update_scheduler_settings(
                 poll_interval_seconds=poll_interval_seconds,
@@ -450,6 +456,7 @@ def create_app(
                 auto_retry_enabled=auto_retry_enabled,
                 auto_retry_max_retries=auto_retry_max_retries,
                 auto_retry_delay_seconds=auto_retry_delay_seconds,
+                external_kill_gpu_cooldown_seconds=external_kill_gpu_cooldown_seconds,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -475,12 +482,38 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/api/tasks/{task_id}/log")
-    async def get_task_log_endpoint(task_id: int) -> dict[str, object]:
+    @app.get("/api/tasks/{task_id}/logs")
+    async def list_task_logs_endpoint(task_id: int) -> dict[str, object]:
         try:
-            return await scheduler.read_task_log(task_id)
+            return await scheduler.list_task_logs(task_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/tasks/{task_id}/log")
+    async def get_task_log_endpoint(
+        task_id: int,
+        attempt: int | None = Query(default=None, ge=1),
+    ) -> dict[str, object]:
+        try:
+            return await scheduler.read_task_log(task_id, attempt=attempt)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/tasks/{task_id}/logs/{attempt}")
+    async def delete_task_log_endpoint(task_id: int, attempt: int) -> dict[str, object]:
+        try:
+            return await scheduler.delete_task_log(task_id, attempt=attempt)
+        except ValueError as exc:
+            message = str(exc)
+            if "运行中" in message:
+                status_code = 409
+            elif "无效" in message:
+                status_code = 400
+            elif "不存在" in message:
+                status_code = 404
+            else:
+                status_code = 400
+            raise HTTPException(status_code=status_code, detail=message) from exc
 
     @app.get("/api/tasks/{task_id}/terminal/stream")
     async def get_task_terminal_stream_endpoint(task_id: int) -> StreamingResponse:

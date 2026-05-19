@@ -305,6 +305,7 @@ def test_scheduler_settings_endpoint_updates_and_persists(tmp_path):
         assert settings.json()["auto_retry_enabled"] is False
         assert settings.json()["auto_retry_max_retries"] == 0
         assert settings.json()["auto_retry_delay_seconds"] == 5
+        assert settings.json()["external_kill_gpu_cooldown_seconds"] == 300
 
         update = client.put(
             "/api/scheduler/settings",
@@ -315,6 +316,7 @@ def test_scheduler_settings_endpoint_updates_and_persists(tmp_path):
                 "auto_retry_enabled": True,
                 "auto_retry_max_retries": 2,
                 "auto_retry_delay_seconds": 7,
+                "external_kill_gpu_cooldown_seconds": 45,
             },
         )
         update.raise_for_status()
@@ -326,8 +328,13 @@ def test_scheduler_settings_endpoint_updates_and_persists(tmp_path):
         assert payload["auto_retry_enabled"] is True
         assert payload["auto_retry_max_retries"] == 2
         assert payload["auto_retry_delay_seconds"] == 7
+        assert payload["external_kill_gpu_cooldown_seconds"] == 45
         assert client.app.state.scheduler.config.auto_retry_max_retries == 2
         assert client.app.state.scheduler.config.auto_retry_delay_seconds == 7
+        assert (
+            client.app.state.scheduler.config.external_kill_gpu_cooldown_seconds
+            == 45
+        )
 
         invalid = client.put(
             "/api/scheduler/settings",
@@ -345,16 +352,30 @@ def test_scheduler_settings_endpoint_updates_and_persists(tmp_path):
         )
         disabled.raise_for_status()
         assert disabled.json()["auto_restore_idle_gpu_seconds"] is None
+        logs = client.get(
+            "/api/activity/logs?action=scheduler_settings_updated&limit=1"
+        )
+        logs.raise_for_status()
+        assert "空闲自动恢复可用 关闭" in logs.json()["logs"][0]["detail"]
+
+        partial_update = client.put(
+            "/api/scheduler/settings",
+            json={"poll_interval_seconds": 0.3},
+        )
+        partial_update.raise_for_status()
+        assert partial_update.json()["poll_interval_seconds"] == 0.3
+        assert partial_update.json()["auto_restore_idle_gpu_seconds"] is None
 
     with make_client(tmp_path) as client:
         persisted = client.get("/api/scheduler/settings")
         persisted.raise_for_status()
-        assert persisted.json()["poll_interval_seconds"] == 0.2
+        assert persisted.json()["poll_interval_seconds"] == 0.3
         assert persisted.json()["gpu_idle_required_checks"] == 3
         assert persisted.json()["auto_restore_idle_gpu_seconds"] is None
         assert persisted.json()["auto_retry_enabled"] is True
         assert persisted.json()["auto_retry_max_retries"] == 2
         assert persisted.json()["auto_retry_delay_seconds"] == 7
+        assert persisted.json()["external_kill_gpu_cooldown_seconds"] == 45
 
 
 def test_gpu_schedule_endpoint_sets_clears_and_applies_due_actions(tmp_path):
@@ -885,6 +906,36 @@ def test_delete_running_task_is_rejected(tmp_path):
 
         delete = client.delete(f"/api/tasks/{task_id}")
         assert delete.status_code == 409
+
+
+def test_delete_current_running_log_is_rejected(tmp_path):
+    with make_client(tmp_path) as client:
+        client.fake_gpu_provider.set_gpus([gpu(0, idle=True)])
+        create = client.post(
+            "/api/tasks",
+            json={
+                "name": "running-log-delete",
+                "command": command("import time; print('running-log'); time.sleep(5)"),
+                "cwd": None,
+                "env": {},
+                "notes": None,
+            },
+        )
+        create.raise_for_status()
+        task_id = create.json()["task"]["id"]
+
+        running_task = wait_for(
+            lambda: next(
+                task for task in client.get("/api/tasks").json()["running"] if task["id"] == task_id
+            ),
+            timeout=8,
+        )
+        assert Path(running_task["log_path"]).exists()
+
+        delete_log = client.delete(f"/api/tasks/{task_id}/logs/1")
+        assert delete_log.status_code == 409
+        assert "运行中的当前日志不能删除" in delete_log.json()["detail"]
+        assert Path(running_task["log_path"]).exists()
 
 
 def test_terminal_stream_status_codes_for_missing_and_non_running_tasks(tmp_path):

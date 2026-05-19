@@ -14,6 +14,7 @@ DEFAULT_GPU_IDLE_REQUIRED_CHECKS = 6
 DEFAULT_AUTO_RESTORE_IDLE_GPU_SECONDS = 5 * 60
 DEFAULT_AUTO_RETRY_MAX_RETRIES = 0
 DEFAULT_AUTO_RETRY_DELAY_SECONDS = 5
+DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS = 5 * 60
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "exp-scheduler" / "config.toml"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "share" / "exp-scheduler"
 
@@ -58,6 +59,9 @@ class SchedulerConfig:
     )
     auto_retry_max_retries: int = DEFAULT_AUTO_RETRY_MAX_RETRIES
     auto_retry_delay_seconds: int = DEFAULT_AUTO_RETRY_DELAY_SECONDS
+    external_kill_gpu_cooldown_seconds: float = (
+        DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS
+    )
     state_dir: Path = DEFAULT_STATE_DIR
     log_dir: Path = DEFAULT_STATE_DIR / "logs"
 
@@ -82,6 +86,13 @@ def _optional_positive_seconds(value: object) -> float | None:
         return None
     if not seconds < float("inf"):
         raise ValueError("auto_restore_idle_gpu_seconds must be finite")
+    return seconds
+
+
+def _nonnegative_seconds(value: object, *, name: str) -> float:
+    seconds = float(value)
+    if seconds < 0 or not seconds < float("inf"):
+        raise ValueError(f"{name} must be non-negative and finite")
     return seconds
 
 
@@ -114,6 +125,13 @@ def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
         auto_retry_delay_seconds=int(
             data.get("auto_retry_delay_seconds", DEFAULT_AUTO_RETRY_DELAY_SECONDS)
         ),
+        external_kill_gpu_cooldown_seconds=_nonnegative_seconds(
+            data.get(
+                "external_kill_gpu_cooldown_seconds",
+                DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS,
+            ),
+            name="external_kill_gpu_cooldown_seconds",
+        ),
         state_dir=state_dir,
         log_dir=log_dir,
     )
@@ -132,6 +150,7 @@ def default_config_text() -> str:
             f"auto_restore_idle_gpu_seconds = {DEFAULT_AUTO_RESTORE_IDLE_GPU_SECONDS}",
             f"auto_retry_max_retries = {DEFAULT_AUTO_RETRY_MAX_RETRIES}",
             f"auto_retry_delay_seconds = {DEFAULT_AUTO_RETRY_DELAY_SECONDS}",
+            f"external_kill_gpu_cooldown_seconds = {DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS}",
             f'state_dir = "{DEFAULT_STATE_DIR}"',
             f'log_dir = "{DEFAULT_STATE_DIR / "logs"}"',
             "",

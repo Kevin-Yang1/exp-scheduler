@@ -38,6 +38,7 @@ LOGGER = logging.getLogger("exp_scheduler")
 LOG_TAIL_BYTES = 1024 * 1024
 TERMINATE_GRACE_SECONDS = 5
 GPU_MEMORY_BUDGET_HEADROOM_MB = 2048
+TASK_LOG_NAME_RE = re.compile(r"^task_(?P<task_id>\d+)_attempt_(?P<attempt>\d+)\.log$")
 INTERRUPTED_SIGNAL_NUMBERS = {
     int(signal.SIGHUP),
     int(signal.SIGINT),
@@ -98,6 +99,7 @@ class SchedulerService:
         self._gpu_ready_counts: dict[tuple[int, str], int] = {}
         self._recently_released_gpu_ids: set[int] = set()
         self._disabled_gpu_idle_since: dict[int, datetime] = {}
+        self._external_kill_gpu_cooldown_started_at: dict[int, datetime] = {}
 
     async def startup(self) -> None:
         self.database.init()
@@ -397,14 +399,7 @@ class SchedulerService:
             task = self.database.delete_task(task_id)
         if task is None:
             raise ValueError("任务不存在")
-        log_path = task.get("log_path")
-        if isinstance(log_path, str) and log_path:
-            try:
-                Path(log_path).unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                LOGGER.warning("Failed to delete log file for task %s: %s", task_id, log_path)
+        deleted_log_count = self._delete_task_log_files(task)
         await self._record_operation(
             level="warning",
             action="task_deleted",
@@ -412,7 +407,10 @@ class SchedulerService:
             entity_id=task_id,
             title=f"任务 #{task_id} 已删除",
             detail=f"任务 {task.get('name')} 及其日志文件已删除。",
-            metadata=self._task_log_metadata(task),
+            metadata=self._task_log_metadata(
+                task,
+                extra={"deleted_log_count": deleted_log_count},
+            ),
         )
         await self.events.publish(
             "task_deleted",
@@ -686,6 +684,7 @@ class SchedulerService:
         auto_retry_enabled: object | None,
         auto_retry_max_retries: object,
         auto_retry_delay_seconds: object,
+        external_kill_gpu_cooldown_seconds: object,
     ) -> dict[str, object]:
         settings = self._normalize_scheduler_settings(
             poll_interval_seconds=poll_interval_seconds,
@@ -694,9 +693,12 @@ class SchedulerService:
             auto_retry_enabled=auto_retry_enabled,
             auto_retry_max_retries=auto_retry_max_retries,
             auto_retry_delay_seconds=auto_retry_delay_seconds,
+            external_kill_gpu_cooldown_seconds=external_kill_gpu_cooldown_seconds,
         )
         self._apply_scheduler_settings(settings)
         self.database.set_scheduler_settings(**settings)
+        if self.config.external_kill_gpu_cooldown_seconds <= 0:
+            self._external_kill_gpu_cooldown_started_at.clear()
         self._reset_gpu_ready_counts()
         self._wake_scheduler_loop()
         await self._record_operation(
@@ -707,10 +709,12 @@ class SchedulerService:
             detail=(
                 f"轮询间隔 {settings['poll_interval_seconds']} 秒，"
                 f"连续空闲确认 {settings['gpu_idle_required_checks']} 次，"
-                "自动恢复等待 "
+                "空闲自动恢复可用 "
                 f"{self._format_auto_restore_idle_gpu_seconds(settings['auto_restore_idle_gpu_seconds'])}，"
                 "自动重试 "
-                f"{self._format_auto_retry_settings(settings)}。"
+                f"{self._format_auto_retry_settings(settings)}，"
+                "外部 kill 后 GPU 冷却 "
+                f"{self._format_external_kill_gpu_cooldown_seconds(settings['external_kill_gpu_cooldown_seconds'])}。"
             ),
             metadata=self._scheduler_settings_payload(),
         )
@@ -817,15 +821,85 @@ class SchedulerService:
         )
         return await self.get_settings()
 
-    async def read_task_log(self, task_id: int, *, tail_bytes: int = LOG_TAIL_BYTES) -> dict[str, object]:
+    async def list_task_logs(self, task_id: int) -> dict[str, object]:
         task = self.database.get_task(task_id)
         if task is None:
             raise ValueError("任务不存在")
-        log_path = task.get("log_path")
+        return {"task": task, "logs": self._list_task_log_entries(task)}
+
+    async def read_task_log(
+        self,
+        task_id: int,
+        *,
+        attempt: int | None = None,
+        tail_bytes: int = LOG_TAIL_BYTES,
+    ) -> dict[str, object]:
+        task = self.database.get_task(task_id)
+        if task is None:
+            raise ValueError("任务不存在")
+        logs = self._list_task_log_entries(task)
+        selected_log = self._select_task_log_entry(
+            task=task,
+            logs=logs,
+            attempt=attempt,
+        )
         content = ""
-        if isinstance(log_path, str) and log_path:
-            content = read_text_tail(Path(log_path), tail_bytes=tail_bytes)
-        return {"task": task, "content": content}
+        if selected_log is not None:
+            content = read_text_tail(Path(str(selected_log["path"])), tail_bytes=tail_bytes)
+        return {
+            "task": task,
+            "content": content,
+            "logs": logs,
+            "log": selected_log,
+            "selected_attempt": selected_log["attempt"] if selected_log is not None else None,
+        }
+
+    async def delete_task_log(self, task_id: int, *, attempt: int) -> dict[str, object]:
+        if attempt < 1:
+            raise ValueError("日志尝试次数无效")
+        task = self.database.get_task(task_id)
+        if task is None:
+            raise ValueError("任务不存在")
+        logs = self._list_task_log_entries(task)
+        selected_log = self._select_task_log_entry(
+            task=task,
+            logs=logs,
+            attempt=attempt,
+        )
+        if selected_log is None:
+            raise ValueError("日志不存在")
+        if task.get("status") == "running" and bool(selected_log.get("is_current")):
+            raise ValueError("运行中的当前日志不能删除")
+        log_path = Path(str(selected_log["path"]))
+        try:
+            log_path.unlink()
+        except FileNotFoundError:
+            raise ValueError("日志不存在") from None
+        except OSError as exc:
+            raise ValueError(f"日志删除失败: {exc}") from exc
+
+        remaining_logs = self._list_task_log_entries(task)
+        await self._record_operation(
+            level="warning",
+            action="task_log_deleted",
+            entity_type="task",
+            entity_id=task_id,
+            title=f"任务 #{task_id} 第 {attempt} 次运行日志已删除",
+            detail=f"已删除日志文件: {log_path}",
+            metadata=self._task_log_metadata(
+                task,
+                extra={
+                    "log_attempt": attempt,
+                    "deleted_log_path": str(log_path),
+                    "deleted_log_size_bytes": selected_log.get("size_bytes"),
+                },
+            ),
+        )
+        await self.events.publish(
+            "task_log_deleted",
+            {"task_id": task_id, "attempt": attempt},
+        )
+        return {"task": task, "deleted_log": selected_log, "logs": remaining_logs}
 
     async def subscribe_terminal_stream(
         self,
@@ -925,7 +999,11 @@ class SchedulerService:
             if not queued_tasks:
                 return
             available = [
-                gpu for gpu in payload if gpu["globally_enabled"] and not gpu["scheduler_occupied"]
+                gpu
+                for gpu in payload
+                if gpu["globally_enabled"]
+                and not gpu["scheduler_occupied"]
+                and not self._is_gpu_in_external_kill_cooldown(int(gpu["index"]))
             ]
             if not available:
                 return
@@ -1065,18 +1143,33 @@ class SchedulerService:
         return sorted(restored_set)
 
     async def _refresh_gpu_payload(self) -> list[dict[str, object]]:
+        now = datetime.now(UTC)
+        self._prune_external_kill_gpu_cooldowns(now=now)
         gpus = await asyncio.to_thread(self._gpu_provider)
         occupied = {handle.gpu_id for handle in self._running.values()}
         allowed_gpu_ids = self.database.get_allowed_gpu_ids()
         allowed_gpu_set = set(allowed_gpu_ids) if allowed_gpu_ids is not None else None
-        payload = [
-            gpu.to_dict(
+        payload: list[dict[str, object]] = []
+        for gpu in gpus:
+            entry = gpu.to_dict(
                 threshold_mb=self.config.gpu_idle_memory_mb,
                 scheduler_occupied=gpu.index in occupied,
                 globally_enabled=allowed_gpu_set is None or gpu.index in allowed_gpu_set,
             )
-            for gpu in gpus
-        ]
+            cooldown_until = self._gpu_external_kill_cooldown_until(
+                gpu.index,
+                now=now,
+            )
+            if cooldown_until is not None:
+                remaining_seconds = max(
+                    0,
+                    int((cooldown_until - now).total_seconds() + 0.999),
+                )
+                entry["is_idle"] = False
+                entry["cooldown_until"] = cooldown_until.isoformat()
+                entry["cooldown_remaining_seconds"] = remaining_seconds
+                entry["cooldown_reason"] = "external_signal"
+            payload.append(entry)
         if payload != self._last_gpu_payload:
             self._last_gpu_payload = payload
             await self.events.publish("gpu_updated", {"gpus": payload})
@@ -1436,6 +1529,13 @@ class SchedulerService:
         reason: str,
     ) -> None:
         task_id = handle.task_id
+        cooldown_metadata: dict[str, object] = {}
+        if reason == "signal_interrupted":
+            cooldown_metadata = self._start_external_kill_gpu_cooldown(
+                gpu_id=handle.gpu_id,
+                task_id=task_id,
+                exit_code=exit_code,
+            )
         self._append_terminal_bytes(
             session,
             encode_terminal_text(
@@ -1443,20 +1543,40 @@ class SchedulerService:
                 f"reason={reason} exit_code={exit_code}\n"
             ),
         )
+        if cooldown_metadata:
+            self._append_terminal_bytes(
+                session,
+                encode_terminal_text(
+                    "[exp-scheduler] external_kill_gpu_cooldown=true "
+                    f"gpu={handle.gpu_id} "
+                    f"seconds={cooldown_metadata['cooldown_seconds']} "
+                    f"until={cooldown_metadata['cooldown_until']}\n"
+                ),
+            )
         task = self.database.requeue_running_task_to_queue_head(
             task_id,
             exit_code=exit_code,
         )
+        detail = f"原因: {reason}，退出码: {exit_code}。"
+        if cooldown_metadata:
+            detail += (
+                f" GPU {handle.gpu_id} 冷却 "
+                f"{cooldown_metadata['cooldown_seconds']:g} 秒。"
+            )
         await self._record_operation(
             level="warning",
             action="task_interrupted_requeued",
             entity_type="task",
             entity_id=task_id,
             title=f"任务 #{task_id} 已中断并回队列",
-            detail=f"原因: {reason}，退出码: {exit_code}。",
+            detail=detail,
             metadata=self._task_log_metadata(
                 task,
-                extra={"reason": reason, "exit_code": exit_code},
+                extra={
+                    "reason": reason,
+                    "exit_code": exit_code,
+                    **cooldown_metadata,
+                },
             ),
         )
         await self.events.publish(
@@ -1465,6 +1585,7 @@ class SchedulerService:
                 "task_id": task_id,
                 "reason": reason,
                 "exit_code": exit_code,
+                **cooldown_metadata,
             },
         )
 
@@ -1484,8 +1605,11 @@ class SchedulerService:
         satisfied_keys: set[tuple[int, str]] = set()
         observed_recently_released_gpu_ids: set[int] = set()
         recently_released_gpu_ids = set(self._recently_released_gpu_ids)
+        now = datetime.now(UTC)
         for gpu in gpu_payload:
             gpu_id = int(gpu["index"])
+            if self._is_gpu_in_external_kill_cooldown(gpu_id, now=now):
+                continue
             if gpu_id in recently_released_gpu_ids and not bool(gpu.get("scheduler_occupied")):
                 observed_recently_released_gpu_ids.add(gpu_id)
             if not bool(gpu.get("globally_enabled")) or bool(gpu.get("scheduler_occupied")):
@@ -1548,9 +1672,13 @@ class SchedulerService:
         task: dict[str, object],
         gpu: dict[str, object],
     ) -> tuple[int, str] | None:
-        if not bool(gpu.get("globally_enabled")) or bool(gpu.get("scheduler_occupied")):
-            return None
         gpu_id = int(gpu["index"])
+        if (
+            not bool(gpu.get("globally_enabled"))
+            or bool(gpu.get("scheduler_occupied"))
+            or self._is_gpu_in_external_kill_cooldown(gpu_id)
+        ):
+            return None
         budget_mb = task.get("gpu_memory_budget_mb")
         if isinstance(budget_mb, int):
             if self._gpu_has_budget_capacity(gpu, budget_mb):
@@ -1628,6 +1756,91 @@ class SchedulerService:
 
     def _log_path_for_task(self, task_id: int, attempt_count: int) -> Path:
         return self.config.log_dir / f"task_{task_id}_attempt_{attempt_count}.log"
+
+    def _list_task_log_entries(self, task: dict[str, object]) -> list[dict[str, object]]:
+        task_id = int(task["id"])
+        entries_by_attempt: dict[int, dict[str, object]] = {}
+        for path in self.config.log_dir.glob(f"task_{task_id}_attempt_*.log"):
+            entry = self._task_log_entry_from_path(task, path)
+            if entry is not None:
+                entries_by_attempt[int(entry["attempt"])] = entry
+
+        log_path = task.get("log_path")
+        if isinstance(log_path, str) and log_path:
+            entry = self._task_log_entry_from_path(task, Path(log_path))
+            if entry is not None:
+                entries_by_attempt[int(entry["attempt"])] = entry
+
+        return [entries_by_attempt[attempt] for attempt in sorted(entries_by_attempt)]
+
+    def _task_log_entry_from_path(
+        self,
+        task: dict[str, object],
+        path: Path,
+    ) -> dict[str, object] | None:
+        if not path.exists() or not path.is_file():
+            return None
+        match = TASK_LOG_NAME_RE.match(path.name)
+        if match is None:
+            return None
+        task_id = int(task["id"])
+        if int(match.group("task_id")) != task_id:
+            return None
+        stat = path.stat()
+        current_path = task.get("log_path")
+        is_current = False
+        if isinstance(current_path, str) and current_path:
+            is_current = Path(current_path).expanduser().resolve() == path.expanduser().resolve()
+        return {
+            "attempt": int(match.group("attempt")),
+            "path": str(path),
+            "size_bytes": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+            "is_current": is_current,
+        }
+
+    def _select_task_log_entry(
+        self,
+        *,
+        task: dict[str, object],
+        logs: list[dict[str, object]],
+        attempt: int | None,
+    ) -> dict[str, object] | None:
+        if attempt is not None:
+            if attempt < 1:
+                raise ValueError("日志尝试次数无效")
+            for log in logs:
+                if int(log["attempt"]) == attempt:
+                    return log
+            raise ValueError("日志不存在")
+
+        for log in logs:
+            if bool(log.get("is_current")):
+                return log
+        if logs:
+            return logs[-1]
+        return None
+
+    def _delete_task_log_files(self, task: dict[str, object]) -> int:
+        paths: set[Path] = {
+            Path(str(entry["path"]))
+            for entry in self._list_task_log_entries(task)
+            if isinstance(entry.get("path"), str)
+        }
+        log_path = task.get("log_path")
+        if isinstance(log_path, str) and log_path:
+            paths.add(Path(log_path))
+
+        deleted_count = 0
+        for path in paths:
+            try:
+                path.unlink()
+                deleted_count += 1
+            except FileNotFoundError:
+                pass
+            except OSError:
+                LOGGER.warning("Failed to delete log file for task %s: %s", task["id"], path)
+        return deleted_count
 
     def _is_task_ready_for_launch(self, task: dict[str, object]) -> bool:
         if not self.database.are_dependencies_satisfied(int(task["id"])):
@@ -1756,6 +1969,10 @@ class SchedulerService:
                     "auto_retry_delay_seconds",
                     self.config.auto_retry_delay_seconds,
                 ),
+                external_kill_gpu_cooldown_seconds=source.get(
+                    "external_kill_gpu_cooldown_seconds",
+                    self.config.external_kill_gpu_cooldown_seconds,
+                ),
             )
         except ValueError:
             LOGGER.warning("Ignoring invalid persisted scheduler settings: %s", persisted)
@@ -1768,6 +1985,9 @@ class SchedulerService:
                 auto_retry_enabled=None,
                 auto_retry_max_retries=self.config.auto_retry_max_retries,
                 auto_retry_delay_seconds=self.config.auto_retry_delay_seconds,
+                external_kill_gpu_cooldown_seconds=(
+                    self.config.external_kill_gpu_cooldown_seconds
+                ),
             )
         self._apply_scheduler_settings(settings)
 
@@ -1780,6 +2000,7 @@ class SchedulerService:
         auto_retry_enabled: object | None,
         auto_retry_max_retries: object,
         auto_retry_delay_seconds: object,
+        external_kill_gpu_cooldown_seconds: object,
     ) -> dict[str, object]:
         try:
             interval = float(poll_interval_seconds)
@@ -1806,12 +2027,18 @@ class SchedulerService:
         retry_delay_seconds = self._normalize_auto_retry_delay_seconds(
             auto_retry_delay_seconds
         )
+        external_kill_cooldown_seconds = (
+            self._normalize_external_kill_gpu_cooldown_seconds(
+                external_kill_gpu_cooldown_seconds
+            )
+        )
         return {
             "poll_interval_seconds": interval,
             "gpu_idle_required_checks": required_checks,
             "auto_restore_idle_gpu_seconds": auto_restore_seconds,
             "auto_retry_max_retries": retry_max_retries,
             "auto_retry_delay_seconds": retry_delay_seconds,
+            "external_kill_gpu_cooldown_seconds": external_kill_cooldown_seconds,
         }
 
     def _normalize_auto_restore_idle_gpu_seconds(self, value: object) -> float | None:
@@ -1831,7 +2058,7 @@ class SchedulerService:
         if value is None:
             return "关闭"
         seconds = float(value)
-        return f"{seconds:g} 秒"
+        return f"{seconds:g}秒"
 
     def _normalize_auto_retry_max_retries(self, value: object) -> int:
         try:
@@ -1851,12 +2078,27 @@ class SchedulerService:
             raise ValueError("自动重试延迟必须大于等于 0")
         return delay_seconds
 
+    def _normalize_external_kill_gpu_cooldown_seconds(self, value: object) -> float:
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("外部 kill 后 GPU 冷却时间必须是数字") from exc
+        if seconds < 0 or not seconds < float("inf"):
+            raise ValueError("外部 kill 后 GPU 冷却时间必须大于等于 0")
+        return seconds
+
     def _format_auto_retry_settings(self, settings: dict[str, object]) -> str:
         max_retries = int(settings["auto_retry_max_retries"])
         if max_retries <= 0:
             return "关闭"
         delay_seconds = int(settings["auto_retry_delay_seconds"])
         return f"开启，额外 {max_retries} 次，延迟 {delay_seconds} 秒"
+
+    def _format_external_kill_gpu_cooldown_seconds(self, value: object) -> str:
+        seconds = float(value)
+        if seconds <= 0:
+            return "关闭"
+        return f"{seconds:g}秒"
 
     def _apply_scheduler_settings(self, settings: dict[str, object]) -> None:
         self.config.poll_interval_seconds = float(settings["poll_interval_seconds"])
@@ -1867,6 +2109,9 @@ class SchedulerService:
         )
         self.config.auto_retry_max_retries = int(settings["auto_retry_max_retries"])
         self.config.auto_retry_delay_seconds = int(settings["auto_retry_delay_seconds"])
+        self.config.external_kill_gpu_cooldown_seconds = float(
+            settings["external_kill_gpu_cooldown_seconds"]
+        )
 
     def _scheduler_settings_payload(self) -> dict[str, object]:
         interval = float(self.config.poll_interval_seconds)
@@ -1874,6 +2119,9 @@ class SchedulerService:
         auto_restore_seconds = self.config.auto_restore_idle_gpu_seconds
         auto_retry_max_retries = int(self.config.auto_retry_max_retries)
         auto_retry_delay_seconds = int(self.config.auto_retry_delay_seconds)
+        external_kill_gpu_cooldown_seconds = float(
+            self.config.external_kill_gpu_cooldown_seconds
+        )
         return {
             "poll_interval_seconds": interval,
             "gpu_idle_required_checks": required_checks,
@@ -1885,6 +2133,7 @@ class SchedulerService:
             "auto_retry_enabled": auto_retry_max_retries > 0,
             "auto_retry_max_retries": auto_retry_max_retries,
             "auto_retry_delay_seconds": auto_retry_delay_seconds,
+            "external_kill_gpu_cooldown_seconds": external_kill_gpu_cooldown_seconds,
         }
 
     def _reset_gpu_ready_counts(self) -> None:
@@ -1903,6 +2152,68 @@ class SchedulerService:
 
     def _mark_gpu_recently_released(self, gpu_id: int) -> None:
         self._recently_released_gpu_ids.add(gpu_id)
+
+    def _start_external_kill_gpu_cooldown(
+        self,
+        *,
+        gpu_id: int,
+        task_id: int,
+        exit_code: int,
+    ) -> dict[str, object]:
+        cooldown_seconds = float(self.config.external_kill_gpu_cooldown_seconds)
+        if cooldown_seconds <= 0:
+            return {}
+        now = datetime.now(UTC)
+        self._external_kill_gpu_cooldown_started_at[gpu_id] = now
+        cooldown_until = now + timedelta(seconds=cooldown_seconds)
+        self._clear_gpu_ready_counts(gpu_id)
+        self._last_gpu_payload = []
+        return {
+            "cooldown_gpu_id": gpu_id,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_started_at": now.isoformat(),
+            "cooldown_until": cooldown_until.isoformat(),
+            "cooldown_reason": "external_signal",
+            "cooldown_task_id": task_id,
+            "cooldown_exit_code": exit_code,
+        }
+
+    def _gpu_external_kill_cooldown_until(
+        self,
+        gpu_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> datetime | None:
+        cooldown_seconds = float(self.config.external_kill_gpu_cooldown_seconds)
+        if cooldown_seconds <= 0:
+            self._external_kill_gpu_cooldown_started_at.pop(gpu_id, None)
+            return None
+        started_at = self._external_kill_gpu_cooldown_started_at.get(gpu_id)
+        if started_at is None:
+            return None
+        current_time = now or datetime.now(UTC)
+        cooldown_until = started_at + timedelta(seconds=cooldown_seconds)
+        if cooldown_until <= current_time:
+            self._external_kill_gpu_cooldown_started_at.pop(gpu_id, None)
+            return None
+        return cooldown_until
+
+    def _is_gpu_in_external_kill_cooldown(
+        self,
+        gpu_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        return self._gpu_external_kill_cooldown_until(gpu_id, now=now) is not None
+
+    def _prune_external_kill_gpu_cooldowns(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        current_time = now or datetime.now(UTC)
+        for gpu_id in list(self._external_kill_gpu_cooldown_started_at):
+            self._gpu_external_kill_cooldown_until(gpu_id, now=current_time)
 
     async def _record_operation(
         self,

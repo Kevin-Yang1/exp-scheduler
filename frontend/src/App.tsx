@@ -54,6 +54,8 @@ interface GPUStatus {
   memoryFree: number;
   utilization: number;
   isBusy: boolean;
+  isCoolingDown?: boolean;
+  cooldownRemainingSeconds?: number;
 }
 
 interface Task {
@@ -108,6 +110,22 @@ interface BackendTask {
   has_dependencies?: boolean;
 }
 
+interface TaskLogEntry {
+  attempt: number;
+  path: string;
+  size_bytes: number;
+  modified_at?: string | null;
+  is_current?: boolean;
+}
+
+interface TaskLogPayload {
+  task?: BackendTask;
+  content?: string;
+  logs?: TaskLogEntry[];
+  log?: TaskLogEntry | null;
+  selected_attempt?: number | null;
+}
+
 interface BackendGPU {
   index: number;
   name: string;
@@ -120,6 +138,9 @@ interface BackendGPU {
   globally_enabled: boolean;
   scheduler_occupied?: boolean;
   has_processes?: boolean;
+  cooldown_until?: string;
+  cooldown_remaining_seconds?: number;
+  cooldown_reason?: string;
 }
 
 interface Profile {
@@ -140,6 +161,7 @@ interface SchedulerSettings {
   auto_retry_enabled: boolean;
   auto_retry_max_retries: number;
   auto_retry_delay_seconds: number;
+  external_kill_gpu_cooldown_seconds: number;
 }
 
 type ActivityLogLevel = 'info' | 'success' | 'warning' | 'error';
@@ -189,6 +211,18 @@ function formatTime(value?: string | null) {
   if (!value) return undefined;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatBytes(value?: number | null) {
+  if (!value || value <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
 }
 
 function envToText(env?: Record<string, string>) {
@@ -298,6 +332,7 @@ function mapTask(task: BackendTask): Task {
 }
 
 function mapGpu(gpu: BackendGPU): GPUStatus {
+  const isCoolingDown = Boolean(gpu.cooldown_until || (gpu.cooldown_remaining_seconds ?? 0) > 0);
   return {
     id: gpu.index,
     name: gpu.name,
@@ -305,7 +340,9 @@ function mapGpu(gpu: BackendGPU): GPUStatus {
     memoryTotal: gpu.memory_total_mb || 0,
     memoryFree: gpu.memory_free_mb ?? Math.max(0, (gpu.memory_total_mb || 0) - (gpu.memory_used_mb || 0)),
     utilization: gpu.utilization_gpu || 0,
-    isBusy: !(gpu.physically_idle ?? gpu.is_idle) || Boolean(gpu.scheduler_occupied || gpu.has_processes),
+    isBusy: isCoolingDown || !(gpu.physically_idle ?? gpu.is_idle) || Boolean(gpu.scheduler_occupied || gpu.has_processes),
+    isCoolingDown,
+    cooldownRemainingSeconds: gpu.cooldown_remaining_seconds,
   };
 }
 
@@ -369,7 +406,6 @@ export default function App() {
   const [profileDraft, setProfileDraft] = useState<Profile | null>(null);
   const [serverIp, setServerIp] = useState('读取中...');
   const [message, setMessage] = useState('');
-  const [logText, setLogText] = useState('系统休眠中，请选择任务查看日志...');
   const followRunningTaskRef = useRef(true);
 
   const runningTasks = useMemo(() => tasks.filter(t => t.status === 'running'), [tasks]);
@@ -405,7 +441,9 @@ export default function App() {
   const isMetadataOnlyTaskEdit = Boolean(isEditingTask && taskDraft && taskDraft.status !== 'pending');
   const autoRestoreIdleGpuSeconds = schedulerSettingsDraft.auto_restore_idle_gpu_seconds !== undefined
     ? schedulerSettingsDraft.auto_restore_idle_gpu_seconds
-    : (schedulerSettings?.auto_restore_idle_gpu_seconds ?? 300);
+    : schedulerSettings
+      ? schedulerSettings.auto_restore_idle_gpu_seconds
+      : 300;
   const autoRestoreIdleGpuEnabled = typeof autoRestoreIdleGpuSeconds === 'number' && autoRestoreIdleGpuSeconds > 0;
   const autoRestoreIdleGpuMinutes = autoRestoreMinutesDraft ?? (
     autoRestoreIdleGpuEnabled && typeof autoRestoreIdleGpuSeconds === 'number'
@@ -421,6 +459,9 @@ export default function App() {
   const autoRetryDelaySeconds = schedulerSettingsDraft.auto_retry_delay_seconds
     ?? schedulerSettings?.auto_retry_delay_seconds
     ?? 5;
+  const externalKillGpuCooldownSeconds = schedulerSettingsDraft.external_kill_gpu_cooldown_seconds
+    ?? schedulerSettings?.external_kill_gpu_cooldown_seconds
+    ?? 300;
   const hasSchedulerSettingsDraft = Object.keys(schedulerSettingsDraft).length > 0 || autoRestoreMinutesDraft !== null;
 
   useEffect(() => {
@@ -514,36 +555,6 @@ export default function App() {
     };
   }, [activeTab, loadActivityLogs]);
 
-  useEffect(() => {
-    if (!selectedTaskId) {
-      setLogText('系统休眠中，请选择任务查看日志...');
-      return;
-    }
-    if (selectedTask?.status === 'running') {
-      setLogText('实时终端连接中...');
-      return;
-    }
-    let cancelled = false;
-    const loadLog = async () => {
-      try {
-        const payload = await api<{ content?: string }>(`/api/tasks/${selectedTaskId}/log`);
-        if (!cancelled) {
-          setLogText(payload.content || '(日志为空)');
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setLogText(error instanceof Error ? `日志加载失败: ${error.message}` : '日志加载失败');
-        }
-      }
-    };
-    loadLog();
-    const timer = window.setInterval(loadLog, 2000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [selectedTaskId, selectedTask?.status]);
-
   const toggleQueue = async () => {
     if (isPaused) {
       await api('/api/queue/resume', { method: 'POST' });
@@ -595,6 +606,7 @@ export default function App() {
         auto_retry_enabled: false,
         auto_retry_max_retries: 0,
         auto_retry_delay_seconds: 5,
+        external_kill_gpu_cooldown_seconds: 300,
       };
       const merged = {
         ...current,
@@ -641,6 +653,13 @@ export default function App() {
         setMessage('自动重试延迟必须是大于等于 0 的整数秒');
         return;
       }
+      if (
+        merged.external_kill_gpu_cooldown_seconds < 0 ||
+        !Number.isFinite(merged.external_kill_gpu_cooldown_seconds)
+      ) {
+        setMessage('外部 kill 后 GPU 冷却时间必须是大于等于 0 的秒数');
+        return;
+      }
       
       const res = await api<SchedulerSettings>('/api/scheduler/settings', {
         method: 'PUT',
@@ -651,6 +670,7 @@ export default function App() {
           auto_retry_enabled: retryEnabled,
           auto_retry_max_retries: retryEnabled ? merged.auto_retry_max_retries : 0,
           auto_retry_delay_seconds: merged.auto_retry_delay_seconds,
+          external_kill_gpu_cooldown_seconds: merged.external_kill_gpu_cooldown_seconds,
         }),
       });
       setSchedulerSettings(res);
@@ -1283,8 +1303,8 @@ export default function App() {
                     <div className={`bg-slate-900 rounded-2xl p-5 font-mono text-xs leading-relaxed shadow-xl overflow-hidden ${isConsoleFullScreen ? 'flex-1' : 'h-[600px]'}`}>
                       <ConsoleTerminal
                         task={selectedTask}
-                        fallbackContent={logText}
                         isFullScreen={isConsoleFullScreen}
+                        onMessage={setMessage}
                       />
                     </div>
                   </section>
@@ -1826,7 +1846,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <div className="mt-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                       <div className="space-y-2">
                         <label className="block text-xs font-bold text-slate-700">轮询间隔 (秒)</label>
                         <input
@@ -1860,6 +1880,25 @@ export default function App() {
                           <Clock className="w-4 h-4 text-slate-400" />
                         </div>
                         <p className="text-[10px] text-slate-500 font-medium">外部释放或未知占用后使用；调度器任务结束后快速接续</p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="block text-xs font-bold text-slate-700">外部 kill 后冷却 (秒)</label>
+                        <input
+                          type="number"
+                          step="1"
+                          min="0"
+                          value={externalKillGpuCooldownSeconds}
+                          onChange={(event) => {
+                            const value = parseFloat(event.target.value);
+                            setSchedulerSettingsDraft(prev => ({
+                              ...prev,
+                              external_kill_gpu_cooldown_seconds: Number.isFinite(value) ? value : 0,
+                            }));
+                          }}
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm font-bold text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-colors"
+                        />
+                        <p className="text-[10px] text-slate-500 font-medium">0 表示外部 kill 后不进入 GPU 冷却</p>
                       </div>
                     </div>
 
@@ -2312,11 +2351,19 @@ function StatCard({ label, value, trend, type }: { label: string, value: string,
 
 function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
   const memPercent = gpu.memoryTotal ? (gpu.memoryUsed / gpu.memoryTotal) * 100 : 0;
+  const statusText = gpu.isCoolingDown
+    ? `冷却 ${gpu.cooldownRemainingSeconds ?? 0}s`
+    : gpu.isBusy ? '活跃' : '空闲';
+  const statusClass = gpu.isCoolingDown
+    ? 'bg-amber-50 text-amber-700 border border-amber-100'
+    : gpu.isBusy
+      ? 'bg-blue-50 text-blue-600 border border-blue-100'
+      : 'bg-slate-50 text-slate-500 border border-slate-100';
 
   return (
     <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm transition-all hover:shadow-md hover:border-blue-200 group flex items-center gap-4">
       <div className="flex items-center gap-3 shrink-0">
-        <div className={`p-1.5 rounded-lg ${gpu.isBusy ? 'bg-blue-50 text-blue-600' : 'bg-slate-50 text-slate-400'}`}>
+        <div className={`p-1.5 rounded-lg ${gpu.isCoolingDown ? 'bg-amber-50 text-amber-600' : gpu.isBusy ? 'bg-blue-50 text-blue-600' : 'bg-slate-50 text-slate-400'}`}>
           <Cpu className="w-4 h-4" />
         </div>
         <div>
@@ -2348,8 +2395,8 @@ function GPUCard({ gpu }: { gpu: GPUStatus; key?: React.Key }) {
       </div>
 
       <div className="shrink-0">
-        <div className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-tighter ${gpu.isBusy ? 'bg-blue-50 text-blue-600 border border-blue-100' : 'bg-slate-50 text-slate-500 border border-slate-100'}`}>
-          {gpu.isBusy ? '活跃' : '空闲'}
+        <div className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-tighter ${statusClass}`}>
+          {statusText}
         </div>
       </div>
     </div>
@@ -2549,24 +2596,11 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
   const canBatchDelete = task.status !== 'running';
 
   const [isLogExpanded, setIsLogExpanded] = useState(false);
-  const [logContent, setLogContent] = useState<string | null>(null);
-  const [isLoadingLog, setIsLoadingLog] = useState(false);
   const [isLogFullScreen, setIsLogFullScreen] = useState(false);
 
-  const handleToggleLog = async () => {
+  const handleToggleLog = () => {
     if (!isLogExpanded) {
       setIsLogExpanded(true);
-      if (logContent === null) {
-        setIsLoadingLog(true);
-        try {
-          const payload = await api<{ content?: string }>(`/api/tasks/${task.id}/log`);
-          setLogContent(payload.content || '暂无日志内容');
-        } catch (e) {
-          setLogContent('无法获取日志。');
-        } finally {
-          setIsLoadingLog(false);
-        }
-      }
     } else {
       setIsLogExpanded(false);
       setIsLogFullScreen(false);
@@ -2753,16 +2787,7 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
                </button>
              </div>
              <div className="p-3 bg-slate-900 rounded-b-lg font-mono text-[11px] text-slate-300 w-full overflow-hidden relative" style={{ height: "600px" }}>
-               {isLoadingLog ? (
-                 <div className="absolute inset-0 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm z-10 rounded-b-lg">
-                   <div className="flex items-center gap-3">
-                     <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
-                     <span className="text-sm font-bold text-slate-300 tracking-tight">正在加载日志流...</span>
-                   </div>
-                 </div>
-               ) : (
-                 <TerminalLog taskName={task.name} content={logContent || ''} />
-               )}
+               <TaskLogViewer task={task} />
              </div>
           </div>
         )}
@@ -2786,7 +2811,7 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
              </button>
           </div>
           <div className="flex-1 overflow-hidden p-6 font-mono text-[13px] relative bg-slate-900">
-             <TerminalLog taskName={task.name} content={logContent || ''} isFullScreen />
+             <TaskLogViewer task={task} isFullScreen />
           </div>
         </div>
       )}
@@ -2862,22 +2887,208 @@ function decodeTerminalBytes(
 
 function ConsoleTerminal({
   task,
-  fallbackContent,
   isFullScreen = false,
+  onMessage,
 }: {
   task: Task | null;
-  fallbackContent: string;
   isFullScreen?: boolean;
+  onMessage?: (message: string) => void;
 }) {
-  if (task?.status === 'running') {
-    return <LiveTerminal taskId={task.id} taskName={task.name} isFullScreen={isFullScreen} />;
+  if (!task) {
+    return (
+      <TerminalLog
+        taskName="系统监控"
+        content="系统休眠中，请选择任务查看日志..."
+        isFullScreen={isFullScreen}
+      />
+    );
   }
   return (
-    <TerminalLog
-      taskName={task?.name || '系统监控'}
-      content={fallbackContent}
+    <TaskLogViewer
+      task={task}
+      allowLive
       isFullScreen={isFullScreen}
+      onMessage={onMessage}
     />
+  );
+}
+
+function TaskLogViewer({
+  task,
+  allowLive = false,
+  isFullScreen = false,
+  onMessage,
+}: {
+  task: Task;
+  allowLive?: boolean;
+  isFullScreen?: boolean;
+  onMessage?: (message: string) => void;
+}) {
+  const canUseLive = allowLive && task.status === 'running';
+  const [logs, setLogs] = useState<TaskLogEntry[]>([]);
+  const [selectedAttempt, setSelectedAttempt] = useState<number | null>(null);
+  const [content, setContent] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const hasLoadedRef = useRef(false);
+
+  const selectableLogs = useMemo(
+    () => logs.filter(log => !(canUseLive && log.is_current)),
+    [canUseLive, logs],
+  );
+  const isLiveSelected = canUseLive && selectedAttempt === null;
+  const selectedLog = selectableLogs.find(log => log.attempt === selectedAttempt) || null;
+
+  useEffect(() => {
+    setLogs([]);
+    setSelectedAttempt(null);
+    setContent(canUseLive ? '实时终端连接中...' : '正在加载日志...');
+    hasLoadedRef.current = false;
+  }, [task.id, task.status, canUseLive]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadLogs = async () => {
+      if (!hasLoadedRef.current && !isLiveSelected) {
+        setIsLoading(true);
+      }
+      try {
+        if (isLiveSelected) {
+          const payload = await api<{ logs?: TaskLogEntry[] }>(`/api/tasks/${task.id}/logs`);
+          if (!cancelled) {
+            setLogs(payload.logs || []);
+            setContent('实时终端连接中...');
+            hasLoadedRef.current = true;
+          }
+          return;
+        }
+
+        const suffix = selectedAttempt !== null ? `?attempt=${selectedAttempt}` : '';
+        const payload = await api<TaskLogPayload>(`/api/tasks/${task.id}/log${suffix}`);
+        if (cancelled) return;
+        const nextLogs = payload.logs || [];
+        setLogs(nextLogs);
+        if (selectedAttempt === null && payload.selected_attempt !== null && payload.selected_attempt !== undefined) {
+          setSelectedAttempt(payload.selected_attempt);
+        }
+        setContent(payload.content || '(日志为空)');
+        hasLoadedRef.current = true;
+      } catch (error) {
+        if (!cancelled) {
+          setContent(error instanceof Error ? `日志加载失败: ${error.message}` : '日志加载失败');
+          hasLoadedRef.current = true;
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      }
+    };
+
+    loadLogs();
+    const timer = window.setInterval(loadLogs, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [task.id, selectedAttempt, isLiveSelected]);
+
+  const handleSelectAttempt = (value: string) => {
+    hasLoadedRef.current = false;
+    if (value === 'live') {
+      setSelectedAttempt(null);
+      setContent('实时终端连接中...');
+      return;
+    }
+    const attempt = Number(value);
+    setSelectedAttempt(Number.isFinite(attempt) ? attempt : null);
+    setContent('正在加载日志...');
+  };
+
+  const handleDeleteLog = async () => {
+    if (selectedAttempt === null || !selectedLog) return;
+    const confirmed = window.confirm(
+      `确认删除任务 #${task.id} 第 ${selectedAttempt} 次运行日志吗？\n\n只会删除这个日志文件，任务记录会保留。`
+    );
+    if (!confirmed) return;
+
+    setIsDeleting(true);
+    try {
+      await api(`/api/tasks/${task.id}/logs/${selectedAttempt}`, { method: 'DELETE' });
+      const nextLogs = logs.filter(log => log.attempt !== selectedAttempt);
+      const nextSelectableLogs = nextLogs.filter(log => !(canUseLive && log.is_current));
+      const nextAttempt = nextSelectableLogs.length
+        ? nextSelectableLogs[nextSelectableLogs.length - 1].attempt
+        : null;
+      setLogs(nextLogs);
+      setSelectedAttempt(nextAttempt);
+      setContent(nextAttempt === null && canUseLive ? '实时终端连接中...' : '该任务暂无可用日志。');
+      hasLoadedRef.current = false;
+      onMessage?.(`任务 #${task.id} 第 ${selectedAttempt} 次运行日志已删除。`);
+    } catch (error) {
+      const text = error instanceof Error ? error.message : '删除日志失败';
+      setContent(`删除日志失败: ${text}`);
+      onMessage?.(text);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const selectValue = isLiveSelected ? 'live' : (selectedAttempt !== null ? String(selectedAttempt) : '');
+  const hasSelectableOptions = canUseLive || selectableLogs.length > 0;
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-slate-800/80 pb-2">
+        <select
+          value={selectValue}
+          disabled={!hasSelectableOptions}
+          onChange={(event) => handleSelectAttempt(event.target.value)}
+          className="max-w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 text-[10px] font-bold text-slate-300 outline-none transition-colors hover:border-slate-500"
+        >
+          {canUseLive && <option value="live">实时终端</option>}
+          {!hasSelectableOptions && <option value="">无日志</option>}
+          {selectableLogs.map(log => (
+            <option key={log.attempt} value={log.attempt}>
+              第 {log.attempt} 次 | {formatBytes(log.size_bytes)}
+            </option>
+          ))}
+        </select>
+        {selectedLog?.modified_at && (
+          <span className="text-[10px] font-mono text-slate-500">{formatTime(selectedLog.modified_at)}</span>
+        )}
+        <button
+          type="button"
+          title={selectedAttempt === null ? '实时终端不能删除' : '删除当前日志'}
+          disabled={selectedAttempt === null || !selectedLog || isDeleting}
+          onClick={handleDeleteLog}
+          className={`ml-auto rounded p-1.5 transition-colors ${
+            selectedAttempt === null || !selectedLog || isDeleting
+              ? 'cursor-not-allowed text-slate-700'
+              : 'text-slate-500 hover:bg-rose-500/10 hover:text-rose-400'
+          }`}
+        >
+          {isDeleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+        </button>
+      </div>
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        {isLiveSelected ? (
+          <LiveTerminal taskId={task.id} taskName={task.name} isFullScreen={isFullScreen} />
+        ) : (
+          <>
+            {isLoading && (
+              <div className="absolute inset-0 z-10 flex items-center justify-center rounded bg-slate-900/80 backdrop-blur-sm">
+                <div className="flex items-center gap-3">
+                  <Loader2 className="h-5 w-5 animate-spin text-blue-500" />
+                  <span className="text-sm font-bold tracking-tight text-slate-300">正在加载日志...</span>
+                </div>
+              </div>
+            )}
+            <TerminalLog taskName={task.name} content={content || '(日志为空)'} isFullScreen={isFullScreen} />
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 

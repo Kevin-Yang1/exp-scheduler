@@ -64,6 +64,7 @@ def make_config(
     gpu_idle_required_checks: int = 1,
     auto_retry_max_retries: int = 0,
     auto_retry_delay_seconds: int = 5,
+    external_kill_gpu_cooldown_seconds: float = 0,
 ) -> SchedulerConfig:
     state_dir = tmp_path / "state"
     return SchedulerConfig(
@@ -74,6 +75,7 @@ def make_config(
         gpu_idle_required_checks=gpu_idle_required_checks,
         auto_retry_max_retries=auto_retry_max_retries,
         auto_retry_delay_seconds=auto_retry_delay_seconds,
+        external_kill_gpu_cooldown_seconds=external_kill_gpu_cooldown_seconds,
         state_dir=state_dir,
         log_dir=state_dir / "logs",
     )
@@ -87,6 +89,7 @@ def build_client(
     gpu_idle_required_checks: int = 1,
     auto_retry_max_retries: int = 0,
     auto_retry_delay_seconds: int = 5,
+    external_kill_gpu_cooldown_seconds: float = 0,
 ) -> TestClient:
     app = create_app(
         make_config(
@@ -95,6 +98,7 @@ def build_client(
             gpu_idle_required_checks=gpu_idle_required_checks,
             auto_retry_max_retries=auto_retry_max_retries,
             auto_retry_delay_seconds=auto_retry_delay_seconds,
+            external_kill_gpu_cooldown_seconds=external_kill_gpu_cooldown_seconds,
         ),
         gpu_provider=provider,
     )
@@ -1121,6 +1125,23 @@ def test_retryable_oom_failure_is_automatically_retried(tmp_path):
         log_payload = client.get(f"/api/tasks/{task_id}/log").json()
         assert "attempt=2" in log_payload["content"]
         assert "recovered" in log_payload["content"]
+        logs_payload = client.get(f"/api/tasks/{task_id}/logs").json()
+        logs = logs_payload["logs"]
+        assert [log["attempt"] for log in logs] == [1, 2]
+        assert logs[1]["is_current"] is True
+
+        first_attempt = client.get(f"/api/tasks/{task_id}/log?attempt=1")
+        first_attempt.raise_for_status()
+        assert "attempt=1" in first_attempt.json()["content"]
+        assert "CUDA out of memory" in first_attempt.json()["content"]
+
+        first_log_path = Path(logs[0]["path"])
+        delete_log = client.delete(f"/api/tasks/{task_id}/logs/1")
+        delete_log.raise_for_status()
+        assert not first_log_path.exists()
+        remaining_logs = client.get(f"/api/tasks/{task_id}/logs").json()["logs"]
+        assert [log["attempt"] for log in remaining_logs] == [2]
+        assert client.get(f"/api/tasks/{task_id}/log?attempt=1").status_code == 404
         assert client.app.state.scheduler._terminal_sessions == {}
 
 
@@ -1304,6 +1325,88 @@ def test_scheduler_shutdown_requeues_running_task_to_queue_head(tmp_path):
     assert first["assigned_gpu"] is None
     assert first["attempt_count"] == 1
     assert int(first["queue_rank"]) < int(second["queue_rank"])
+
+
+def test_external_signal_kill_cools_gpu_before_relaunch(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    order_file = tmp_path / "cooldown-order.log"
+    with build_client(
+        tmp_path,
+        provider,
+        poll_interval_seconds=0.05,
+        external_kill_gpu_cooldown_seconds=0.6,
+    ) as client:
+        task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "import os, time",
+                        "from pathlib import Path",
+                        "attempt = int(os.environ['EXP_SCHEDULER_ATTEMPT'])",
+                        f"path = Path({str(order_file)!r})",
+                        "with path.open('a', encoding='utf-8') as fh:",
+                        "    fh.write(f'attempt-{attempt}-start\\n')",
+                        "if attempt == 1:",
+                        "    time.sleep(30)",
+                        "print('recovered')",
+                    ]
+                )
+            ),
+        )
+
+        running_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == task_id
+            ),
+            timeout=3,
+        )
+        wait_for(
+            lambda: (
+                order_file.exists()
+                and "attempt-1-start" in order_file.read_text(encoding="utf-8")
+            ),
+            timeout=3,
+        )
+
+        os.killpg(int(running_task["pid"]), signal.SIGTERM)
+
+        requeued_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["queued"]
+                if task["id"] == task_id and task["exit_code"] in {-15, 143}
+            ),
+            timeout=3,
+        )
+        assert requeued_task["attempt_count"] == 1
+
+        gpu_payload = client.get("/api/gpus").json()["gpus"][0]
+        assert gpu_payload["cooldown_reason"] == "external_signal"
+        assert gpu_payload["cooldown_remaining_seconds"] > 0
+        assert gpu_payload["is_idle"] is False
+
+        time.sleep(0.2)
+        during_cooldown = client.get("/api/tasks").json()
+        assert not during_cooldown["running"]
+        assert any(task["id"] == task_id for task in during_cooldown["queued"])
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=5,
+        )
+        assert history_task["attempt_count"] == 2
+
+    assert order_file.read_text(encoding="utf-8").splitlines() == [
+        "attempt-1-start",
+        "attempt-2-start",
+    ]
 
 
 def test_external_signal_kill_requeues_running_task_to_head_and_retries(tmp_path):

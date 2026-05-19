@@ -691,6 +691,7 @@ class Database:
         auto_restore_idle_gpu_seconds: float | None,
         auto_retry_max_retries: int,
         auto_retry_delay_seconds: int,
+        external_kill_gpu_cooldown_seconds: float,
     ) -> dict[str, object]:
         settings: dict[str, object] = {
             "poll_interval_seconds": poll_interval_seconds,
@@ -698,6 +699,7 @@ class Database:
             "auto_restore_idle_gpu_seconds": auto_restore_idle_gpu_seconds,
             "auto_retry_max_retries": auto_retry_max_retries,
             "auto_retry_delay_seconds": auto_retry_delay_seconds,
+            "external_kill_gpu_cooldown_seconds": external_kill_gpu_cooldown_seconds,
         }
         with self._lock, self._connect() as conn:
             conn.execute(
