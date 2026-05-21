@@ -54,8 +54,8 @@ RETRYABLE_OOM_PATTERN = re.compile(
     r"out of memory|cuda out of memory|cublas.*alloc|cuda error: out of memory|"
     r"failed to allocate|cuda runtime error|memory allocation|std::bad_alloc|"
     r"nccl.*unhandled system error|device-side assert triggered|resource exhausted|"
-    r"cuda error.*launch out of resources|killed|terminated|oom-kill|"
-    r"out of memory: kill process",
+    r"cuda error.*launch out of resources|cuda-capable device.*busy or unavailable|"
+    r"cudaerrordevicesunavailable|killed|terminated|oom-kill|out of memory: kill process",
     re.IGNORECASE,
 )
 

@@ -1145,6 +1145,52 @@ def test_retryable_oom_failure_is_automatically_retried(tmp_path):
         assert client.app.state.scheduler._terminal_sessions == {}
 
 
+def test_cuda_devices_unavailable_failure_is_automatically_retried(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(
+        tmp_path,
+        provider,
+        auto_retry_max_retries=1,
+        auto_retry_delay_seconds=0,
+    ) as client:
+        task_id = create_task(
+            client,
+            command(
+                "\n".join(
+                    [
+                        "import os",
+                        "attempt = int(os.environ['EXP_SCHEDULER_ATTEMPT'])",
+                        "print(f'attempt={attempt}')",
+                        "if attempt == 1:",
+                        "    print('torch.AcceleratorError: CUDA error: CUDA-capable device(s) is/are busy or unavailable')",
+                        "    print(\"Search for `cudaErrorDevicesUnavailable' in the CUDA Runtime API docs\")",
+                        "    raise SystemExit(1)",
+                        "print('recovered')",
+                    ]
+                )
+            ),
+            name="cuda-devices-unavailable",
+        )
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+        assert history_task["attempt_count"] == 2
+        log_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        assert "attempt=2" in log_payload["content"]
+        assert "recovered" in log_payload["content"]
+
+        first_attempt = client.get(f"/api/tasks/{task_id}/log?attempt=1")
+        first_attempt.raise_for_status()
+        assert "CUDA-capable device(s) is/are busy or unavailable" in first_attempt.json()["content"]
+        assert "cudaErrorDevicesUnavailable" in first_attempt.json()["content"]
+
+
 def test_non_retryable_failure_stops_without_retry(tmp_path):
     provider = FakeGPUProvider([gpu(0, idle=True)])
     with build_client(
