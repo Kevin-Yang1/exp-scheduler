@@ -1122,12 +1122,19 @@ def test_retryable_oom_failure_is_automatically_retried(tmp_path):
         )
         assert history_task["attempt_count"] == 2
         assert history_task["log_path"].endswith("attempt_2.log")
+        assert [log["attempt"] for log in history_task["attempt_logs"]] == [1, 2]
         log_payload = client.get(f"/api/tasks/{task_id}/log").json()
         assert "attempt=2" in log_payload["content"]
         assert "recovered" in log_payload["content"]
         logs_payload = client.get(f"/api/tasks/{task_id}/logs").json()
         logs = logs_payload["logs"]
         assert [log["attempt"] for log in logs] == [1, 2]
+        assert logs[0]["status"] == "retry_scheduled"
+        assert logs[0]["started_at"]
+        assert logs[0]["finished_at"]
+        assert logs[1]["status"] == "succeeded"
+        assert logs[1]["started_at"]
+        assert logs[1]["finished_at"]
         assert logs[1]["is_current"] is True
 
         first_attempt = client.get(f"/api/tasks/{task_id}/log?attempt=1")

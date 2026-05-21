@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 from pathlib import Path
 import socket
+import subprocess
 import tomllib
 
 
@@ -23,22 +25,76 @@ def _detect_server_name() -> str:
     return socket.gethostname() or "unknown-host"
 
 
+def _is_displayable_server_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return (
+        ip.version == 4
+        and not ip.is_loopback
+        and not ip.is_unspecified
+        and not ip.is_link_local
+        and not ip.is_multicast
+    )
+
+
+def _is_loopback_or_unspecified_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_unspecified
+
+
+def _iter_hostname_ips() -> list[str]:
+    try:
+        host = socket.gethostname()
+        infos = socket.getaddrinfo(host, None, family=socket.AF_INET)
+    except OSError:
+        return []
+    return [info[4][0] for info in infos if info[4]]
+
+
+def _iter_command_ips() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["hostname", "-I"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return result.stdout.split()
+
+
 def _detect_server_ip() -> str:
+    candidates: list[str] = []
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("192.0.2.1", 80))
             ip = sock.getsockname()[0]
             if ip:
-                return ip
+                candidates.append(ip)
     except OSError:
         pass
-    try:
-        ip = socket.gethostbyname(socket.gethostname())
-        if ip:
+    candidates.extend(_iter_command_ips())
+    candidates.extend(_iter_hostname_ips())
+    for ip in candidates:
+        if _is_displayable_server_ip(ip):
             return ip
-    except OSError:
-        pass
     return "127.0.0.1"
+
+
+def _resolve_server_ip(value: object) -> str:
+    configured = str(value).strip()
+    if not configured or _is_loopback_or_unspecified_ip(configured):
+        detected = _detect_server_ip()
+        if _is_displayable_server_ip(detected):
+            return detected
+    return configured or DEFAULT_SERVER_IP
 
 
 DEFAULT_SERVER_NAME = _detect_server_name()
@@ -103,7 +159,7 @@ def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
         host=str(data.get("host", DEFAULT_HOST)),
         port=int(data.get("port", DEFAULT_PORT)),
         server_name=str(data.get("server_name", DEFAULT_SERVER_NAME)),
-        server_ip=str(data.get("server_ip", DEFAULT_SERVER_IP)),
+        server_ip=_resolve_server_ip(data.get("server_ip", DEFAULT_SERVER_IP)),
         poll_interval_seconds=float(
             data.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS)
         ),

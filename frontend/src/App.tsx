@@ -80,6 +80,7 @@ interface Task {
   dependsOn?: number[];
   dependencyCount?: number;
   hasDependencies?: boolean;
+  attemptLogs?: TaskLogEntry[];
   raw?: BackendTask;
 }
 
@@ -108,6 +109,7 @@ interface BackendTask {
   depends_on?: number[];
   dependency_count?: number;
   has_dependencies?: boolean;
+  attempt_logs?: TaskLogEntry[];
 }
 
 interface TaskLogEntry {
@@ -115,6 +117,10 @@ interface TaskLogEntry {
   path: string;
   size_bytes: number;
   modified_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  status?: Task['status'] | 'retry_scheduled' | 'preempted' | 'interrupted_requeued' | null;
+  exit_code?: number | null;
   is_current?: boolean;
 }
 
@@ -178,6 +184,8 @@ interface ActivityLogEntry {
   detail?: string | null;
   metadata?: Record<string, unknown>;
 }
+
+type HistorySortKey = 'finished_at' | 'started_at';
 
 interface DiscoveryItem {
   display_name: string;
@@ -327,6 +335,7 @@ function mapTask(task: BackendTask): Task {
     dependsOn: task.depends_on || [],
     dependencyCount: task.dependency_count ?? (task.depends_on?.length || 0),
     hasDependencies: task.has_dependencies ?? ((task.depends_on?.length || 0) > 0),
+    attemptLogs: task.attempt_logs || [],
     raw: task,
   };
 }
@@ -364,6 +373,7 @@ export default function App() {
   const [activityEntityFilter, setActivityEntityFilter] = useState('all');
   const [activitySearch, setActivitySearch] = useState('');
   const [expandedActivityLogId, setExpandedActivityLogId] = useState<number | null>(null);
+  const [historySort, setHistorySort] = useState<HistorySortKey>('finished_at');
   const [isConsoleFullScreen, setIsConsoleFullScreen] = useState(false);
   const [isNvitopFullScreen, setIsNvitopFullScreen] = useState(false);
   const [gpus, setGpus] = useState<GPUStatus[]>([]);
@@ -419,6 +429,11 @@ export default function App() {
   const hasWaitingUrgentTask = urgentQueueTasks.some(task => task.status === 'pending');
   const failedCount = historyTasks.filter(t => t.status === 'failed' || t.status === 'interrupted').length;
   const failureRate = historyTasks.length ? `${((failedCount / historyTasks.length) * 100).toFixed(1)}%` : '0%';
+  const filteredHistoryTasks = useMemo(() => historyTasks.filter(t => {
+    if (statusFilter === 'all') return true;
+    if (statusFilter === 'marked') return markedTaskIds.has(t.id);
+    return t.status === statusFilter;
+  }), [historyTasks, markedTaskIds, statusFilter]);
   const canUseBatchDelete = activeTab === 'queue' || activeTab === 'history';
   const dependencyCandidates = useMemo<DependencyCandidate[]>(() => {
     const currentTaskId = taskDraft?.id;
@@ -470,8 +485,9 @@ export default function App() {
   }, [activeTab]);
 
   const refreshAll = useCallback(async () => {
+    const taskParams = new URLSearchParams({ history_sort: historySort });
     const [taskPayload, gpuPayload, settingsPayload, profilePayload, serverPayload, schedulerSettingsPayload] = await Promise.all([
-      api<{ queued: BackendTask[]; urgent_queued: BackendTask[]; running: BackendTask[]; history: BackendTask[]; queue_paused: boolean }>('/api/tasks'),
+      api<{ queued: BackendTask[]; urgent_queued: BackendTask[]; running: BackendTask[]; history: BackendTask[]; queue_paused: boolean }>(`/api/tasks?${taskParams.toString()}`),
       api<{ gpus: BackendGPU[] }>('/api/gpus'),
       api<{ allowed_gpu_ids: number[] | null; gpu_schedule?: Record<string, GpuScheduleEntry> }>('/api/settings'),
       api<{ profiles: Profile[] }>('/api/profiles'),
@@ -508,7 +524,7 @@ export default function App() {
       followRunningTaskRef.current = true;
       return runningTask?.id || null;
     });
-  }, []);
+  }, [historySort]);
 
   const loadActivityLogs = useCallback(async () => {
     const params = new URLSearchParams({ limit: '300' });
@@ -1355,35 +1371,48 @@ export default function App() {
                     <span className="font-bold text-slate-800 text-base">系统审计日志</span>
                   </div>
 
-                  <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200">
-                    {['all', 'marked', 'succeeded', 'failed', 'interrupted', 'cancelled'].map((filter) => (
-                      <button
-                        key={filter}
-                        onClick={() => setStatusFilter(filter)}
-                        className={`px-3 py-1 text-[10px] font-bold uppercase tracking-tighter rounded-md transition-all ${
-                          statusFilter === filter
-                          ? 'bg-white text-blue-600 shadow-sm'
-                          : 'text-slate-400 hover:text-slate-600'
-                        }`}
-                      >
-                        {filter === 'all' && '全部'}
-                        {filter === 'marked' && '已标记'}
-                        {filter === 'succeeded' && '成功'}
-                        {filter === 'failed' && '失败'}
-                        {filter === 'interrupted' && '中断'}
-                        {filter === 'cancelled' && '取消'}
-                      </button>
-                    ))}
+                  <div className="flex items-center gap-2 flex-wrap justify-end">
+                    <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200">
+                      {(['finished_at', 'started_at'] as HistorySortKey[]).map((sortKey) => (
+                        <button
+                          key={sortKey}
+                          onClick={() => setHistorySort(sortKey)}
+                          className={`px-3 py-1 text-[10px] font-bold uppercase tracking-tighter rounded-md transition-all ${
+                            historySort === sortKey
+                              ? 'bg-white text-blue-600 shadow-sm'
+                              : 'text-slate-400 hover:text-slate-600'
+                          }`}
+                          title={sortKey === 'finished_at' ? '按完成时间排序' : '按开始时间排序'}
+                        >
+                          {sortKey === 'finished_at' ? '完成时间' : '开始时间'}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg border border-slate-200">
+                      {['all', 'marked', 'succeeded', 'failed', 'interrupted', 'cancelled'].map((filter) => (
+                        <button
+                          key={filter}
+                          onClick={() => setStatusFilter(filter)}
+                          className={`px-3 py-1 text-[10px] font-bold uppercase tracking-tighter rounded-md transition-all ${
+                            statusFilter === filter
+                            ? 'bg-white text-blue-600 shadow-sm'
+                            : 'text-slate-400 hover:text-slate-600'
+                          }`}
+                        >
+                          {filter === 'all' && '全部'}
+                          {filter === 'marked' && '已标记'}
+                          {filter === 'succeeded' && '成功'}
+                          {filter === 'failed' && '失败'}
+                          {filter === 'interrupted' && '中断'}
+                          {filter === 'cancelled' && '取消'}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
                 <div className="p-4 space-y-4 bg-slate-50/50">
-                  {historyTasks
-                    .filter(t => {
-                      if (statusFilter === 'all') return true;
-                      if (statusFilter === 'marked') return markedTaskIds.has(t.id);
-                      return t.status === statusFilter;
-                    })
-                    .map(task => (
+                  {filteredHistoryTasks.map(task => (
                     <HistoryRowInner
                       key={task.id}
                       task={task}
@@ -1399,13 +1428,7 @@ export default function App() {
                       onToggleSelectForDelete={() => toggleTaskForBatchDelete(task)}
                     />
                   ))}
-                  {historyTasks
-                    .filter(t => {
-                      if (statusFilter === 'all') return true;
-                      if (statusFilter === 'marked') return markedTaskIds.has(t.id);
-                      return t.status === statusFilter;
-                    })
-                    .length === 0 && (
+                  {filteredHistoryTasks.length === 0 && (
                     <div className="p-12 text-center text-slate-400 space-y-2">
                        <History className="w-8 h-8 mx-auto opacity-20" />
                        <p className="text-sm">暂无符合条件的审计记录</p>
@@ -2112,7 +2135,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-3xl bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+              className="relative w-full max-w-4xl bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col"
             >
               <div className="px-8 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
                 <div>
@@ -2202,41 +2225,47 @@ export default function App() {
 	                </div>
 
 	                {/* Dependencies */}
-	                {!isMetadataOnlyTaskEdit && dependencyCandidates.length > 0 && (
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">依赖任务 (Dependencies)</label>
-                    <p className="text-[11px] text-slate-400">选择前置任务，全部成功完成后才会调度当前任务</p>
-                    <select
-                      name="depends_on"
-                      multiple
-                      size={Math.min(4, dependencyCandidates.length)}
-                      defaultValue={taskDraft?.dependsOn?.map(String) || []}
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors"
-                    >
-                      {dependencyCandidates
-                        .map(candidate => (
-                          <option key={candidate.id} value={candidate.id}>
-                            #{candidate.id} {candidate.name} ({candidate.isMissingDependency ? '当前列表外' : taskStatusLabel(candidate.status)})
-                          </option>
-                        ))}
-                    </select>
-                    <p className="text-[10px] text-slate-400">按住 Ctrl/Cmd 多选，不选则无依赖</p>
-                  </div>
-                )}
+		                {!isMetadataOnlyTaskEdit && (
+		                  <div className="space-y-1.5">
+		                    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+		                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">依赖任务 (Dependencies)</label>
+		                      <span className="text-[10px] text-slate-400">选择前置任务，全部成功完成后才会调度当前任务</span>
+		                      <span className="text-[10px] text-slate-400">按住 Ctrl/Cmd 多选，不选则无依赖</span>
+		                    </div>
+		                    <select
+		                      name="depends_on"
+		                      multiple
+		                      size={Math.min(4, Math.max(2, dependencyCandidates.length))}
+		                      disabled={dependencyCandidates.length === 0}
+		                      defaultValue={taskDraft?.dependsOn?.map(String) || []}
+		                      className={`w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 transition-colors ${dependencyCandidates.length === 0 ? 'text-slate-400 cursor-not-allowed' : 'text-slate-700'}`}
+		                    >
+		                      {dependencyCandidates.length === 0 ? (
+		                        <option value="">暂无可选依赖任务</option>
+		                      ) : (
+		                        dependencyCandidates.map(candidate => (
+		                          <option key={candidate.id} value={candidate.id}>
+		                            #{candidate.id} {candidate.name} ({candidate.isMissingDependency ? '当前列表外' : taskStatusLabel(candidate.status)})
+		                          </option>
+		                        ))
+		                      )}
+		                    </select>
+		                  </div>
+		                )}
 
 	                {!isMetadataOnlyTaskEdit && (
 	                  <>
 	                    {/* Command */}
 	                    <div className="space-y-1.5">
 	                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">启动命令</label>
-	                        <textarea
-	                          rows={2}
-	                            name="command"
-	                            defaultValue={taskDraft?.command || ''}
-	                          placeholder="python main.py --model llama --dataset sft..."
-	                            required
-	                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors resize-none"
-	                        />
+		                        <textarea
+		                          rows={4}
+		                          name="command"
+		                          defaultValue={taskDraft?.command || ''}
+		                          placeholder="python main.py --model llama --dataset sft..."
+		                          required
+		                          className="w-full min-h-[96px] bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors resize-none"
+		                        />
 	                    </div>
 
 	                    <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
@@ -2594,9 +2623,53 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
 	  const canEdit = Boolean(onEdit);
 	  const editTitle = task.status === 'pending' ? '编辑任务' : '编辑记录信息';
   const canBatchDelete = task.status !== 'running';
+  const attemptOptions = useMemo(() => task.attemptLogs || [], [task.attemptLogs]);
+  const latestAttempt = attemptOptions.length > 0
+    ? attemptOptions[attemptOptions.length - 1].attempt
+    : (task.attempts || 1);
 
   const [isLogExpanded, setIsLogExpanded] = useState(false);
   const [isLogFullScreen, setIsLogFullScreen] = useState(false);
+  const [selectedAttempt, setSelectedAttempt] = useState<number | null>(latestAttempt);
+  const effectiveSelectedAttempt = selectedAttempt ?? latestAttempt;
+  const selectedAttemptLog = attemptOptions.find(log => log.attempt === effectiveSelectedAttempt) || null;
+  const selectedStartedAt = formatTime(selectedAttemptLog?.started_at) || (
+    effectiveSelectedAttempt === latestAttempt ? task.startedAt : undefined
+  );
+  const selectedFinishedAt = formatTime(selectedAttemptLog?.finished_at) || (
+    effectiveSelectedAttempt === latestAttempt ? task.endedAt : undefined
+  );
+  const controlledLogAttempt = !isQueueView && attemptOptions.length > 0
+    ? effectiveSelectedAttempt
+    : undefined;
+
+  useEffect(() => {
+    if (attemptOptions.length === 0) return;
+    setSelectedAttempt(prev => {
+      if (prev !== null && attemptOptions.some(log => log.attempt === prev)) {
+        return prev;
+      }
+      return latestAttempt;
+    });
+  }, [attemptOptions, latestAttempt]);
+
+  const handleSelectAttempt = (attempt: number | null) => {
+    setSelectedAttempt(attempt);
+  };
+
+  const getAttemptStatusLabel = (status?: TaskLogEntry['status']) => {
+    switch (status) {
+      case 'succeeded': return '成功';
+      case 'failed': return '失败';
+      case 'cancelled': return '取消';
+      case 'interrupted': return '中断';
+      case 'retry_scheduled': return '已重试';
+      case 'preempted': return '已抢占';
+      case 'interrupted_requeued': return '已回队';
+      case 'running': return '运行中';
+      default: return '';
+    }
+  };
 
   const handleToggleLog = () => {
     if (!isLogExpanded) {
@@ -2757,14 +2830,37 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
 	          </div>
 
 	          {!isQueueView && (
-             <div className="flex items-center gap-5 text-[9px] font-medium shrink-0">
+             <div className="flex items-center gap-4 text-[9px] font-medium shrink-0">
+               {attemptOptions.length > 1 && (
+                 <select
+                   value={String(effectiveSelectedAttempt)}
+                   onClick={(e) => e.stopPropagation()}
+                   onDoubleClick={(e) => e.stopPropagation()}
+                   onChange={(e) => {
+                     e.stopPropagation();
+                     const attempt = Number(e.target.value);
+                     handleSelectAttempt(Number.isFinite(attempt) ? attempt : latestAttempt);
+                   }}
+                   className="max-w-[120px] rounded border border-slate-200 bg-white px-2 py-1 text-[9px] font-bold text-slate-500 outline-none transition-colors hover:border-blue-200 hover:text-blue-600"
+                   title="选择要查看的尝试记录"
+                 >
+                   {attemptOptions.map(log => {
+                     const statusLabel = getAttemptStatusLabel(log.status);
+                     return (
+                       <option key={log.attempt} value={log.attempt}>
+                         第 {log.attempt} 次{statusLabel ? ` · ${statusLabel}` : ''}
+                       </option>
+                     );
+                   })}
+                 </select>
+               )}
                <div className="flex items-center gap-2 text-slate-400">
                  <span className="uppercase tracking-widest text-[8px] font-bold text-slate-300">开始</span>
-                 <span className="text-slate-500 tabular-nums font-mono">{task.startedAt}</span>
+                 <span className="text-slate-500 tabular-nums font-mono">{selectedStartedAt || '-'}</span>
                </div>
                <div className="flex items-center gap-2 text-slate-400">
                  <span className="uppercase tracking-widest text-[8px] font-bold text-slate-300">结束</span>
-                 <span className="text-slate-500 tabular-nums font-mono">{task.endedAt}</span>
+                 <span className="text-slate-500 tabular-nums font-mono">{selectedFinishedAt || '-'}</span>
                </div>
              </div>
           )}
@@ -2787,7 +2883,11 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
                </button>
              </div>
              <div className="p-3 bg-slate-900 rounded-b-lg font-mono text-[11px] text-slate-300 w-full overflow-hidden relative" style={{ height: "600px" }}>
-               <TaskLogViewer task={task} />
+               <TaskLogViewer
+                 task={task}
+                 selectedAttempt={controlledLogAttempt}
+                 onSelectedAttemptChange={handleSelectAttempt}
+               />
              </div>
           </div>
         )}
@@ -2811,7 +2911,12 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
              </button>
           </div>
           <div className="flex-1 overflow-hidden p-6 font-mono text-[13px] relative bg-slate-900">
-             <TaskLogViewer task={task} isFullScreen />
+             <TaskLogViewer
+               task={task}
+               isFullScreen
+               selectedAttempt={controlledLogAttempt}
+               onSelectedAttemptChange={handleSelectAttempt}
+             />
           </div>
         </div>
       )}
@@ -2918,15 +3023,21 @@ function TaskLogViewer({
   allowLive = false,
   isFullScreen = false,
   onMessage,
+  selectedAttempt,
+  onSelectedAttemptChange,
 }: {
   task: Task;
   allowLive?: boolean;
   isFullScreen?: boolean;
   onMessage?: (message: string) => void;
+  selectedAttempt?: number | null;
+  onSelectedAttemptChange?: (attempt: number | null) => void;
 }) {
   const canUseLive = allowLive && task.status === 'running';
   const [logs, setLogs] = useState<TaskLogEntry[]>([]);
-  const [selectedAttempt, setSelectedAttempt] = useState<number | null>(null);
+  const isAttemptControlled = selectedAttempt !== undefined;
+  const [internalSelectedAttempt, setInternalSelectedAttempt] = useState<number | null>(null);
+  const currentSelectedAttempt = isAttemptControlled ? selectedAttempt : internalSelectedAttempt;
   const [content, setContent] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -2936,15 +3047,24 @@ function TaskLogViewer({
     () => logs.filter(log => !(canUseLive && log.is_current)),
     [canUseLive, logs],
   );
-  const isLiveSelected = canUseLive && selectedAttempt === null;
-  const selectedLog = selectableLogs.find(log => log.attempt === selectedAttempt) || null;
+  const isLiveSelected = canUseLive && currentSelectedAttempt === null;
+  const selectedLog = selectableLogs.find(log => log.attempt === currentSelectedAttempt) || null;
+
+  const updateSelectedAttempt = useCallback((attempt: number | null) => {
+    if (!isAttemptControlled) {
+      setInternalSelectedAttempt(attempt);
+    }
+    onSelectedAttemptChange?.(attempt);
+  }, [isAttemptControlled, onSelectedAttemptChange]);
 
   useEffect(() => {
     setLogs([]);
-    setSelectedAttempt(null);
+    if (!isAttemptControlled) {
+      setInternalSelectedAttempt(null);
+    }
     setContent(canUseLive ? '实时终端连接中...' : '正在加载日志...');
     hasLoadedRef.current = false;
-  }, [task.id, task.status, canUseLive]);
+  }, [task.id, task.status, canUseLive, isAttemptControlled]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2963,13 +3083,13 @@ function TaskLogViewer({
           return;
         }
 
-        const suffix = selectedAttempt !== null ? `?attempt=${selectedAttempt}` : '';
+        const suffix = currentSelectedAttempt !== null ? `?attempt=${currentSelectedAttempt}` : '';
         const payload = await api<TaskLogPayload>(`/api/tasks/${task.id}/log${suffix}`);
         if (cancelled) return;
         const nextLogs = payload.logs || [];
         setLogs(nextLogs);
-        if (selectedAttempt === null && payload.selected_attempt !== null && payload.selected_attempt !== undefined) {
-          setSelectedAttempt(payload.selected_attempt);
+        if (currentSelectedAttempt === null && payload.selected_attempt !== null && payload.selected_attempt !== undefined) {
+          updateSelectedAttempt(payload.selected_attempt);
         }
         setContent(payload.content || '(日志为空)');
         hasLoadedRef.current = true;
@@ -2991,40 +3111,40 @@ function TaskLogViewer({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [task.id, selectedAttempt, isLiveSelected]);
+  }, [task.id, currentSelectedAttempt, isLiveSelected, updateSelectedAttempt]);
 
   const handleSelectAttempt = (value: string) => {
     hasLoadedRef.current = false;
     if (value === 'live') {
-      setSelectedAttempt(null);
+      updateSelectedAttempt(null);
       setContent('实时终端连接中...');
       return;
     }
     const attempt = Number(value);
-    setSelectedAttempt(Number.isFinite(attempt) ? attempt : null);
+    updateSelectedAttempt(Number.isFinite(attempt) ? attempt : null);
     setContent('正在加载日志...');
   };
 
   const handleDeleteLog = async () => {
-    if (selectedAttempt === null || !selectedLog) return;
+    if (currentSelectedAttempt === null || !selectedLog) return;
     const confirmed = window.confirm(
-      `确认删除任务 #${task.id} 第 ${selectedAttempt} 次运行日志吗？\n\n只会删除这个日志文件，任务记录会保留。`
+      `确认删除任务 #${task.id} 第 ${currentSelectedAttempt} 次运行日志吗？\n\n只会删除这个日志文件，任务记录会保留。`
     );
     if (!confirmed) return;
 
     setIsDeleting(true);
     try {
-      await api(`/api/tasks/${task.id}/logs/${selectedAttempt}`, { method: 'DELETE' });
-      const nextLogs = logs.filter(log => log.attempt !== selectedAttempt);
+      await api(`/api/tasks/${task.id}/logs/${currentSelectedAttempt}`, { method: 'DELETE' });
+      const nextLogs = logs.filter(log => log.attempt !== currentSelectedAttempt);
       const nextSelectableLogs = nextLogs.filter(log => !(canUseLive && log.is_current));
       const nextAttempt = nextSelectableLogs.length
         ? nextSelectableLogs[nextSelectableLogs.length - 1].attempt
         : null;
       setLogs(nextLogs);
-      setSelectedAttempt(nextAttempt);
+      updateSelectedAttempt(nextAttempt);
       setContent(nextAttempt === null && canUseLive ? '实时终端连接中...' : '该任务暂无可用日志。');
       hasLoadedRef.current = false;
-      onMessage?.(`任务 #${task.id} 第 ${selectedAttempt} 次运行日志已删除。`);
+      onMessage?.(`任务 #${task.id} 第 ${currentSelectedAttempt} 次运行日志已删除。`);
     } catch (error) {
       const text = error instanceof Error ? error.message : '删除日志失败';
       setContent(`删除日志失败: ${text}`);
@@ -3034,8 +3154,9 @@ function TaskLogViewer({
     }
   };
 
-  const selectValue = isLiveSelected ? 'live' : (selectedAttempt !== null ? String(selectedAttempt) : '');
-  const hasSelectableOptions = canUseLive || selectableLogs.length > 0;
+  const selectValue = isLiveSelected ? 'live' : (currentSelectedAttempt !== null ? String(currentSelectedAttempt) : '');
+  const hasSelectableOptions = canUseLive || selectableLogs.length > 0 || currentSelectedAttempt !== null;
+  const selectedLogTime = formatTime(selectedLog?.finished_at || selectedLog?.modified_at);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -3048,22 +3169,25 @@ function TaskLogViewer({
         >
           {canUseLive && <option value="live">实时终端</option>}
           {!hasSelectableOptions && <option value="">无日志</option>}
+          {!canUseLive && selectableLogs.length === 0 && currentSelectedAttempt !== null && (
+            <option value={currentSelectedAttempt}>第 {currentSelectedAttempt} 次</option>
+          )}
           {selectableLogs.map(log => (
             <option key={log.attempt} value={log.attempt}>
               第 {log.attempt} 次 | {formatBytes(log.size_bytes)}
             </option>
           ))}
         </select>
-        {selectedLog?.modified_at && (
-          <span className="text-[10px] font-mono text-slate-500">{formatTime(selectedLog.modified_at)}</span>
+        {selectedLogTime && (
+          <span className="text-[10px] font-mono text-slate-500">{selectedLogTime}</span>
         )}
         <button
           type="button"
-          title={selectedAttempt === null ? '实时终端不能删除' : '删除当前日志'}
-          disabled={selectedAttempt === null || !selectedLog || isDeleting}
+          title={currentSelectedAttempt === null ? '实时终端不能删除' : '删除当前日志'}
+          disabled={currentSelectedAttempt === null || !selectedLog || isDeleting}
           onClick={handleDeleteLog}
           className={`ml-auto rounded p-1.5 transition-colors ${
-            selectedAttempt === null || !selectedLog || isDeleting
+            currentSelectedAttempt === null || !selectedLog || isDeleting
               ? 'cursor-not-allowed text-slate-700'
               : 'text-slate-500 hover:bg-rose-500/10 hover:text-rose-400'
           }`}

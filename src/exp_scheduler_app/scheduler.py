@@ -146,8 +146,12 @@ class SchedulerService:
         )
         await self.events.publish("service_stopped", {})
 
-    async def list_tasks(self) -> dict[str, object]:
-        return self.database.list_tasks()
+    async def list_tasks(self, *, history_sort: str = "finished_at") -> dict[str, object]:
+        payload = self.database.list_tasks(history_sort=history_sort)
+        for task in payload.get("history", []):
+            if isinstance(task, dict):
+                task["attempt_logs"] = self._list_task_log_entries(task)
+        return payload
 
     async def list_gpus(self) -> list[dict[str, object]]:
         await self._apply_due_gpu_schedule()
@@ -1760,18 +1764,132 @@ class SchedulerService:
     def _list_task_log_entries(self, task: dict[str, object]) -> list[dict[str, object]]:
         task_id = int(task["id"])
         entries_by_attempt: dict[int, dict[str, object]] = {}
+        attempts_by_number = self._task_attempt_metadata(task)
         for path in self.config.log_dir.glob(f"task_{task_id}_attempt_*.log"):
             entry = self._task_log_entry_from_path(task, path)
             if entry is not None:
+                self._apply_attempt_metadata(
+                    entry,
+                    attempts_by_number.get(int(entry["attempt"])),
+                    task=task,
+                )
                 entries_by_attempt[int(entry["attempt"])] = entry
 
         log_path = task.get("log_path")
         if isinstance(log_path, str) and log_path:
             entry = self._task_log_entry_from_path(task, Path(log_path))
             if entry is not None:
+                self._apply_attempt_metadata(
+                    entry,
+                    attempts_by_number.get(int(entry["attempt"])),
+                    task=task,
+                )
                 entries_by_attempt[int(entry["attempt"])] = entry
 
         return [entries_by_attempt[attempt] for attempt in sorted(entries_by_attempt)]
+
+    def _task_attempt_metadata(
+        self,
+        task: dict[str, object],
+    ) -> dict[int, dict[str, object]]:
+        task_id = int(task["id"])
+        records: dict[int, dict[str, object]] = {}
+
+        for attempt_row in self.database.list_task_attempts(task_id):
+            attempt = self._positive_int(attempt_row.get("attempt"))
+            if attempt is None:
+                continue
+            records[attempt] = {
+                "attempt": attempt,
+                "started_at": attempt_row.get("started_at"),
+                "finished_at": attempt_row.get("finished_at"),
+                "status": attempt_row.get("status"),
+                "exit_code": attempt_row.get("exit_code"),
+                "log_path": attempt_row.get("log_path"),
+            }
+
+        for operation_log in self.database.list_task_operation_logs(task_id):
+            metadata = operation_log.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            attempt = self._positive_int(metadata.get("attempt"))
+            if attempt is None:
+                attempt = self._positive_int(metadata.get("attempt_count"))
+            if attempt is None:
+                continue
+            record = records.setdefault(attempt, {"attempt": attempt})
+            action = str(operation_log.get("action") or "")
+            created_at = operation_log.get("created_at")
+            if action == "task_started":
+                self._set_if_missing(record, "started_at", created_at)
+                self._set_if_missing(record, "status", "running")
+                self._set_if_missing(record, "exit_code", metadata.get("exit_code"))
+                self._set_if_missing(record, "log_path", metadata.get("log_path"))
+            elif action in {"task_finished", "task_failed_to_launch"}:
+                self._set_if_missing(record, "finished_at", created_at)
+                record["status"] = metadata.get("status") or "failed"
+                record["exit_code"] = metadata.get("exit_code")
+                self._set_if_missing(record, "log_path", metadata.get("log_path"))
+            elif action == "task_retry_scheduled":
+                self._set_if_missing(record, "finished_at", created_at)
+                record["status"] = "retry_scheduled"
+                record["exit_code"] = metadata.get("exit_code")
+                self._set_if_missing(record, "log_path", metadata.get("log_path"))
+            elif action in {"task_interrupted_requeued", "task_preempted"}:
+                self._set_if_missing(record, "finished_at", created_at)
+                record["status"] = action.replace("task_", "")
+                record["exit_code"] = metadata.get("exit_code")
+                self._set_if_missing(record, "log_path", metadata.get("log_path"))
+
+        current_attempt = self._positive_int(task.get("attempt_count"))
+        if current_attempt is not None:
+            record = records.setdefault(current_attempt, {"attempt": current_attempt})
+            self._set_if_missing(record, "started_at", task.get("started_at"))
+            self._set_if_missing(record, "finished_at", task.get("finished_at"))
+            self._set_if_missing(record, "status", task.get("status"))
+            self._set_if_missing(record, "exit_code", task.get("exit_code"))
+            self._set_if_missing(record, "log_path", task.get("log_path"))
+
+        return records
+
+    def _apply_attempt_metadata(
+        self,
+        entry: dict[str, object],
+        metadata: dict[str, object] | None,
+        *,
+        task: dict[str, object],
+    ) -> None:
+        if metadata:
+            for key in ("started_at", "finished_at", "status", "exit_code"):
+                entry[key] = metadata.get(key)
+        else:
+            entry["started_at"] = None
+            entry["finished_at"] = None
+            entry["status"] = None
+            entry["exit_code"] = None
+
+        if bool(entry.get("is_current")):
+            entry["started_at"] = entry.get("started_at") or task.get("started_at")
+            entry["finished_at"] = entry.get("finished_at") or task.get("finished_at")
+            entry["status"] = entry.get("status") or task.get("status")
+            entry["exit_code"] = entry.get("exit_code") if entry.get("exit_code") is not None else task.get("exit_code")
+        entry["finished_at"] = entry.get("finished_at") or entry.get("modified_at")
+
+    def _set_if_missing(
+        self,
+        record: dict[str, object],
+        key: str,
+        value: object,
+    ) -> None:
+        if value is not None and record.get(key) is None:
+            record[key] = value
+
+    def _positive_int(self, value: object) -> int | None:
+        try:
+            number = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
 
     def _task_log_entry_from_path(
         self,

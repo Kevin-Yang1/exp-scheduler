@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 import httpx
 import uvicorn
 
+import exp_scheduler_app.config as config_module
 from exp_scheduler_app.config import SchedulerConfig
 from exp_scheduler_app.gpu import GPUInfo
 from exp_scheduler_app.web import create_app
@@ -443,6 +444,28 @@ def test_server_info_endpoint_uses_config_values(tmp_path):
         }
 
 
+def test_config_replaces_loopback_server_ip_with_detected_ip(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module, "_detect_server_ip", lambda: "10.10.0.24")
+    config = config_module.config_from_mapping(
+        {
+            "server_ip": "127.0.1.1",
+            "state_dir": tmp_path / "state-loopback-server",
+        }
+    )
+    assert config.server_ip == "10.10.0.24"
+
+
+def test_config_keeps_explicit_non_loopback_server_ip(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module, "_detect_server_ip", lambda: "10.10.0.24")
+    config = config_module.config_from_mapping(
+        {
+            "server_ip": "10.10.0.23",
+            "state_dir": tmp_path / "state-explicit-server",
+        }
+    )
+    assert config.server_ip == "10.10.0.23"
+
+
 def test_urgent_queue_listing_and_preempt_requires_waiting_urgent_task(tmp_path):
     with make_client(tmp_path / "listing") as client:
         client.fake_gpu_provider.set_gpus([gpu(0, idle=False)])
@@ -738,6 +761,58 @@ def test_update_history_task_metadata_keeps_runtime_fields(tmp_path):
 
         empty = client.patch(f"/api/tasks/{task_id}/metadata", json={})
         assert empty.status_code == 400
+
+
+def test_history_tasks_can_sort_by_started_at(tmp_path):
+    with make_client(tmp_path) as client:
+        db = client.app.state.scheduler.database
+        first = db.create_task(
+            name="started-first",
+            command=command("print('first')"),
+            cwd=None,
+            env={},
+            notes=None,
+        )
+        second = db.create_task(
+            name="started-second",
+            command=command("print('second')"),
+            cwd=None,
+            env={},
+            notes=None,
+        )
+
+        db.mark_task_running(
+            task_id=first["id"],
+            gpu_id=0,
+            pid=1001,
+            log_path=str(tmp_path / "first.log"),
+        )
+        time.sleep(0.01)
+        db.mark_task_running(
+            task_id=second["id"],
+            gpu_id=0,
+            pid=1002,
+            log_path=str(tmp_path / "second.log"),
+        )
+        db.finish_task(task_id=second["id"], status="succeeded", exit_code=0)
+        time.sleep(0.01)
+        db.finish_task(task_id=first["id"], status="succeeded", exit_code=0)
+
+        by_finished = client.get("/api/tasks")
+        by_finished.raise_for_status()
+        by_finished_ids = [task["id"] for task in by_finished.json()["history"]]
+        assert by_finished_ids[:2] == [first["id"], second["id"]]
+
+        by_started = client.get(
+            "/api/tasks",
+            params={"history_sort": "started_at"},
+        )
+        by_started.raise_for_status()
+        by_started_ids = [task["id"] for task in by_started.json()["history"]]
+        assert by_started_ids[:2] == [second["id"], first["id"]]
+
+        invalid = client.get("/api/tasks", params={"history_sort": "created_at"})
+        assert invalid.status_code == 400
 
 
 def test_activity_logs_endpoint_records_task_details_and_filters(tmp_path):

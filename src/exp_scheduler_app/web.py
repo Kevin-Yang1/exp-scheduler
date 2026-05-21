@@ -158,8 +158,12 @@ def create_app(
         return FileResponse(STATIC_DIR / "index.html")
 
     @app.get("/api/tasks")
-    async def list_tasks() -> dict[str, object]:
-        result = await scheduler.list_tasks()
+    async def list_tasks(
+        history_sort: str = Query(default="finished_at"),
+    ) -> dict[str, object]:
+        if history_sort not in {"finished_at", "started_at"}:
+            raise HTTPException(status_code=400, detail="历史排序字段无效")
+        result = await scheduler.list_tasks(history_sort=history_sort)
         for key in ("queued", "urgent_queued", "running", "history"):
             for task in result.get(key, []):
                 add_dependency_payload(task)

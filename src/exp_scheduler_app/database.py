@@ -82,6 +82,26 @@ class Database:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS task_attempts (
+                    task_id INTEGER NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    status TEXT,
+                    exit_code INTEGER,
+                    log_path TEXT,
+                    PRIMARY KEY(task_id, attempt)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_attempts_task
+                ON task_attempts(task_id, attempt)
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -416,7 +436,18 @@ class Database:
             return None
         return self._row_to_task(row)
 
-    def list_tasks(self, history_limit: int = 100) -> dict[str, object]:
+    def list_tasks(
+        self,
+        history_limit: int = 100,
+        history_sort: str = "finished_at",
+    ) -> dict[str, object]:
+        if history_sort == "finished_at":
+            history_order = "COALESCE(finished_at, created_at) DESC, id DESC"
+        elif history_sort == "started_at":
+            history_order = "COALESCE(started_at, created_at) DESC, id DESC"
+        else:
+            raise ValueError("历史排序字段无效")
+
         with self._lock, self._connect() as conn:
             queued = conn.execute(
                 """
@@ -438,10 +469,10 @@ class Database:
                 "SELECT * FROM tasks WHERE status = 'running' ORDER BY started_at ASC, id ASC"
             ).fetchall()
             history = conn.execute(
-                """
+                f"""
                 SELECT * FROM tasks
                 WHERE status NOT IN ('queued', 'running')
-                ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+                ORDER BY {history_order}
                 LIMIT ?
                 """,
                 (history_limit,),
@@ -492,6 +523,32 @@ class Database:
             ).fetchall()
         return [self._row_to_task(row) for row in rows]
 
+    def list_task_attempts(self, task_id: int) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM task_attempts
+                WHERE task_id = ?
+                ORDER BY attempt ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_task_attempt(row) for row in rows]
+
+    def list_task_operation_logs(self, task_id: int) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM operation_logs
+                WHERE entity_type = 'task' AND entity_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_operation_log(row) for row in rows]
+
     def delete_task(self, task_id: int) -> dict[str, object] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute(
@@ -505,6 +562,10 @@ class Database:
             conn.execute(
                 "DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?",
                 (task_id, task_id),
+            )
+            conn.execute(
+                "DELETE FROM task_attempts WHERE task_id = ?",
+                (task_id,),
             )
             conn.execute(
                 "DELETE FROM tasks WHERE id = ?",
@@ -836,6 +897,21 @@ class Database:
                 """,
                 (gpu_id, pid, started_at, log_path, task_id),
             )
+            row = conn.execute(
+                "SELECT attempt_count FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is not None:
+                self._upsert_task_attempt(
+                    conn,
+                    task_id=task_id,
+                    attempt=int(row["attempt_count"] or 1),
+                    started_at=started_at,
+                    finished_at=None,
+                    status="running",
+                    exit_code=None,
+                    log_path=log_path,
+                )
             conn.commit()
         task = self.get_task(task_id)
         if task is None:
@@ -852,6 +928,10 @@ class Database:
     ) -> dict[str, object]:
         finished_at = utc_now_iso()
         with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT attempt_count, started_at, log_path FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
             conn.execute(
                 """
                 UPDATE tasks
@@ -863,6 +943,17 @@ class Database:
                 """,
                 (status, exit_code, finished_at, pid, task_id),
             )
+            if row is not None:
+                self._upsert_task_attempt(
+                    conn,
+                    task_id=task_id,
+                    attempt=max(1, int(row["attempt_count"] or 1)),
+                    started_at=row["started_at"],
+                    finished_at=finished_at,
+                    status=status,
+                    exit_code=exit_code,
+                    log_path=row["log_path"],
+                )
             conn.commit()
         task = self.get_task(task_id)
         if task is None:
@@ -873,7 +964,12 @@ class Database:
         self, *, task_id: int, log_path: str, message: str
     ) -> dict[str, object]:
         finished_at = utc_now_iso()
+        attempt = self._attempt_from_log_path(log_path)
         with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT started_at FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
             conn.execute(
                 """
                 UPDATE tasks
@@ -881,6 +977,7 @@ class Database:
                     queue_rank = NULL,
                     finished_at = ?,
                     exit_code = -1,
+                    attempt_count = MAX(COALESCE(attempt_count, 0), ?),
                     log_path = ?,
                     notes = CASE
                         WHEN notes IS NULL OR notes = '' THEN ?
@@ -888,8 +985,19 @@ class Database:
                     END
                 WHERE id = ?
                 """,
-                (finished_at, log_path, message, message, task_id),
+                (finished_at, attempt or 1, log_path, message, message, task_id),
             )
+            if attempt is not None:
+                self._upsert_task_attempt(
+                    conn,
+                    task_id=task_id,
+                    attempt=attempt,
+                    started_at=row["started_at"] if row is not None else None,
+                    finished_at=finished_at,
+                    status="failed",
+                    exit_code=-1,
+                    log_path=log_path,
+                )
             conn.commit()
         task = self.get_task(task_id)
         if task is None:
@@ -903,7 +1011,12 @@ class Database:
         next_retry_at: str,
         exit_code: int | None,
     ) -> dict[str, object]:
+        finished_at = utc_now_iso()
         with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT attempt_count, started_at, log_path FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
             queue_name = self._queue_name_for_task(conn, task_id)
             queue_rank = self._head_queue_rank(conn, queue_name)
             conn.execute(
@@ -918,8 +1031,19 @@ class Database:
                     next_retry_at = ?
                 WHERE id = ?
                 """,
-                (queue_rank, exit_code, utc_now_iso(), next_retry_at, task_id),
+                (queue_rank, exit_code, finished_at, next_retry_at, task_id),
             )
+            if row is not None:
+                self._upsert_task_attempt(
+                    conn,
+                    task_id=task_id,
+                    attempt=max(1, int(row["attempt_count"] or 1)),
+                    started_at=row["started_at"],
+                    finished_at=finished_at,
+                    status="retry_scheduled",
+                    exit_code=exit_code,
+                    log_path=row["log_path"],
+                )
             conn.commit()
         task = self.get_task(task_id)
         if task is None:
@@ -933,8 +1057,17 @@ class Database:
         queue_name: str = NORMAL_QUEUE,
     ) -> dict[str, object]:
         normalized_queue_name = self._normalize_queue_name(queue_name)
+        finished_at = utc_now_iso()
         with self._lock, self._connect() as conn:
             queue_rank = self._head_queue_rank(conn, normalized_queue_name)
+            row = conn.execute(
+                """
+                SELECT attempt_count, started_at, log_path, exit_code
+                FROM tasks
+                WHERE id = ? AND status = 'running'
+                """,
+                (task_id,),
+            ).fetchone()
             cursor = conn.execute(
                 """
                 UPDATE tasks
@@ -951,6 +1084,17 @@ class Database:
                 """,
                 (queue_rank, normalized_queue_name, task_id),
             )
+            if row is not None:
+                self._upsert_task_attempt(
+                    conn,
+                    task_id=task_id,
+                    attempt=max(1, int(row["attempt_count"] or 1)),
+                    started_at=row["started_at"],
+                    finished_at=finished_at,
+                    status="preempted",
+                    exit_code=row["exit_code"],
+                    log_path=row["log_path"],
+                )
             conn.commit()
         if cursor.rowcount == 0:
             raise ValueError("只有运行中的任务可以抢占后回队列")
@@ -965,7 +1109,16 @@ class Database:
         *,
         exit_code: int | None,
     ) -> dict[str, object]:
+        finished_at = utc_now_iso()
         with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT attempt_count, started_at, log_path
+                FROM tasks
+                WHERE id = ? AND status = 'running'
+                """,
+                (task_id,),
+            ).fetchone()
             queue_name = self._queue_name_for_task(conn, task_id)
             queue_rank = self._head_queue_rank(conn, queue_name)
             cursor = conn.execute(
@@ -983,6 +1136,17 @@ class Database:
                 """,
                 (queue_rank, exit_code, task_id),
             )
+            if row is not None:
+                self._upsert_task_attempt(
+                    conn,
+                    task_id=task_id,
+                    attempt=max(1, int(row["attempt_count"] or 1)),
+                    started_at=row["started_at"],
+                    finished_at=finished_at,
+                    status="interrupted_requeued",
+                    exit_code=exit_code,
+                    log_path=row["log_path"],
+                )
             conn.commit()
         if cursor.rowcount == 0:
             raise ValueError("只有运行中的任务可以中断后回队列")
@@ -992,10 +1156,11 @@ class Database:
         return task
 
     def requeue_running_tasks_to_queue_head(self) -> int:
+        finished_at = utc_now_iso()
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, queue_name
+                SELECT id, queue_name, attempt_count, started_at, log_path, exit_code
                 FROM tasks
                 WHERE status = 'running'
                 ORDER BY COALESCE(started_at, created_at) ASC, id ASC
@@ -1035,6 +1200,16 @@ class Database:
                         WHERE id = ? AND status = 'running'
                         """,
                         (base_rank + offset, queue_name, row["id"]),
+                    )
+                    self._upsert_task_attempt(
+                        conn,
+                        task_id=int(row["id"]),
+                        attempt=max(1, int(row["attempt_count"] or 1)),
+                        started_at=row["started_at"],
+                        finished_at=finished_at,
+                        status="interrupted_requeued",
+                        exit_code=row["exit_code"],
+                        log_path=row["log_path"],
                     )
             conn.commit()
             return len(rows)
@@ -1100,6 +1275,48 @@ class Database:
         if row is None:
             raise ValueError(f"任务不存在: {task_id}")
         return self._normalize_queue_name(row["queue_name"])
+
+    def _upsert_task_attempt(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task_id: int,
+        attempt: int,
+        started_at: str | None,
+        finished_at: str | None,
+        status: str | None,
+        exit_code: int | None,
+        log_path: str | None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO task_attempts(
+                task_id, attempt, started_at, finished_at, status, exit_code, log_path
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, attempt) DO UPDATE SET
+                started_at = COALESCE(excluded.started_at, task_attempts.started_at),
+                finished_at = excluded.finished_at,
+                status = COALESCE(excluded.status, task_attempts.status),
+                exit_code = excluded.exit_code,
+                log_path = COALESCE(excluded.log_path, task_attempts.log_path)
+            """,
+            (task_id, attempt, started_at, finished_at, status, exit_code, log_path),
+        )
+
+    def _attempt_from_log_path(self, log_path: str | None) -> int | None:
+        if not log_path:
+            return None
+        name = Path(log_path).name
+        marker = "_attempt_"
+        if marker not in name:
+            return None
+        raw_attempt = name.rsplit(marker, 1)[-1].split(".", 1)[0]
+        try:
+            attempt = int(raw_attempt)
+        except ValueError:
+            return None
+        return attempt if attempt > 0 else None
 
     def _normalize_queue_name(self, queue_name: str | None) -> str:
         value = str(queue_name or NORMAL_QUEUE).strip().lower()
@@ -1169,6 +1386,17 @@ class Database:
             "notes": row["notes"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    def _row_to_task_attempt(self, row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "task_id": row["task_id"],
+            "attempt": row["attempt"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "status": row["status"],
+            "exit_code": row["exit_code"],
+            "log_path": row["log_path"],
         }
 
     def _row_to_operation_log(self, row: sqlite3.Row) -> dict[str, object]:
