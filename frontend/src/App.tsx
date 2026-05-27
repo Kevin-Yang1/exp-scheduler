@@ -54,8 +54,15 @@ interface GPUStatus {
   memoryFree: number;
   utilization: number;
   isBusy: boolean;
+  isPhysicallyIdle: boolean;
+  isGloballyEnabled: boolean;
   isCoolingDown?: boolean;
   cooldownRemainingSeconds?: number;
+  autoRestoreIdleSince?: string;
+  autoRestoreIdleWaiting?: boolean;
+  autoRestoreIdleWaitSeconds?: number;
+  autoRestoreIdleRequiredSeconds?: number;
+  autoRestoreIdleRemainingSeconds?: number;
 }
 
 interface Task {
@@ -112,6 +119,19 @@ interface BackendTask {
   attempt_logs?: TaskLogEntry[];
 }
 
+interface TaskCounts {
+  queued: number;
+  urgent_queued: number;
+  running: number;
+  history: number;
+  history_filtered: number;
+  total: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  interrupted: number;
+}
+
 interface TaskLogEntry {
   attempt: number;
   path: string;
@@ -147,6 +167,11 @@ interface BackendGPU {
   cooldown_until?: string;
   cooldown_remaining_seconds?: number;
   cooldown_reason?: string;
+  auto_restore_idle_since?: string;
+  auto_restore_idle_waiting?: boolean;
+  auto_restore_idle_wait_seconds?: number;
+  auto_restore_idle_required_seconds?: number;
+  auto_restore_idle_remaining_seconds?: number;
 }
 
 interface Profile {
@@ -186,6 +211,8 @@ interface ActivityLogEntry {
 }
 
 type HistorySortKey = 'finished_at' | 'started_at';
+
+const HISTORY_PAGE_SIZE = 100;
 
 interface DiscoveryItem {
   display_name: string;
@@ -271,6 +298,28 @@ function formatScheduleTime(value?: string) {
   });
 }
 
+function formatDurationSeconds(value?: number | null) {
+  if (value === undefined || value === null || !Number.isFinite(value)) return '--';
+  const totalSeconds = Math.max(0, Math.floor(value));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function currentAutoRestoreWaitSeconds(gpu: GPUStatus, nowMs: number) {
+  if (gpu.autoRestoreIdleSince) {
+    const startedAt = new Date(gpu.autoRestoreIdleSince).getTime();
+    if (!Number.isNaN(startedAt)) {
+      return Math.max(0, (nowMs - startedAt) / 1000);
+    }
+  }
+  return gpu.autoRestoreIdleWaitSeconds ?? 0;
+}
+
 function taskStatusLabel(status: Task['status']) {
   switch (status) {
     case 'pending': return '排队中';
@@ -342,6 +391,7 @@ function mapTask(task: BackendTask): Task {
 
 function mapGpu(gpu: BackendGPU): GPUStatus {
   const isCoolingDown = Boolean(gpu.cooldown_until || (gpu.cooldown_remaining_seconds ?? 0) > 0);
+  const isPhysicallyIdle = gpu.physically_idle ?? gpu.is_idle;
   return {
     id: gpu.index,
     name: gpu.name,
@@ -349,10 +399,28 @@ function mapGpu(gpu: BackendGPU): GPUStatus {
     memoryTotal: gpu.memory_total_mb || 0,
     memoryFree: gpu.memory_free_mb ?? Math.max(0, (gpu.memory_total_mb || 0) - (gpu.memory_used_mb || 0)),
     utilization: gpu.utilization_gpu || 0,
-    isBusy: isCoolingDown || !(gpu.physically_idle ?? gpu.is_idle) || Boolean(gpu.scheduler_occupied || gpu.has_processes),
+    isBusy: isCoolingDown || !isPhysicallyIdle || Boolean(gpu.scheduler_occupied || gpu.has_processes),
+    isPhysicallyIdle,
+    isGloballyEnabled: gpu.globally_enabled,
     isCoolingDown,
     cooldownRemainingSeconds: gpu.cooldown_remaining_seconds,
+    autoRestoreIdleSince: gpu.auto_restore_idle_since,
+    autoRestoreIdleWaiting: gpu.auto_restore_idle_waiting,
+    autoRestoreIdleWaitSeconds: gpu.auto_restore_idle_wait_seconds,
+    autoRestoreIdleRequiredSeconds: gpu.auto_restore_idle_required_seconds,
+    autoRestoreIdleRemainingSeconds: gpu.auto_restore_idle_remaining_seconds,
   };
+}
+
+function normalizeGpuIds(ids: number[]) {
+  return Array.from(new Set(ids)).sort((left, right) => left - right);
+}
+
+function haveSameGpuIds(left: number[], right: number[]) {
+  const normalizedLeft = normalizeGpuIds(left);
+  const normalizedRight = normalizeGpuIds(right);
+  return normalizedLeft.length === normalizedRight.length &&
+    normalizedLeft.every((id, index) => id === normalizedRight[index]);
 }
 
 type AppTab = 'dashboard' | 'queue' | 'history' | 'activity' | 'nvitop' | 'settings';
@@ -362,6 +430,7 @@ export default function App() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [isPaused, setIsPaused] = useState(false);
   const [showNewTask, setShowNewTask] = useState(false);
+  const [isTaskModalExpanded, setIsTaskModalExpanded] = useState(false);
   const [taskDraft, setTaskDraft] = useState<Task | null>(null);
   const [enabledGpus, setEnabledGpus] = useState<number[]>([]);
   const [appliedEnabledGpus, setAppliedEnabledGpus] = useState<number[]>([]);
@@ -374,6 +443,7 @@ export default function App() {
   const [activitySearch, setActivitySearch] = useState('');
   const [expandedActivityLogId, setExpandedActivityLogId] = useState<number | null>(null);
   const [historySort, setHistorySort] = useState<HistorySortKey>('finished_at');
+  const [historyLimit, setHistoryLimit] = useState(HISTORY_PAGE_SIZE);
   const [isConsoleFullScreen, setIsConsoleFullScreen] = useState(false);
   const [isNvitopFullScreen, setIsNvitopFullScreen] = useState(false);
   const [gpus, setGpus] = useState<GPUStatus[]>([]);
@@ -406,6 +476,7 @@ export default function App() {
     });
   }, []);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [taskCounts, setTaskCounts] = useState<TaskCounts | null>(null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [schedulerSettings, setSchedulerSettings] = useState<SchedulerSettings | null>(null);
   const [schedulerSettingsDraft, setSchedulerSettingsDraft] = useState<Partial<SchedulerSettings>>({});
@@ -416,7 +487,26 @@ export default function App() {
   const [profileDraft, setProfileDraft] = useState<Profile | null>(null);
   const [serverIp, setServerIp] = useState('读取中...');
   const [message, setMessage] = useState('');
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const followRunningTaskRef = useRef(true);
+  const gpuSettingsDraftRef = useRef(false);
+  const appliedEnabledGpusRef = useRef<number[]>([]);
+  const commandTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const resetCommandTextareaSize = useCallback(() => {
+    if (!commandTextareaRef.current) return;
+    commandTextareaRef.current.style.height = '';
+    commandTextareaRef.current.style.width = '';
+  }, []);
+
+  const toggleTaskModalExpanded = useCallback(() => {
+    setIsTaskModalExpanded(prev => {
+      if (prev) {
+        resetCommandTextareaSize();
+      }
+      return !prev;
+    });
+  }, [resetCommandTextareaSize]);
 
   const runningTasks = useMemo(() => tasks.filter(t => t.status === 'running'), [tasks]);
   const historyTasks = useMemo(() => tasks.filter(t => t.status !== 'running' && t.status !== 'pending'), [tasks]);
@@ -424,16 +514,27 @@ export default function App() {
   const standardQueueTasks = useMemo(() => tasks.filter(t => !t.isUrgent && (t.status === 'pending' || t.status === 'running')), [tasks]);
   const selectedTask = useMemo(() => tasks.find(t => t.id === selectedTaskId) || null, [tasks, selectedTaskId]);
   const enabledGpuSet = useMemo(() => new Set(enabledGpus), [enabledGpus]);
+  const hasGpuSettingsDraft = useMemo(() => !haveSameGpuIds(enabledGpus, appliedEnabledGpus), [appliedEnabledGpus, enabledGpus]);
   const visibleGpus = useMemo(() => gpus.filter(gpu => enabledGpuSet.has(gpu.id)), [gpus, enabledGpuSet]);
-  const queueDepth = urgentQueueTasks.filter(t => t.status === 'pending').length + standardQueueTasks.filter(t => t.status === 'pending').length;
+  const queueDepth = taskCounts
+    ? taskCounts.queued + taskCounts.urgent_queued
+    : urgentQueueTasks.filter(t => t.status === 'pending').length + standardQueueTasks.filter(t => t.status === 'pending').length;
   const hasWaitingUrgentTask = urgentQueueTasks.some(task => task.status === 'pending');
-  const failedCount = historyTasks.filter(t => t.status === 'failed' || t.status === 'interrupted').length;
-  const failureRate = historyTasks.length ? `${((failedCount / historyTasks.length) * 100).toFixed(1)}%` : '0%';
+  const totalTaskCount = taskCounts?.total ?? tasks.length;
+  const runningTaskCount = taskCounts?.running ?? runningTasks.length;
+  const historyTotalCount = taskCounts?.history ?? historyTasks.length;
+  const failedCount = taskCounts
+    ? taskCounts.failed + taskCounts.interrupted
+    : historyTasks.filter(t => t.status === 'failed' || t.status === 'interrupted').length;
+  const failureRate = historyTotalCount ? `${((failedCount / historyTotalCount) * 100).toFixed(1)}%` : '0%';
   const filteredHistoryTasks = useMemo(() => historyTasks.filter(t => {
     if (statusFilter === 'all') return true;
     if (statusFilter === 'marked') return markedTaskIds.has(t.id);
     return t.status === statusFilter;
   }), [historyTasks, markedTaskIds, statusFilter]);
+  const historyFilteredTotalCount = taskCounts?.history_filtered ?? historyTotalCount;
+  const historyLoadTargetCount = statusFilter === 'marked' ? historyTotalCount : historyFilteredTotalCount;
+  const canLoadMoreHistory = historyTasks.length < historyLoadTargetCount;
   const canUseBatchDelete = activeTab === 'queue' || activeTab === 'history';
   const dependencyCandidates = useMemo<DependencyCandidate[]>(() => {
     const currentTaskId = taskDraft?.id;
@@ -484,10 +585,64 @@ export default function App() {
     setSelectedForDelete(new Set());
   }, [activeTab]);
 
+  useEffect(() => {
+    if (activeTab !== 'settings') return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (!isTaskModalExpanded) {
+      resetCommandTextareaSize();
+    }
+  }, [isTaskModalExpanded, resetCommandTextareaSize]);
+
+  const discardGpuSettingsDraft = useCallback(() => {
+    gpuSettingsDraftRef.current = false;
+    setEnabledGpus(appliedEnabledGpusRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'settings' || !hasGpuSettingsDraft) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('[data-gpu-settings-draft-keep="true"]')) return;
+      discardGpuSettingsDraft();
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+    };
+  }, [activeTab, discardGpuSettingsDraft, hasGpuSettingsDraft]);
+
+  const updateEnabledGpuDraft = useCallback((updater: (current: number[]) => number[]) => {
+    setEnabledGpus(current => {
+      const next = normalizeGpuIds(updater(current));
+      const isDraft = !haveSameGpuIds(next, appliedEnabledGpusRef.current);
+      gpuSettingsDraftRef.current = isDraft;
+      return next;
+    });
+  }, []);
+
   const refreshAll = useCallback(async () => {
-    const taskParams = new URLSearchParams({ history_sort: historySort });
+    const taskParams = new URLSearchParams({
+      history_sort: historySort,
+      history_limit: String(historyLimit),
+    });
+    if (['succeeded', 'failed', 'interrupted', 'cancelled'].includes(statusFilter)) {
+      taskParams.set('history_status', statusFilter);
+    }
     const [taskPayload, gpuPayload, settingsPayload, profilePayload, serverPayload, schedulerSettingsPayload] = await Promise.all([
-      api<{ queued: BackendTask[]; urgent_queued: BackendTask[]; running: BackendTask[]; history: BackendTask[]; queue_paused: boolean }>(`/api/tasks?${taskParams.toString()}`),
+      api<{
+        queued: BackendTask[];
+        urgent_queued: BackendTask[];
+        running: BackendTask[];
+        history: BackendTask[];
+        queue_paused: boolean;
+        counts?: TaskCounts;
+      }>(`/api/tasks?${taskParams.toString()}`),
       api<{ gpus: BackendGPU[] }>('/api/gpus'),
       api<{ allowed_gpu_ids: number[] | null; gpu_schedule?: Record<string, GpuScheduleEntry> }>('/api/settings'),
       api<{ profiles: Profile[] }>('/api/profiles'),
@@ -503,14 +658,25 @@ export default function App() {
     ].map(mapTask);
     setGpus(nextGpus);
     setTasks(nextTasks);
+    setTaskCounts(taskPayload.counts || null);
     setProfiles(profilePayload.profiles || []);
     if (schedulerSettingsPayload) {
       setSchedulerSettings(schedulerSettingsPayload);
     }
     setIsPaused(Boolean(taskPayload.queue_paused));
-    const nextEnabledGpus = settingsPayload.allowed_gpu_ids ?? nextGpus.map(gpu => gpu.id);
-    setEnabledGpus(nextEnabledGpus);
+    const nextEnabledGpus = normalizeGpuIds(settingsPayload.allowed_gpu_ids ?? nextGpus.map(gpu => gpu.id));
+    appliedEnabledGpusRef.current = nextEnabledGpus;
     setAppliedEnabledGpus(nextEnabledGpus);
+    setEnabledGpus(current => {
+      if (!gpuSettingsDraftRef.current) {
+        return nextEnabledGpus;
+      }
+      if (haveSameGpuIds(current, nextEnabledGpus)) {
+        gpuSettingsDraftRef.current = false;
+        return nextEnabledGpus;
+      }
+      return current;
+    });
     setGpuSchedule(settingsPayload.gpu_schedule || {});
     setServerIp(serverPayload.server_ip || serverPayload.server_name || 'unknown');
     setSelectedTaskId(prev => {
@@ -524,7 +690,7 @@ export default function App() {
       followRunningTaskRef.current = true;
       return runningTask?.id || null;
     });
-  }, [historySort]);
+  }, [historyLimit, historySort, statusFilter]);
 
   const loadActivityLogs = useCallback(async () => {
     const params = new URLSearchParams({ limit: '300' });
@@ -591,11 +757,13 @@ export default function App() {
 
   const openNewTaskModal = () => {
     setTaskDraft(null);
+    setIsTaskModalExpanded(false);
     setShowNewTask(true);
   };
 
   const closeNewTaskModal = () => {
     setShowNewTask(false);
+    setIsTaskModalExpanded(false);
     setTaskDraft(null);
     setIsEditingTask(false);
   };
@@ -607,7 +775,7 @@ export default function App() {
   };
 
   const toggleGpu = (id: number) => {
-    setEnabledGpus(prev =>
+    updateEnabledGpuDraft(prev =>
       prev.includes(id) ? prev.filter(gid => gid !== id) : [...prev, id]
     );
   };
@@ -703,7 +871,9 @@ export default function App() {
   };
 
   const applyGpuSettings = async () => {
-    const allowed_gpu_ids = enabledGpus.length === gpus.length ? null : enabledGpus;
+    if (!hasGpuSettingsDraft) return;
+    const allGpuIds = gpus.map(gpu => gpu.id);
+    const allowed_gpu_ids = haveSameGpuIds(enabledGpus, allGpuIds) ? null : enabledGpus;
     const disabledGpuIds = appliedEnabledGpus.filter(id => !enabledGpus.includes(id));
     const runningOnDisabled = runningTasks.filter(task => (
       typeof task.gpu === 'number' && disabledGpuIds.includes(task.gpu)
@@ -724,10 +894,16 @@ export default function App() {
         ));
       }
     }
-    await api('/api/settings', {
+    const settings = await api<{ allowed_gpu_ids: number[] | null; gpu_schedule?: Record<string, GpuScheduleEntry> }>('/api/settings', {
       method: 'PUT',
       body: JSON.stringify({ allowed_gpu_ids, stop_running_gpu_ids }),
     });
+    const nextEnabledGpus = normalizeGpuIds(settings.allowed_gpu_ids ?? gpus.map(gpu => gpu.id));
+    gpuSettingsDraftRef.current = false;
+    appliedEnabledGpusRef.current = nextEnabledGpus;
+    setAppliedEnabledGpus(nextEnabledGpus);
+    setEnabledGpus(nextEnabledGpus);
+    setGpuSchedule(settings.gpu_schedule || {});
     await refreshAll();
   };
 
@@ -979,6 +1155,7 @@ export default function App() {
   const duplicateTask = (task: Task) => {
     setTaskDraft(task);
     setIsEditingTask(false);
+    setIsTaskModalExpanded(false);
     setShowNewTask(true);
     setMessage(`正在基于任务 #${task.id} 复用新建。`);
   };
@@ -986,6 +1163,7 @@ export default function App() {
   const editTask = (task: Task) => {
     setTaskDraft(task);
     setIsEditingTask(true);
+    setIsTaskModalExpanded(false);
     setShowNewTask(true);
     setMessage(task.status === 'pending' ? `正在重新编辑任务 #${task.id}。` : `正在编辑任务 #${task.id} 的记录信息。`);
   };
@@ -1070,6 +1248,7 @@ export default function App() {
             onClick={() => setActiveTab('dashboard')}
             icon={<Monitor className="w-5 h-5" />}
             label="控制台概览"
+            count={runningTaskCount}
           />
           <NavItem
             active={activeTab === 'queue'}
@@ -1083,6 +1262,7 @@ export default function App() {
             onClick={() => setActiveTab('history')}
             icon={<History className="w-5 h-5" />}
             label="历史记录"
+            count={historyTotalCount}
           />
           <NavItem
             active={activeTab === 'nvitop'}
@@ -1243,8 +1423,8 @@ export default function App() {
               >
                 {/* Stats Cards Row (derived from design) */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                  <StatCard label="总运行次数" value={String(tasks.length)} type="neutral" />
-                  <StatCard label="活跃任务" value={String(runningTasks.length)} type="blue" />
+                  <StatCard label="任务总数" value={String(totalTaskCount)} type="neutral" />
+                  <StatCard label="活跃任务" value={String(runningTaskCount)} type="blue" />
                   <StatCard label="队列深度" value={String(queueDepth)} type="amber" />
                   <StatCard label="失败率" value={failureRate} type="rose" />
                 </div>
@@ -1368,7 +1548,14 @@ export default function App() {
                     <div className="p-2 bg-blue-600 rounded-lg text-white">
                       <History className="w-5 h-5" />
                     </div>
-                    <span className="font-bold text-slate-800 text-base">系统审计日志</span>
+                    <div>
+                      <span className="font-bold text-slate-800 text-base">历史记录</span>
+                      <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                        {statusFilter === 'marked'
+                          ? `已标记 ${filteredHistoryTasks.length} / 已加载 ${historyTasks.length}`
+                          : `已显示 ${filteredHistoryTasks.length} / ${historyLoadTargetCount}`}
+                      </p>
+                    </div>
                   </div>
 
                   <div className="flex items-center gap-2 flex-wrap justify-end">
@@ -1376,7 +1563,10 @@ export default function App() {
                       {(['finished_at', 'started_at'] as HistorySortKey[]).map((sortKey) => (
                         <button
                           key={sortKey}
-                          onClick={() => setHistorySort(sortKey)}
+                          onClick={() => {
+                            setHistorySort(sortKey);
+                            setHistoryLimit(HISTORY_PAGE_SIZE);
+                          }}
                           className={`px-3 py-1 text-[10px] font-bold uppercase tracking-tighter rounded-md transition-all ${
                             historySort === sortKey
                               ? 'bg-white text-blue-600 shadow-sm'
@@ -1393,7 +1583,10 @@ export default function App() {
                       {['all', 'marked', 'succeeded', 'failed', 'interrupted', 'cancelled'].map((filter) => (
                         <button
                           key={filter}
-                          onClick={() => setStatusFilter(filter)}
+                          onClick={() => {
+                            setStatusFilter(filter);
+                            setHistoryLimit(HISTORY_PAGE_SIZE);
+                          }}
                           className={`px-3 py-1 text-[10px] font-bold uppercase tracking-tighter rounded-md transition-all ${
                             statusFilter === filter
                             ? 'bg-white text-blue-600 shadow-sm'
@@ -1434,9 +1627,19 @@ export default function App() {
                        <p className="text-sm">暂无符合条件的审计记录</p>
                     </div>
                   )}
+                  {canLoadMoreHistory && (
+                    <div className="flex justify-center pt-1">
+                      <button
+                        onClick={() => setHistoryLimit(prev => prev + HISTORY_PAGE_SIZE)}
+                        className="px-4 py-2 text-xs font-bold text-blue-600 bg-white border border-blue-100 rounded-lg hover:bg-blue-50 transition-colors"
+                      >
+                        加载更多 {historyTasks.length}/{historyLoadTargetCount}
+                      </button>
+                    </div>
+                  )}
                 </div>
-	              </motion.div>
-	            )}
+              </motion.div>
+            )}
 
 	            {activeTab === 'activity' && (
 	              <motion.div
@@ -1728,8 +1931,9 @@ export default function App() {
                         <div className="flex flex-wrap items-start gap-4">
                           {gpus.map(gpu => {
                             const schedule = gpuSchedule[String(gpu.id)];
+                            const showAutoRestoreWait = Boolean(gpu.autoRestoreIdleRequiredSeconds && !gpu.isGloballyEnabled && !enabledGpus.includes(gpu.id));
                             return (
-                            <div key={gpu.id} className={`space-y-2 rounded-xl border p-3 transition-all ${
+                            <div key={gpu.id} data-gpu-settings-draft-keep="true" className={`space-y-2 rounded-xl border p-3 transition-all ${
                               enabledGpus.includes(gpu.id)
                               ? 'bg-blue-50 border-blue-200 text-blue-700'
                               : 'bg-slate-50 border-slate-200 text-slate-500'
@@ -1744,6 +1948,9 @@ export default function App() {
                                 <span className="text-sm font-bold">GPU {gpu.id}</span>
                               </label>
                               <div className="space-y-2 border-t border-white/70 pt-2">
+                                {showAutoRestoreWait && (
+                                  <GpuAutoRestoreWait gpu={gpu} nowMs={nowMs} />
+                                )}
                                 {schedule && (
                                   <div className="flex items-center justify-between gap-2 text-[10px] font-bold text-slate-500">
                                     <span>{schedule.action === 'enable' ? '定时开启' : '定时关闭'} {formatScheduleTime(schedule.run_at)}</span>
@@ -1773,7 +1980,7 @@ export default function App() {
                             </div>
                           );
                           })}
-                          <div className="flex w-[210px] max-w-full self-start flex-col gap-3 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3">
+                          <div data-gpu-settings-draft-keep="true" className="flex w-[210px] max-w-full self-start flex-col gap-3 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3">
                             <label className="flex items-start gap-2 cursor-pointer">
                               <input
                                 type="checkbox"
@@ -1832,12 +2039,23 @@ export default function App() {
 
                       <div className="flex gap-3 pt-4">
                         <button
-                          onClick={() => setEnabledGpus(gpus.map(g => g.id))}
+                          data-gpu-settings-draft-keep="true"
+                          onClick={() => updateEnabledGpuDraft(() => gpus.map(g => g.id))}
                           className="px-6 py-2.5 rounded-lg bg-slate-50 border border-slate-200 text-slate-600 text-sm font-bold hover:bg-slate-100 transition-all"
                         >
                           恢复全部可用
                         </button>
-                        <button onClick={applyGpuSettings} className="px-8 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-bold shadow-md hover:bg-slate-800 active:scale-95 transition-all">
+                        <button
+                          data-gpu-settings-draft-keep="true"
+                          type="button"
+                          onClick={applyGpuSettings}
+                          disabled={!hasGpuSettingsDraft}
+                          className={`px-8 py-2.5 rounded-lg text-sm font-bold transition-all ${
+                            hasGpuSettingsDraft
+                              ? 'bg-slate-900 text-white shadow-lg shadow-slate-900/20 ring-2 ring-blue-100 hover:bg-slate-800 active:scale-95'
+                              : 'bg-slate-100 text-slate-400 border border-slate-200 shadow-none cursor-not-allowed'
+                          }`}
+                        >
                           应用 GPU 设置
                         </button>
                       </div>
@@ -2135,9 +2353,13 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-4xl bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+              className={`relative w-full bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col transition-all ${
+                isTaskModalExpanded
+                  ? 'max-w-7xl max-h-[calc(100vh-3rem)]'
+                  : 'max-w-4xl'
+              }`}
             >
-              <div className="px-8 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
+              <div className="shrink-0 px-8 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
                 <div>
                   <h2 className="text-lg font-bold text-slate-900 tracking-tight">{isMetadataOnlyTaskEdit ? '编辑记录信息' : taskDraft ? (isEditingTask ? '编辑任务' : '复用任务创建新任务') : '创建新运行时任务'}</h2>
                   <p className="text-xs text-slate-500 font-medium">{isMetadataOnlyTaskEdit ? `任务 #${taskDraft?.id} 的名称和备注` : taskDraft ? (isEditingTask ? `配置任务 #${taskDraft.id} 并提交更新` : `已填入任务 #${taskDraft.id} 的参数，可修改后提交`) : '配置参数并提交给调度系统'}</p>
@@ -2147,166 +2369,190 @@ export default function App() {
                 </button>
               </div>
 
-              <form key={taskDraft?.id || 'new'} onSubmit={submitTask} className="px-8 py-5 space-y-4 overflow-y-auto max-h-[80vh] custom-scrollbar">
+              <form
+                key={taskDraft?.id || 'new'}
+                onSubmit={submitTask}
+                className={`px-8 py-5 space-y-4 overflow-y-auto custom-scrollbar ${
+                  isTaskModalExpanded ? 'max-h-[calc(100vh-9rem)]' : 'max-h-[80vh]'
+                }`}
+              >
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
                   {/* Task Name */}
-	                  <div className="space-y-1.5 md:col-span-2">
-	                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">任务名称</label>
-	                      <input
+                  <div className="space-y-1.5 md:col-span-2">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">任务名称</label>
+                    <input
+                      type="text"
+                      name="name"
+                      defaultValue={taskDraft?.name || ''}
+                      placeholder="例如: llama-sft"
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+                    />
+                  </div>
+
+                  {isMetadataOnlyTaskEdit && (
+                    <div className="space-y-1.5 md:col-span-2">
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">备注说明</label>
+                      <input
                         type="text"
-                          name="name"
-                          defaultValue={taskDraft?.name || ''}
-                        placeholder="例如: llama-sft"
-	                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-	                      />
-	                  </div>
+                        name="notes"
+                        defaultValue={taskDraft?.notes || ''}
+                        placeholder="可选备注"
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+                      />
+                    </div>
+                  )}
 
-	                  {isMetadataOnlyTaskEdit && (
-	                    <div className="space-y-1.5 md:col-span-2">
-	                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">备注说明</label>
-	                      <input
-	                        type="text"
-	                        name="notes"
-	                        defaultValue={taskDraft?.notes || ''}
-	                        placeholder="可选备注"
-	                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-	                      />
-	                    </div>
-	                  )}
+                  {!isMetadataOnlyTaskEdit && (
+                    <>
+                      {/* Environment Template */}
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">环境模板</label>
+                        <select name="profile_id" defaultValue={taskDraft?.profileId ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
+                          <option value="">不使用环境模板</option>
+                          {profiles.map(profile => (
+                            <option key={profile.id} value={profile.id}>{profile.name}</option>
+                          ))}
+                        </select>
+                      </div>
 
-	                  {!isMetadataOnlyTaskEdit && (
-	                    <>
-	                      {/* Environment Template */}
-	                      <div className="space-y-1.5">
-	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">环境模板</label>
-	                          <select name="profile_id" defaultValue={taskDraft?.profileId ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
-	                            <option value="">不使用环境模板</option>
-	                              {profiles.map(profile => (
-	                                <option key={profile.id} value={profile.id}>{profile.name}</option>
-	                              ))}
-	                          </select>
-	                      </div>
+                      {/* GPU Selection */}
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">指定 GPU</label>
+                        <select name="requested_gpu" defaultValue={taskDraft?.requestedGpu ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
+                          <option value="">自动分配</option>
+                          {gpus.map(gpu => (
+                            <option key={gpu.id} value={gpu.id}>GPU {gpu.id} ({gpu.name})</option>
+                          ))}
+                        </select>
+                      </div>
 
-	                      {/* GPU Selection */}
-	                      <div className="space-y-1.5">
-	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">指定 GPU</label>
-	                          <select name="requested_gpu" defaultValue={taskDraft?.requestedGpu ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
-	                            <option value="">自动分配</option>
-	                              {gpus.map(gpu => (
-	                                <option key={gpu.id} value={gpu.id}>GPU {gpu.id} ({gpu.name})</option>
-	                              ))}
-	                          </select>
-	                      </div>
+                      {/* Queue Type */}
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">队列策略</label>
+                        <label className="flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-lg px-4 py-[7px] cursor-pointer hover:bg-slate-100 transition-all">
+                          <input type="checkbox" name="is_urgent" defaultChecked={Boolean(taskDraft?.isUrgent)} className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+                          <span className="text-sm font-semibold text-slate-600">加入紧急队列 (Priority)</span>
+                        </label>
+                      </div>
 
-	                      {/* Queue Type */}
-	                      <div className="space-y-1.5">
-	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">队列策略</label>
-	                        <div className="flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-lg px-4 py-[7px] cursor-pointer hover:bg-slate-100 transition-all">
-	                            <input type="checkbox" name="is_urgent" defaultChecked={Boolean(taskDraft?.isUrgent)} className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
-	                          <span className="text-sm font-semibold text-slate-600">加入紧急队列 (Priority)</span>
-	                        </div>
-	                      </div>
+                      {/* GPU Memory Budget */}
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">显存预算 (GB)</label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.1"
+                          name="gpu_memory_budget_gb"
+                          defaultValue={taskDraft?.gpuMemoryBudgetMb ? taskDraft.gpuMemoryBudgetMb / 1024 : ''}
+                          placeholder="不填写则使用默认空闲阈值"
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
 
-	                      {/* GPU Memory Budget */}
-	                      <div className="space-y-1.5">
-	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">显存预算 (GB)</label>
-	                        <input
-	                          type="number"
-	                          min="0"
-	                          step="0.1"
-	                          name="gpu_memory_budget_gb"
-	                          defaultValue={taskDraft?.gpuMemoryBudgetMb ? taskDraft.gpuMemoryBudgetMb / 1024 : ''}
-	                          placeholder="不填写则使用默认空闲阈值"
-	                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-	                        />
-	                      </div>
-	                    </>
-	                  )}
-	                </div>
+                {/* Dependencies */}
+                {!isMetadataOnlyTaskEdit && (
+                  <div className="space-y-1.5">
+                    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">依赖任务 (Dependencies)</label>
+                      <span className="text-[10px] text-slate-400">选择前置任务，全部成功完成后才会调度当前任务</span>
+                      <span className="text-[10px] text-slate-400">按住 Ctrl/Cmd 多选，不选则无依赖</span>
+                    </div>
+                    <select
+                      name="depends_on"
+                      multiple
+                      size={Math.min(isTaskModalExpanded ? 6 : 4, Math.max(2, dependencyCandidates.length))}
+                      disabled={dependencyCandidates.length === 0}
+                      defaultValue={taskDraft?.dependsOn?.map(String) || []}
+                      className={`w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 transition-colors ${dependencyCandidates.length === 0 ? 'text-slate-400 cursor-not-allowed' : 'text-slate-700'}`}
+                    >
+                      {dependencyCandidates.length === 0 ? (
+                        <option value="">暂无可选依赖任务</option>
+                      ) : (
+                        dependencyCandidates.map(candidate => (
+                          <option key={candidate.id} value={candidate.id}>
+                            #{candidate.id} {candidate.name} ({candidate.isMissingDependency ? '当前列表外' : taskStatusLabel(candidate.status)})
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </div>
+                )}
 
-	                {/* Dependencies */}
-		                {!isMetadataOnlyTaskEdit && (
-		                  <div className="space-y-1.5">
-		                    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-		                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">依赖任务 (Dependencies)</label>
-		                      <span className="text-[10px] text-slate-400">选择前置任务，全部成功完成后才会调度当前任务</span>
-		                      <span className="text-[10px] text-slate-400">按住 Ctrl/Cmd 多选，不选则无依赖</span>
-		                    </div>
-		                    <select
-		                      name="depends_on"
-		                      multiple
-		                      size={Math.min(4, Math.max(2, dependencyCandidates.length))}
-		                      disabled={dependencyCandidates.length === 0}
-		                      defaultValue={taskDraft?.dependsOn?.map(String) || []}
-		                      className={`w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 transition-colors ${dependencyCandidates.length === 0 ? 'text-slate-400 cursor-not-allowed' : 'text-slate-700'}`}
-		                    >
-		                      {dependencyCandidates.length === 0 ? (
-		                        <option value="">暂无可选依赖任务</option>
-		                      ) : (
-		                        dependencyCandidates.map(candidate => (
-		                          <option key={candidate.id} value={candidate.id}>
-		                            #{candidate.id} {candidate.name} ({candidate.isMissingDependency ? '当前列表外' : taskStatusLabel(candidate.status)})
-		                          </option>
-		                        ))
-		                      )}
-		                    </select>
-		                  </div>
-		                )}
+                {!isMetadataOnlyTaskEdit && (
+                  <>
+                    {/* Command */}
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">启动命令</label>
+                      <div className="relative">
+                        <textarea
+                          ref={commandTextareaRef}
+                          rows={isTaskModalExpanded ? 18 : 4}
+                          name="command"
+                          defaultValue={taskDraft?.command || ''}
+                          placeholder="python main.py --model llama --dataset sft..."
+                          required
+                          className={`w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 pr-12 text-slate-900 font-mono placeholder-slate-400 outline-none focus:border-blue-500 transition-colors ${
+                            isTaskModalExpanded
+                              ? 'min-h-[420px] text-[12px] leading-5 resize-y'
+                              : 'min-h-[96px] text-[11px] resize-none'
+                          }`}
+                          spellCheck={false}
+                        />
+                        <button
+                          type="button"
+                          onClick={toggleTaskModalExpanded}
+                          title={isTaskModalExpanded ? '还原窗口' : '放大窗口'}
+                          className="absolute right-2 top-2 z-10 rounded-md border border-slate-200 bg-white/90 p-1.5 text-slate-400 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                        >
+                          {isTaskModalExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+                        </button>
+                      </div>
+                    </div>
 
-	                {!isMetadataOnlyTaskEdit && (
-	                  <>
-	                    {/* Command */}
-	                    <div className="space-y-1.5">
-	                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">启动命令</label>
-		                        <textarea
-		                          rows={4}
-		                          name="command"
-		                          defaultValue={taskDraft?.command || ''}
-		                          placeholder="python main.py --model llama --dataset sft..."
-		                          required
-		                          className="w-full min-h-[96px] bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors resize-none"
-		                        />
-	                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+                      {/* Working Directory */}
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">工作目录</label>
+                        <input
+                          type="text"
+                          name="cwd"
+                          defaultValue={taskDraft?.workingDir || ''}
+                          placeholder="/path/to/project (可选)"
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+                        />
+                      </div>
 
-	                    <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
-	                      {/* Working Directory */}
-	                      <div className="space-y-1.5">
-	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">工作目录</label>
-	                          <input
-	                            type="text"
-	                              name="cwd"
-	                              defaultValue={taskDraft?.workingDir || ''}
-	                            placeholder="/path/to/project (可选)"
-	                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-	                          />
-	                      </div>
+                      {/* Remarks */}
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">备注说明</label>
+                        <input
+                          type="text"
+                          name="notes"
+                          defaultValue={taskDraft?.notes || ''}
+                          placeholder="可选备注"
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+                        />
+                      </div>
+                    </div>
 
-	                      {/* Remarks */}
-	                      <div className="space-y-1.5">
-	                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">备注说明</label>
-	                          <input
-	                            type="text"
-	                              name="notes"
-	                              defaultValue={taskDraft?.notes || ''}
-	                            placeholder="可选备注"
-	                            className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-	                          />
-	                      </div>
-	                    </div>
-
-	                    {/* Env Vars */}
-	                    <div className="space-y-1.5">
-	                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">独立环境变量</label>
-	                        <textarea
-	                          rows={1}
-	                            name="env"
-	                            defaultValue={envToText(taskDraft?.env)}
-	                          placeholder="WANDB_MODE=offline"
-	                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors resize-none"
-	                        />
-	                    </div>
-	                  </>
-	                )}
+                    {/* Env Vars */}
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">独立环境变量</label>
+                      <textarea
+                        rows={isTaskModalExpanded ? 3 : 1}
+                        name="env"
+                        defaultValue={envToText(taskDraft?.env)}
+                        placeholder="WANDB_MODE=offline"
+                        className={`w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-slate-900 font-mono text-[11px] placeholder-slate-400 outline-none focus:border-blue-500 transition-colors ${
+                          isTaskModalExpanded ? 'resize-y' : 'resize-none'
+                        }`}
+                      />
+                    </div>
+                  </>
+                )}
 
                 <div className="flex justify-end gap-3 pt-4 border-t border-slate-100">
                     <button
@@ -2374,6 +2620,38 @@ function StatCard({ label, value, trend, type }: { label: string, value: string,
         {value}
         {trend && <span className="text-[9px] font-bold text-emerald-500 ml-1.5 tracking-normal inline-block align-middle">{trend}</span>}
       </p>
+    </div>
+  );
+}
+
+function GpuAutoRestoreWait({ gpu, nowMs }: { gpu: GPUStatus; nowMs: number }) {
+  const requiredSeconds = gpu.autoRestoreIdleRequiredSeconds ?? 0;
+  const waitSeconds = gpu.autoRestoreIdleWaiting ? currentAutoRestoreWaitSeconds(gpu, nowMs) : 0;
+  const remainingSeconds = requiredSeconds > 0 ? Math.max(0, requiredSeconds - waitSeconds) : gpu.autoRestoreIdleRemainingSeconds;
+  const progress = requiredSeconds > 0 ? Math.min(100, (waitSeconds / requiredSeconds) * 100) : 0;
+  const statusText = gpu.autoRestoreIdleWaiting ? '还需' : '等待空闲';
+  const detailText = gpu.autoRestoreIdleWaiting
+    ? `${statusText} ${formatDurationSeconds(remainingSeconds)}`
+    : '空闲后开始计时';
+
+  return (
+    <div className="rounded-lg border border-emerald-100 bg-white/80 px-2 py-1.5 text-emerald-800">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-bold">已等待</span>
+        <span className="font-mono text-[12px] font-black tabular-nums">
+          {formatDurationSeconds(waitSeconds)}
+        </span>
+      </div>
+      <div className="mt-1 h-1 rounded-full bg-emerald-100 overflow-hidden">
+        <div
+          className="h-full rounded-full bg-emerald-500 transition-all"
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+      <div className="mt-1 flex items-center justify-between gap-2 text-[9px] font-bold text-emerald-700/80">
+        <span>{detailText}</span>
+        {requiredSeconds > 0 && <span className="font-mono tabular-nums">{formatDurationSeconds(requiredSeconds)}</span>}
+      </div>
     </div>
   );
 }
@@ -2568,7 +2846,10 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
       </div>
 
       <div className={`rounded-lg px-3 py-2 border transition-colors ${isSelected ? 'bg-slate-900/5 border-slate-200' : 'bg-slate-50/50 border-slate-100'}`}>
-	        <code className={`text-[10px] font-mono block truncate ${isSelected ? 'text-slate-800' : 'text-slate-600'}`}>
+	        <code
+	          className={`text-[10px] font-mono block whitespace-pre-wrap break-words leading-relaxed ${isSelected ? 'text-slate-800' : 'text-slate-600'}`}
+	          style={{ overflowWrap: 'anywhere' }}
+	        >
 	          {task.command}
 	        </code>
 	      </div>
@@ -2798,7 +3079,12 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
 
         {/* Middle: Command Box */}
         <div className="px-3 py-2 bg-slate-50/80 rounded-lg border border-slate-100">
-           <code className="text-[10px] font-mono text-slate-600 truncate block">{task.command}</code>
+           <code
+             className="text-[10px] font-mono text-slate-600 whitespace-pre-wrap break-words leading-relaxed block"
+             style={{ overflowWrap: 'anywhere' }}
+           >
+             {task.command}
+           </code>
         </div>
 
         {/* Bottom: Metadata Labels and Timestamps */}

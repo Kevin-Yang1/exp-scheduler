@@ -567,6 +567,35 @@ def test_disabled_gpu_auto_restores_after_continuous_idle(tmp_path):
         assert restored["allowed_gpu_ids"] is None
 
 
+def test_disabled_gpu_auto_restore_wait_status_is_reported_per_gpu(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
+    with build_client(tmp_path, provider, poll_interval_seconds=0.05) as client:
+        update = client.put(
+            "/api/scheduler/settings",
+            json={
+                "poll_interval_seconds": 0.05,
+                "gpu_idle_required_checks": 1,
+                "auto_restore_idle_gpu_seconds": 60,
+            },
+        )
+        update.raise_for_status()
+
+        disable = client.put("/api/settings", json={"allowed_gpu_ids": [1]})
+        disable.raise_for_status()
+
+        payload = client.get("/api/gpus").json()["gpus"]
+        gpu0 = next(item for item in payload if item["index"] == 0)
+        gpu1 = next(item for item in payload if item["index"] == 1)
+
+        assert gpu0["globally_enabled"] is False
+        assert gpu0["auto_restore_idle_waiting"] is True
+        assert gpu0["auto_restore_idle_required_seconds"] == 60
+        assert gpu0["auto_restore_idle_wait_seconds"] >= 0
+        assert gpu0["auto_restore_idle_remaining_seconds"] <= 60
+        assert "auto_restore_idle_since" in gpu0
+        assert "auto_restore_idle_waiting" not in gpu1
+
+
 def test_disabled_gpu_auto_restore_can_be_disabled(tmp_path):
     provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
     with build_client(tmp_path, provider, poll_interval_seconds=0.05) as client:
@@ -852,6 +881,155 @@ def test_disabling_gpu_can_requeue_running_task_to_head(tmp_path):
             first_id,
             second_id,
         ]
+
+
+def test_agent_gpu_lease_blocks_only_selected_gpu_and_release_reschedules(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        lease_response = client.post(
+            "/api/agent/gpu-leases",
+            json={
+                "owner": "codex-test",
+                "gpu_ids": [0],
+                "ttl_seconds": 60,
+                "stop_running": False,
+            },
+        )
+        lease_response.raise_for_status()
+        lease_payload = lease_response.json()
+        lease_id = lease_payload["lease"]["id"]
+        assert lease_payload["settings"]["allowed_gpu_ids"] is None
+        assert lease_payload["settings"]["effective_allowed_gpu_ids"] == [1]
+        assert lease_payload["settings"]["leased_gpu_ids"] == [0]
+
+        gpu_payload = client.get("/api/gpus").json()["gpus"]
+        by_gpu = {item["index"]: item for item in gpu_payload}
+        assert by_gpu[0]["globally_enabled"] is False
+        assert by_gpu[0]["leased_by_agent"] is True
+        assert by_gpu[1]["globally_enabled"] is True
+
+        gpu0_task = create_task(
+            client,
+            command("print('gpu0 after release')"),
+            name="gpu0-task",
+            requested_gpu=0,
+        )
+        gpu1_task = create_task(
+            client,
+            command("print('gpu1 while leased')"),
+            name="gpu1-task",
+            requested_gpu=1,
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == gpu1_task and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+        queued_ids = [task["id"] for task in client.get("/api/tasks").json()["queued"]]
+        assert gpu0_task in queued_ids
+
+        release = client.delete(f"/api/agent/gpu-leases/{lease_id}")
+        release.raise_for_status()
+        assert release.json()["settings"]["leased_gpu_ids"] == []
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == gpu0_task and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+
+
+def test_agent_gpu_lease_ttl_expires_without_manual_release(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        lease_response = client.post(
+            "/api/agent/gpu-leases",
+            json={
+                "owner": "codex-test",
+                "gpu_ids": [0],
+                "ttl_seconds": 0.2,
+            },
+        )
+        lease_response.raise_for_status()
+        lease_id = lease_response.json()["lease"]["id"]
+        assert lease_response.json()["settings"]["leased_gpu_ids"] == [0]
+
+        def lease_expired_settings():
+            payload = client.get("/api/settings").json()
+            return payload if payload["leased_gpu_ids"] == [] else None
+
+        settings = wait_for(
+            lease_expired_settings,
+            timeout=3,
+        )
+        assert settings["effective_allowed_gpu_ids"] is None
+
+        active_leases = client.get("/api/agent/gpu-leases")
+        active_leases.raise_for_status()
+        assert active_leases.json()["leases"] == []
+
+        all_leases = client.get("/api/agent/gpu-leases?include_inactive=true")
+        all_leases.raise_for_status()
+        expired = next(lease for lease in all_leases.json()["leases"] if lease["id"] == lease_id)
+        assert expired["status"] == "expired"
+
+
+def test_agent_gpu_lease_stop_running_only_interrupts_matching_gpu(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True), gpu(1, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        gpu0_task = create_task(
+            client,
+            command("import time; print('gpu0 running'); time.sleep(30)"),
+            name="gpu0-running",
+            requested_gpu=0,
+        )
+        gpu1_task = create_task(
+            client,
+            command("import time; print('gpu1 running'); time.sleep(30)"),
+            name="gpu1-running",
+            requested_gpu=1,
+        )
+
+        def both_tasks_running():
+            payload = client.get("/api/tasks").json()
+            running_ids = {task["id"] for task in payload["running"]}
+            return payload["running"] if running_ids == {gpu0_task, gpu1_task} else None
+
+        wait_for(
+            both_tasks_running,
+            timeout=5,
+        )
+
+        lease_response = client.post(
+            "/api/agent/gpu-leases",
+            json={
+                "owner": "codex-test",
+                "gpu_ids": [0],
+                "ttl_seconds": 60,
+                "stop_running": True,
+            },
+        )
+        lease_response.raise_for_status()
+        assert lease_response.json()["interrupted"] == 1
+
+        def only_gpu1_running():
+            payload = client.get("/api/tasks").json()
+            running_ids = {task["id"] for task in payload["running"]}
+            return payload if running_ids == {gpu1_task} else None
+
+        queue_payload = wait_for(
+            only_gpu1_running,
+            timeout=8,
+        )
+        assert [task["id"] for task in queue_payload["running"]] == [gpu1_task]
+        assert gpu0_task in [task["id"] for task in queue_payload["queued"]]
 
 
 def test_preempt_running_task_runs_urgent_queue_first_and_requeues_to_normal_head(tmp_path):

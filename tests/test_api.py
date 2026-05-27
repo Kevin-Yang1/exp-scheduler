@@ -815,6 +815,50 @@ def test_history_tasks_can_sort_by_started_at(tmp_path):
         assert invalid.status_code == 400
 
 
+def test_tasks_endpoint_counts_full_history_and_supports_history_limit(tmp_path):
+    with make_client(tmp_path) as client:
+        db = client.app.state.scheduler.database
+        for index in range(105):
+            task = db.create_task(
+                name=f"history-{index}",
+                command=command(f"print({index})"),
+                cwd=None,
+                env={},
+                notes=None,
+            )
+            db.finish_task(
+                task_id=task["id"],
+                status="failed" if index < 3 else "succeeded",
+                exit_code=1 if index < 3 else 0,
+            )
+
+        default = client.get("/api/tasks")
+        default.raise_for_status()
+        default_payload = default.json()
+        assert len(default_payload["history"]) == 100
+        assert default_payload["counts"]["history"] == 105
+        assert default_payload["counts"]["total"] == 105
+        assert default_payload["counts"]["failed"] == 3
+        assert default_payload["counts"]["succeeded"] == 102
+
+        expanded = client.get("/api/tasks", params={"history_limit": 150})
+        expanded.raise_for_status()
+        assert len(expanded.json()["history"]) == 105
+
+        failed_only = client.get(
+            "/api/tasks",
+            params={"history_status": "failed"},
+        )
+        failed_only.raise_for_status()
+        failed_payload = failed_only.json()
+        assert len(failed_payload["history"]) == 3
+        assert failed_payload["counts"]["history"] == 105
+        assert failed_payload["counts"]["history_filtered"] == 3
+
+        invalid = client.get("/api/tasks", params={"history_status": "queued"})
+        assert invalid.status_code == 400
+
+
 def test_activity_logs_endpoint_records_task_details_and_filters(tmp_path):
     with make_client(tmp_path) as client:
         original_command = command("print('activity')")

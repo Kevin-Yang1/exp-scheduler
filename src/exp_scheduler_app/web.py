@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from collections.abc import Iterable
 from pathlib import Path
 import asyncio
 import base64
 import json
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
@@ -22,6 +24,14 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 def sse_message(event_name: str, payload: dict[str, object]) -> str:
     return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _cancel_pending_tasks(pending: Iterable[asyncio.Task[Any]]) -> None:
+    tasks = list(pending)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class CreateTaskRequest(BaseModel):
@@ -89,6 +99,14 @@ class PauseQueueRequest(BaseModel):
 class ScheduleGpuRequest(BaseModel):
     action: str
     run_at: str
+
+
+class CreateAgentGpuLeaseRequest(BaseModel):
+    owner: str = Field(min_length=1)
+    gpu_ids: list[int] = Field(default_factory=list)
+    ttl_seconds: float | None = Field(default=3600, gt=0)
+    stop_running: bool = False
+    notes: str | None = None
 
 
 class ResizeTerminalRequest(BaseModel):
@@ -160,10 +178,25 @@ def create_app(
     @app.get("/api/tasks")
     async def list_tasks(
         history_sort: str = Query(default="finished_at"),
+        history_limit: int = Query(default=100, ge=1),
+        history_offset: int = Query(default=0, ge=0),
+        history_status: str | None = Query(default=None),
     ) -> dict[str, object]:
         if history_sort not in {"finished_at", "started_at"}:
             raise HTTPException(status_code=400, detail="历史排序字段无效")
-        result = await scheduler.list_tasks(history_sort=history_sort)
+        if history_status is not None and history_status not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+            "interrupted",
+        }:
+            raise HTTPException(status_code=400, detail="历史状态无效")
+        result = await scheduler.list_tasks(
+            history_limit=history_limit,
+            history_offset=history_offset,
+            history_sort=history_sort,
+            history_status=history_status,
+        )
         for key in ("queued", "urgent_queued", "running", "history"):
             for task in result.get(key, []):
                 add_dependency_payload(task)
@@ -394,6 +427,40 @@ def create_app(
     async def get_settings_endpoint() -> dict[str, object]:
         return await scheduler.get_settings()
 
+    @app.get("/api/agent/gpu-leases")
+    async def list_agent_gpu_leases_endpoint(
+        include_inactive: bool = Query(default=False),
+    ) -> dict[str, object]:
+        return {
+            "leases": await scheduler.list_agent_gpu_leases(
+                include_inactive=include_inactive,
+            )
+        }
+
+    @app.post("/api/agent/gpu-leases")
+    async def create_agent_gpu_lease_endpoint(
+        payload: CreateAgentGpuLeaseRequest,
+    ) -> dict[str, object]:
+        try:
+            return await scheduler.create_agent_gpu_lease(
+                owner=payload.owner,
+                gpu_ids=payload.gpu_ids,
+                ttl_seconds=payload.ttl_seconds,
+                stop_running=payload.stop_running,
+                notes=payload.notes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/agent/gpu-leases/{lease_id}")
+    async def release_agent_gpu_lease_endpoint(lease_id: str) -> dict[str, object]:
+        try:
+            return await scheduler.release_agent_gpu_lease(lease_id)
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "不存在" in message else 400
+            raise HTTPException(status_code=status_code, detail=message) from exc
+
     @app.put("/api/settings")
     async def update_settings_endpoint(payload: UpdateSettingsRequest) -> dict[str, object]:
         try:
@@ -545,8 +612,7 @@ def create_app(
                         timeout=15,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    for pending_task in pending:
-                        pending_task.cancel()
+                    await _cancel_pending_tasks(pending)
                     if not done:
                         yield sse_message("heartbeat", {"task_id": task_id})
                         continue
@@ -612,8 +678,7 @@ def create_app(
                         timeout=15,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
-                    for pending_task in pending:
-                        pending_task.cancel()
+                    await _cancel_pending_tasks(pending)
                     if not done:
                         yield sse_message("heartbeat", {"source": "nvitop"})
                         continue

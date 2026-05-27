@@ -151,6 +151,25 @@ class Database:
                 """
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_gpu_leases (
+                    id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    gpu_ids TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    released_at TEXT,
+                    notes TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_gpu_leases_active
+                ON agent_gpu_leases(released_at, expires_at)
+                """
+            )
+            conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('queue_paused', '0')"
             )
             conn.commit()
@@ -439,7 +458,9 @@ class Database:
     def list_tasks(
         self,
         history_limit: int = 100,
+        history_offset: int = 0,
         history_sort: str = "finished_at",
+        history_status: str | None = None,
     ) -> dict[str, object]:
         if history_sort == "finished_at":
             history_order = "COALESCE(finished_at, created_at) DESC, id DESC"
@@ -447,6 +468,18 @@ class Database:
             history_order = "COALESCE(started_at, created_at) DESC, id DESC"
         else:
             raise ValueError("历史排序字段无效")
+
+        valid_history_statuses = {"succeeded", "failed", "cancelled", "interrupted"}
+        if history_status is not None and history_status not in valid_history_statuses:
+            raise ValueError("历史状态无效")
+
+        safe_history_limit = max(1, int(history_limit))
+        safe_history_offset = max(0, int(history_offset))
+        history_where = "status NOT IN ('queued', 'running')"
+        history_params: list[object] = []
+        if history_status is not None:
+            history_where = "status = ?"
+            history_params.append(history_status)
 
         with self._lock, self._connect() as conn:
             queued = conn.execute(
@@ -471,21 +504,78 @@ class Database:
             history = conn.execute(
                 f"""
                 SELECT * FROM tasks
-                WHERE status NOT IN ('queued', 'running')
+                WHERE {history_where}
                 ORDER BY {history_order}
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (history_limit,),
+                (*history_params, safe_history_limit, safe_history_offset),
             ).fetchall()
+            status_count_rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM tasks
+                GROUP BY status
+                """
+            ).fetchall()
+            queued_count_rows = conn.execute(
+                """
+                SELECT queue_name, COUNT(*) AS count
+                FROM tasks
+                WHERE status = 'queued'
+                GROUP BY queue_name
+                """
+            ).fetchall()
+            history_filtered_count = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM tasks
+                WHERE {history_where}
+                """,
+                tuple(history_params),
+            ).fetchone()
             paused_value = conn.execute(
                 "SELECT value FROM meta WHERE key = 'queue_paused'"
             ).fetchone()
+        status_counts = {
+            str(row["status"]): int(row["count"])
+            for row in status_count_rows
+        }
+        queued_counts = {
+            str(row["queue_name"] or NORMAL_QUEUE): int(row["count"])
+            for row in queued_count_rows
+        }
+        normal_queued_count = queued_counts.get(NORMAL_QUEUE, 0)
+        urgent_queued_count = queued_counts.get(URGENT_QUEUE, 0)
+        running_count = status_counts.get("running", 0)
+        history_count = sum(
+            count
+            for status, count in status_counts.items()
+            if status not in {"queued", "running"}
+        )
+        total_count = sum(status_counts.values())
+        filtered_count = (
+            int(history_filtered_count["count"]) if history_filtered_count else 0
+        )
         return {
             "queued": [self._row_to_task(row) for row in queued],
             "urgent_queued": [self._row_to_task(row) for row in urgent_queued],
             "running": [self._row_to_task(row) for row in running],
             "history": [self._row_to_task(row) for row in history],
             "queue_paused": paused_value is not None and paused_value["value"] == "1",
+            "history_limit": safe_history_limit,
+            "history_offset": safe_history_offset,
+            "counts": {
+                "queued": normal_queued_count,
+                "urgent_queued": urgent_queued_count,
+                "running": running_count,
+                "history": history_count,
+                "history_filtered": filtered_count,
+                "total": total_count,
+                "succeeded": status_counts.get("succeeded", 0),
+                "failed": status_counts.get("failed", 0),
+                "cancelled": status_counts.get("cancelled", 0),
+                "interrupted": status_counts.get("interrupted", 0),
+            },
         }
 
     def list_queued_tasks(self) -> list[dict[str, object]]:
@@ -804,6 +894,95 @@ class Database:
                 )
             conn.commit()
         return allowed_gpu_ids
+
+    def create_agent_gpu_lease(
+        self,
+        *,
+        lease_id: str,
+        owner: str,
+        gpu_ids: list[int],
+        expires_at: str | None,
+        notes: str | None,
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_gpu_leases(
+                    id, owner, gpu_ids, created_at, expires_at, released_at, notes
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (lease_id, owner, json.dumps(gpu_ids), now, expires_at, notes),
+            )
+            conn.commit()
+        lease = self.get_agent_gpu_lease(lease_id)
+        if lease is None:
+            raise ValueError(f"GPU lease 不存在: {lease_id}")
+        return lease
+
+    def get_agent_gpu_lease(self, lease_id: str) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_gpu_leases WHERE id = ?",
+                (lease_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_agent_gpu_lease(row)
+
+    def list_agent_gpu_leases(
+        self,
+        *,
+        include_inactive: bool = False,
+        now_iso: str | None = None,
+    ) -> list[dict[str, object]]:
+        now = now_iso or utc_now_iso()
+        with self._lock, self._connect() as conn:
+            if include_inactive:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM agent_gpu_leases
+                    ORDER BY created_at DESC, id DESC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM agent_gpu_leases
+                    WHERE released_at IS NULL
+                      AND (expires_at IS NULL OR expires_at > ?)
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (now,),
+                ).fetchall()
+        return [self._row_to_agent_gpu_lease(row, now_iso=now) for row in rows]
+
+    def release_agent_gpu_lease(self, lease_id: str) -> dict[str, object] | None:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_gpu_leases WHERE id = ?",
+                (lease_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["released_at"] is None:
+                conn.execute(
+                    """
+                    UPDATE agent_gpu_leases
+                    SET released_at = ?
+                    WHERE id = ? AND released_at IS NULL
+                    """,
+                    (now, lease_id),
+                )
+                conn.commit()
+            row = conn.execute(
+                "SELECT * FROM agent_gpu_leases WHERE id = ?",
+                (lease_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_agent_gpu_lease(row, now_iso=now)
 
 
     def get_gpu_schedule(self) -> dict[str, dict[str, str | int]]:
@@ -1418,6 +1597,49 @@ class Database:
             "title": row["title"],
             "detail": row["detail"],
             "metadata": metadata,
+        }
+
+    def _row_to_agent_gpu_lease(
+        self,
+        row: sqlite3.Row,
+        *,
+        now_iso: str | None = None,
+    ) -> dict[str, object]:
+        try:
+            gpu_ids = json.loads(row["gpu_ids"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            gpu_ids = []
+        if not isinstance(gpu_ids, list):
+            gpu_ids = []
+        normalized_gpu_ids: list[int] = []
+        seen_gpu_ids: set[int] = set()
+        for gpu_id in gpu_ids:
+            try:
+                value = int(gpu_id)
+            except (TypeError, ValueError):
+                continue
+            if value in seen_gpu_ids:
+                continue
+            seen_gpu_ids.add(value)
+            normalized_gpu_ids.append(value)
+        normalized_gpu_ids.sort()
+        status = "active"
+        released_at = row["released_at"]
+        expires_at = row["expires_at"]
+        now = now_iso or utc_now_iso()
+        if released_at is not None:
+            status = "released"
+        elif expires_at is not None and expires_at <= now:
+            status = "expired"
+        return {
+            "id": row["id"],
+            "owner": row["owner"],
+            "gpu_ids": normalized_gpu_ids,
+            "created_at": row["created_at"],
+            "expires_at": expires_at,
+            "released_at": released_at,
+            "notes": row["notes"],
+            "status": status,
         }
 
     # ── task dependencies ──────────────────────────────────────────

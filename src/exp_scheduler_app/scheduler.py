@@ -14,6 +14,7 @@ import subprocess
 import sys
 import traceback
 from typing import Callable
+from uuid import uuid4
 
 from .config import SchedulerConfig
 from .database import Database, NORMAL_QUEUE, URGENT_QUEUE
@@ -146,8 +147,20 @@ class SchedulerService:
         )
         await self.events.publish("service_stopped", {})
 
-    async def list_tasks(self, *, history_sort: str = "finished_at") -> dict[str, object]:
-        payload = self.database.list_tasks(history_sort=history_sort)
+    async def list_tasks(
+        self,
+        *,
+        history_limit: int = 100,
+        history_offset: int = 0,
+        history_sort: str = "finished_at",
+        history_status: str | None = None,
+    ) -> dict[str, object]:
+        payload = self.database.list_tasks(
+            history_limit=history_limit,
+            history_offset=history_offset,
+            history_sort=history_sort,
+            history_status=history_status,
+        )
         for task in payload.get("history", []):
             if isinstance(task, dict):
                 task["attempt_logs"] = self._list_task_log_entries(task)
@@ -156,8 +169,9 @@ class SchedulerService:
     async def list_gpus(self) -> list[dict[str, object]]:
         await self._apply_due_gpu_schedule()
         if self._last_gpu_payload:
-            return self._last_gpu_payload
-        return await self._refresh_gpu_payload()
+            return self._gpu_payload_with_auto_restore_status(self._last_gpu_payload)
+        payload = await self._refresh_gpu_payload()
+        return self._gpu_payload_with_auto_restore_status(payload)
 
     async def list_operation_logs(
         self,
@@ -671,13 +685,100 @@ class SchedulerService:
 
     async def get_settings(self) -> dict[str, object]:
         await self._apply_due_gpu_schedule()
+        active_leases = self._active_agent_gpu_leases()
+        leased_gpu_ids = self._leased_gpu_ids(active_leases)
+        known_gpu_ids = await self._known_gpu_ids()
         return {
             "allowed_gpu_ids": self.database.get_allowed_gpu_ids(),
+            "effective_allowed_gpu_ids": self._effective_allowed_gpu_ids(
+                known_gpu_ids=known_gpu_ids,
+                active_leases=active_leases,
+            ),
+            "leased_gpu_ids": sorted(leased_gpu_ids),
+            "agent_gpu_leases": active_leases,
             "gpu_schedule": self.database.get_gpu_schedule(),
         }
 
     async def get_scheduler_settings(self) -> dict[str, object]:
         return self._scheduler_settings_payload()
+
+    async def list_agent_gpu_leases(
+        self,
+        *,
+        include_inactive: bool = False,
+    ) -> list[dict[str, object]]:
+        return self.database.list_agent_gpu_leases(include_inactive=include_inactive)
+
+    async def create_agent_gpu_lease(
+        self,
+        *,
+        owner: str,
+        gpu_ids: list[int],
+        ttl_seconds: float | None,
+        stop_running: bool,
+        notes: str | None,
+    ) -> dict[str, object]:
+        normalized_owner = owner.strip()
+        if not normalized_owner:
+            raise ValueError("lease owner 不能为空")
+        normalized_gpu_ids = await self._normalize_allowed_gpu_ids(gpu_ids)
+        if not normalized_gpu_ids:
+            raise ValueError("至少需要指定一个 GPU")
+        expires_at = self._lease_expires_at(ttl_seconds)
+        lease = self.database.create_agent_gpu_lease(
+            lease_id=uuid4().hex,
+            owner=normalized_owner,
+            gpu_ids=normalized_gpu_ids,
+            expires_at=expires_at,
+            notes=notes.strip() if isinstance(notes, str) and notes.strip() else None,
+        )
+        self._last_gpu_payload = []
+        interrupted = 0
+        if stop_running:
+            interrupted = await self.interrupt_running_tasks_to_queue_head(
+                gpu_ids=set(normalized_gpu_ids),
+            )
+        await self._trigger_immediate_schedule()
+        settings = await self.get_settings()
+        await self._record_operation(
+            level="warning" if interrupted else "info",
+            action="agent_gpu_lease_created",
+            entity_type="gpu_lease",
+            title=f"Agent GPU lease 已创建: {lease['id']}",
+            detail=(
+                f"{normalized_owner} 临时占用 GPU {normalized_gpu_ids}，"
+                f"中断并回队列任务数: {interrupted}。"
+            ),
+            metadata={
+                "lease": lease,
+                "interrupted": interrupted,
+                "settings": settings,
+            },
+        )
+        await self.events.publish(
+            "agent_gpu_lease_created",
+            {"lease": lease, "interrupted": interrupted},
+        )
+        await self.events.publish("settings_updated", settings)
+        return {"lease": lease, "interrupted": interrupted, "settings": settings}
+
+    async def release_agent_gpu_lease(self, lease_id: str) -> dict[str, object]:
+        lease = self.database.release_agent_gpu_lease(lease_id)
+        if lease is None:
+            raise ValueError(f"GPU lease 不存在: {lease_id}")
+        self._last_gpu_payload = []
+        await self._trigger_immediate_schedule()
+        settings = await self.get_settings()
+        await self._record_operation(
+            level="success",
+            action="agent_gpu_lease_released",
+            entity_type="gpu_lease",
+            title=f"Agent GPU lease 已释放: {lease['id']}",
+            metadata={"lease": lease, "settings": settings},
+        )
+        await self.events.publish("agent_gpu_lease_released", {"lease": lease})
+        await self.events.publish("settings_updated", settings)
+        return {"lease": lease, "settings": settings}
 
     async def update_scheduler_settings(
         self,
@@ -739,6 +840,7 @@ class SchedulerService:
         if stop_running_gpu_ids:
             normalized_stop_gpu_ids = await self._normalize_gpu_id_set(stop_running_gpu_ids)
         self.database.set_allowed_gpu_ids(normalized_allowed_gpu_ids)
+        self._last_gpu_payload = []
         await self.events.publish(
             "settings_updated",
             {
@@ -1077,36 +1179,26 @@ class SchedulerService:
         gpu_payload: list[dict[str, object]],
     ) -> list[int]:
         restore_after_seconds = self.config.auto_restore_idle_gpu_seconds
-        if restore_after_seconds is None or restore_after_seconds <= 0:
-            self._disabled_gpu_idle_since.clear()
-            return []
-        known_gpu_ids = {int(gpu["index"]) for gpu in gpu_payload}
-        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
-        if allowed_gpu_ids is None:
-            self._disabled_gpu_idle_since.clear()
-            return []
-        enabled_gpu_ids = {gpu_id for gpu_id in allowed_gpu_ids if gpu_id in known_gpu_ids}
-        disabled_gpu_ids = known_gpu_ids - enabled_gpu_ids
+        now = datetime.now(UTC)
+        disabled_gpu_ids = self._sync_auto_restore_idle_tracking(gpu_payload, now=now)
         if not disabled_gpu_ids:
-            self._disabled_gpu_idle_since.clear()
             return []
 
-        now = datetime.now(UTC)
+        known_gpu_ids = {int(gpu["index"]) for gpu in gpu_payload}
+        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
+        enabled_gpu_ids = {gpu_id for gpu_id in (allowed_gpu_ids or []) if gpu_id in known_gpu_ids}
+        leased_gpu_ids = self._leased_gpu_ids() & known_gpu_ids
         restored_gpu_ids: list[int] = []
         for gpu in gpu_payload:
             gpu_id = int(gpu["index"])
-            if gpu_id not in disabled_gpu_ids:
+            if gpu_id not in disabled_gpu_ids or gpu_id in leased_gpu_ids:
                 continue
-            if self._is_gpu_physically_idle(gpu):
-                idle_since = self._disabled_gpu_idle_since.setdefault(gpu_id, now)
-                idle_seconds = (now - idle_since).total_seconds()
-                if idle_seconds >= restore_after_seconds:
-                    restored_gpu_ids.append(gpu_id)
-            else:
-                self._disabled_gpu_idle_since.pop(gpu_id, None)
-
-        for gpu_id in set(self._disabled_gpu_idle_since) - disabled_gpu_ids:
-            self._disabled_gpu_idle_since.pop(gpu_id, None)
+            idle_since = self._disabled_gpu_idle_since.get(gpu_id)
+            if idle_since is None:
+                continue
+            idle_seconds = (now - idle_since).total_seconds()
+            if idle_seconds >= float(restore_after_seconds):
+                restored_gpu_ids.append(gpu_id)
 
         if not restored_gpu_ids:
             return []
@@ -1151,8 +1243,13 @@ class SchedulerService:
         self._prune_external_kill_gpu_cooldowns(now=now)
         gpus = await asyncio.to_thread(self._gpu_provider)
         occupied = {handle.gpu_id for handle in self._running.values()}
-        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
-        allowed_gpu_set = set(allowed_gpu_ids) if allowed_gpu_ids is not None else None
+        known_gpu_ids = {gpu.index for gpu in gpus}
+        active_leases = self._active_agent_gpu_leases()
+        leases_by_gpu = self._agent_leases_by_gpu(active_leases)
+        allowed_gpu_set = self._effective_allowed_gpu_set(
+            known_gpu_ids=known_gpu_ids,
+            active_leases=active_leases,
+        )
         payload: list[dict[str, object]] = []
         for gpu in gpus:
             entry = gpu.to_dict(
@@ -1160,6 +1257,20 @@ class SchedulerService:
                 scheduler_occupied=gpu.index in occupied,
                 globally_enabled=allowed_gpu_set is None or gpu.index in allowed_gpu_set,
             )
+            gpu_leases = leases_by_gpu.get(gpu.index, [])
+            if gpu_leases:
+                entry["leased_by_agent"] = True
+                entry["agent_leases"] = [
+                    {
+                        "id": lease["id"],
+                        "owner": lease["owner"],
+                        "expires_at": lease["expires_at"],
+                    }
+                    for lease in gpu_leases
+                ]
+            else:
+                entry["leased_by_agent"] = False
+                entry["agent_leases"] = []
             cooldown_until = self._gpu_external_kill_cooldown_until(
                 gpu.index,
                 now=now,
@@ -1174,10 +1285,103 @@ class SchedulerService:
                 entry["cooldown_remaining_seconds"] = remaining_seconds
                 entry["cooldown_reason"] = "external_signal"
             payload.append(entry)
+        self._sync_auto_restore_idle_tracking(payload, now=now)
+        self._add_auto_restore_idle_status(payload, now=now, include_elapsed=False)
         if payload != self._last_gpu_payload:
             self._last_gpu_payload = payload
             await self.events.publish("gpu_updated", {"gpus": payload})
         return payload
+
+    def _sync_auto_restore_idle_tracking(
+        self,
+        gpu_payload: list[dict[str, object]],
+        *,
+        now: datetime,
+    ) -> set[int]:
+        restore_after_seconds = self.config.auto_restore_idle_gpu_seconds
+        if restore_after_seconds is None or restore_after_seconds <= 0:
+            self._disabled_gpu_idle_since.clear()
+            return set()
+        known_gpu_ids = {int(gpu["index"]) for gpu in gpu_payload}
+        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
+        if allowed_gpu_ids is None:
+            self._disabled_gpu_idle_since.clear()
+            return set()
+        enabled_gpu_ids = {gpu_id for gpu_id in allowed_gpu_ids if gpu_id in known_gpu_ids}
+        leased_gpu_ids = self._leased_gpu_ids() & known_gpu_ids
+        disabled_gpu_ids = (known_gpu_ids - enabled_gpu_ids) - leased_gpu_ids
+        if not disabled_gpu_ids:
+            self._disabled_gpu_idle_since.clear()
+            return set()
+
+        for gpu in gpu_payload:
+            gpu_id = int(gpu["index"])
+            if gpu_id not in disabled_gpu_ids:
+                continue
+            if self._is_gpu_physically_idle(gpu):
+                self._disabled_gpu_idle_since.setdefault(gpu_id, now)
+            else:
+                self._disabled_gpu_idle_since.pop(gpu_id, None)
+
+        for gpu_id in set(self._disabled_gpu_idle_since) - disabled_gpu_ids:
+            self._disabled_gpu_idle_since.pop(gpu_id, None)
+        return disabled_gpu_ids
+
+    def _gpu_payload_with_auto_restore_status(
+        self,
+        gpu_payload: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        now = datetime.now(UTC)
+        payload = [
+            {
+                key: value
+                for key, value in gpu.items()
+                if not str(key).startswith("auto_restore_idle_")
+            }
+            for gpu in gpu_payload
+        ]
+        self._sync_auto_restore_idle_tracking(payload, now=now)
+        self._add_auto_restore_idle_status(payload, now=now, include_elapsed=True)
+        return payload
+
+    def _add_auto_restore_idle_status(
+        self,
+        gpu_payload: list[dict[str, object]],
+        *,
+        now: datetime,
+        include_elapsed: bool,
+    ) -> None:
+        restore_after_seconds = self.config.auto_restore_idle_gpu_seconds
+        if restore_after_seconds is None or restore_after_seconds <= 0:
+            return
+        known_gpu_ids = {int(gpu["index"]) for gpu in gpu_payload}
+        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
+        if allowed_gpu_ids is None:
+            return
+        enabled_gpu_ids = {gpu_id for gpu_id in allowed_gpu_ids if gpu_id in known_gpu_ids}
+        leased_gpu_ids = self._leased_gpu_ids() & known_gpu_ids
+        disabled_gpu_ids = (known_gpu_ids - enabled_gpu_ids) - leased_gpu_ids
+        for gpu in gpu_payload:
+            gpu_id = int(gpu["index"])
+            if gpu_id not in disabled_gpu_ids:
+                continue
+            gpu["auto_restore_idle_required_seconds"] = float(restore_after_seconds)
+            idle_since = self._disabled_gpu_idle_since.get(gpu_id)
+            is_waiting = idle_since is not None and self._is_gpu_physically_idle(gpu)
+            gpu["auto_restore_idle_waiting"] = is_waiting
+            if not is_waiting:
+                if include_elapsed:
+                    gpu["auto_restore_idle_wait_seconds"] = 0.0
+                    gpu["auto_restore_idle_remaining_seconds"] = float(restore_after_seconds)
+                continue
+            idle_seconds = max(0.0, (now - idle_since).total_seconds())
+            gpu["auto_restore_idle_since"] = idle_since.isoformat()
+            if include_elapsed:
+                gpu["auto_restore_idle_wait_seconds"] = idle_seconds
+                gpu["auto_restore_idle_remaining_seconds"] = max(
+                    0.0,
+                    float(restore_after_seconds) - idle_seconds,
+                )
 
     async def _launch_task(
         self,
@@ -1990,6 +2194,82 @@ class SchedulerService:
             datetime.now(UTC)
             + timedelta(seconds=max(0, self.config.auto_retry_delay_seconds))
         ).isoformat()
+
+    def _lease_expires_at(self, ttl_seconds: float | None) -> str | None:
+        if ttl_seconds is None:
+            return None
+        try:
+            seconds = float(ttl_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("lease TTL 必须是秒数") from exc
+        if seconds <= 0 or not seconds < float("inf"):
+            raise ValueError("lease TTL 必须大于 0")
+        return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat()
+
+    def _active_agent_gpu_leases(self) -> list[dict[str, object]]:
+        return self.database.list_agent_gpu_leases(include_inactive=False)
+
+    def _leased_gpu_ids(
+        self,
+        leases: list[dict[str, object]] | None = None,
+    ) -> set[int]:
+        active_leases = leases if leases is not None else self._active_agent_gpu_leases()
+        leased: set[int] = set()
+        for lease in active_leases:
+            gpu_ids = lease.get("gpu_ids")
+            if not isinstance(gpu_ids, list):
+                continue
+            for gpu_id in gpu_ids:
+                try:
+                    leased.add(int(gpu_id))
+                except (TypeError, ValueError):
+                    continue
+        return leased
+
+    def _agent_leases_by_gpu(
+        self,
+        leases: list[dict[str, object]],
+    ) -> dict[int, list[dict[str, object]]]:
+        by_gpu: dict[int, list[dict[str, object]]] = {}
+        for lease in leases:
+            gpu_ids = lease.get("gpu_ids")
+            if not isinstance(gpu_ids, list):
+                continue
+            for gpu_id in gpu_ids:
+                try:
+                    by_gpu.setdefault(int(gpu_id), []).append(lease)
+                except (TypeError, ValueError):
+                    continue
+        return by_gpu
+
+    def _effective_allowed_gpu_set(
+        self,
+        *,
+        known_gpu_ids: set[int],
+        active_leases: list[dict[str, object]] | None = None,
+    ) -> set[int] | None:
+        allowed_gpu_ids = self.database.get_allowed_gpu_ids()
+        leased_gpu_ids = self._leased_gpu_ids(active_leases) & known_gpu_ids
+        if allowed_gpu_ids is None:
+            if not leased_gpu_ids:
+                return None
+            return set(known_gpu_ids) - leased_gpu_ids
+        enabled_gpu_ids = {gpu_id for gpu_id in allowed_gpu_ids if gpu_id in known_gpu_ids}
+        return enabled_gpu_ids - leased_gpu_ids
+
+    def _effective_allowed_gpu_ids(
+        self,
+        *,
+        known_gpu_ids: set[int],
+        active_leases: list[dict[str, object]] | None = None,
+    ) -> list[int] | None:
+        allowed_gpu_set = self._effective_allowed_gpu_set(
+            known_gpu_ids=known_gpu_ids,
+            active_leases=active_leases,
+        )
+        if allowed_gpu_set is None:
+            return None
+        return sorted(allowed_gpu_set)
 
     async def _normalize_gpu_id(self, gpu_id: int) -> int:
         value = int(gpu_id)
