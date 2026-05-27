@@ -1,0 +1,4 @@
+interface:
+  display_name: "Exp Scheduler Control"
+  short_description: "Manage exp-scheduler tasks and GPU leases"
+  default_prompt: "Use $exp-scheduler-gpu-lease to add an urgent exp-scheduler task, inspect the queue, and reorder it if needed."

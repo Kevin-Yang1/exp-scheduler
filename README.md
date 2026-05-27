@@ -432,6 +432,49 @@ http://127.0.0.1:17861
 
 GPU 页面可以控制哪些 GPU 参与调度，也可以给单张 GPU 设置定时开启或关闭。“调控器”页面可以实时调整检测间隔、连续满足次数，以及 OOM / CUDA 资源类错误自动重试策略。监控页面会在内嵌终端中运行 `nvitop`。
 
+## Agent 接口与 Codex skill
+
+当另一个 agent 需要临时使用某张 GPU 跑测试时，用 lease 接口摘掉指定 GPU，而不是暂停整个队列。其他 GPU 上的任务会继续运行。
+
+```bash
+curl -X POST http://127.0.0.1:17861/api/agent/gpu-leases \
+  -H 'Content-Type: application/json' \
+  -d '{"owner":"codex-test","gpu_ids":[2],"ttl_seconds":3600,"stop_running":true}'
+```
+
+返回里的 `lease.id` 用于释放：
+
+```bash
+curl -X DELETE http://127.0.0.1:17861/api/agent/gpu-leases/<lease_id>
+```
+
+`stop_running: true` 会把指定 GPU 上由调度器启动的运行中任务中断并放回队首；它不是进程级暂停恢复。lease 不会改写用户设置的全局白名单，调度器会按“用户白名单减去活跃 lease”计算有效可调度 GPU，并且空闲自动恢复不会抢回被 lease 占用的 GPU。
+
+仓库里同时保存了一份 Codex skill，便于同步到其他设备。这个 skill 除了 GPU lease，也提供任务管理包装命令，例如 `task-create`、`task-update`、`task-list`、`task-reorder`、`task-delete`、`task-cancel`、`task-requeue` 和 `profile-list`：
+
+```text
+tools/exp-scheduler/skills/exp-scheduler-gpu-lease/
+```
+
+推荐用软链接安装到当前用户的 Codex skills 目录，这样仓库更新后 skill 会同步生效：
+
+```bash
+SKILL_SRC="$(pwd)/tools/exp-scheduler/skills/exp-scheduler-gpu-lease"
+SKILL_DST="${CODEX_HOME:-$HOME/.codex}/skills/exp-scheduler-gpu-lease"
+mkdir -p "$(dirname "$SKILL_DST")"
+if [ -e "$SKILL_DST" ] && [ ! -L "$SKILL_DST" ]; then
+  mv "$SKILL_DST" "$SKILL_DST.bak.$(date +%Y%m%d-%H%M%S)"
+fi
+ln -sfnT "$SKILL_SRC" "$SKILL_DST"
+```
+
+如果不希望 Codex 依赖这个仓库路径，也可以改用复制：
+
+```bash
+rsync -a tools/exp-scheduler/skills/exp-scheduler-gpu-lease/ \
+  "${CODEX_HOME:-$HOME/.codex}/skills/exp-scheduler-gpu-lease/"
+```
+
 ## 日志查看
 
 运行中任务会以只读 PTY 终端形式展示，因此颜色、进度条和覆盖刷新类输出都能正常显示。任务结束后，页面会自动切回历史纯文本日志视图；浏览器侧在 v1 不支持任意键盘输入，只提供查看能力。
