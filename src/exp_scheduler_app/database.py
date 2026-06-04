@@ -14,7 +14,8 @@ def utc_now_iso() -> str:
 
 NORMAL_QUEUE = "normal"
 URGENT_QUEUE = "urgent"
-VALID_QUEUE_NAMES = {NORMAL_QUEUE, URGENT_QUEUE}
+STAGED_QUEUE = "staged"
+VALID_QUEUE_NAMES = {NORMAL_QUEUE, URGENT_QUEUE, STAGED_QUEUE}
 SCHEDULER_SETTINGS_META_KEY = "scheduler_settings"
 
 
@@ -196,6 +197,7 @@ class Database:
         depends_on_ids: Sequence[int] | None = None,
     ) -> dict[str, object]:
         normalized_queue_name = self._normalize_queue_name(queue_name)
+        task_status = self._status_for_queue(normalized_queue_name)
         with self._lock, self._connect() as conn:
             queue_rank = self._next_queue_rank(conn, normalized_queue_name)
             now = utc_now_iso()
@@ -206,13 +208,14 @@ class Database:
                     exit_code, created_at, started_at, finished_at, log_path, notes,
                     profile_id, profile_name, shell_setup, attempt_count, next_retry_at,
                     requested_gpu, gpu_memory_budget_mb, queue_name
-                ) VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
                 """,
                 (
                     name,
                     command,
                     cwd,
                     json.dumps(env),
+                    task_status,
                     queue_rank,
                     now,
                     notes,
@@ -475,7 +478,7 @@ class Database:
 
         safe_history_limit = max(1, int(history_limit))
         safe_history_offset = max(0, int(history_offset))
-        history_where = "status NOT IN ('queued', 'running')"
+        history_where = "status NOT IN ('queued', 'running', 'staged')"
         history_params: list[object] = []
         if history_status is not None:
             history_where = "status = ?"
@@ -497,6 +500,13 @@ class Database:
                 ORDER BY queue_rank ASC, id ASC
                 """,
                 (URGENT_QUEUE,),
+            ).fetchall()
+            staged = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'staged'
+                ORDER BY queue_rank ASC, id ASC
+                """
             ).fetchall()
             running = conn.execute(
                 "SELECT * FROM tasks WHERE status = 'running' ORDER BY started_at ASC, id ASC"
@@ -546,11 +556,12 @@ class Database:
         }
         normal_queued_count = queued_counts.get(NORMAL_QUEUE, 0)
         urgent_queued_count = queued_counts.get(URGENT_QUEUE, 0)
+        staged_count = status_counts.get("staged", 0)
         running_count = status_counts.get("running", 0)
         history_count = sum(
             count
             for status, count in status_counts.items()
-            if status not in {"queued", "running"}
+            if status not in {"queued", "running", "staged"}
         )
         total_count = sum(status_counts.values())
         filtered_count = (
@@ -559,6 +570,7 @@ class Database:
         return {
             "queued": [self._row_to_task(row) for row in queued],
             "urgent_queued": [self._row_to_task(row) for row in urgent_queued],
+            "staged": [self._row_to_task(row) for row in staged],
             "running": [self._row_to_task(row) for row in running],
             "history": [self._row_to_task(row) for row in history],
             "queue_paused": paused_value is not None and paused_value["value"] == "1",
@@ -567,6 +579,7 @@ class Database:
             "counts": {
                 "queued": normal_queued_count,
                 "urgent_queued": urgent_queued_count,
+                "staged": staged_count,
                 "running": running_count,
                 "history": history_count,
                 "history_filtered": filtered_count,
@@ -595,14 +608,15 @@ class Database:
 
     def list_queue_tasks(self, queue_name: str = NORMAL_QUEUE) -> list[dict[str, object]]:
         normalized_queue_name = self._normalize_queue_name(queue_name)
+        task_status = self._status_for_queue(normalized_queue_name)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE status = 'queued' AND queue_name = ?
+                WHERE status = ? AND queue_name = ?
                 ORDER BY queue_rank ASC, id ASC
                 """,
-                (normalized_queue_name,),
+                (task_status, normalized_queue_name),
             ).fetchall()
         return [self._row_to_task(row) for row in rows]
 
@@ -682,19 +696,25 @@ class Database:
         depends_on_ids: Sequence[int] | None = None,
     ) -> dict[str, object]:
         normalized_queue_name = self._normalize_queue_name(queue_name)
+        task_status = self._status_for_queue(normalized_queue_name)
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT queue_rank, queue_name
+                SELECT queue_rank, queue_name, status
                 FROM tasks
-                WHERE id = ? AND status = 'queued'
+                WHERE id = ? AND status IN ('queued', 'staged')
                 """,
                 (task_id,),
             ).fetchone()
             if row is None:
-                raise ValueError("只能修改排队中的任务")
+                raise ValueError("只能修改排队中或暂存中的任务")
             current_queue_name = self._normalize_queue_name(row["queue_name"])
-            if current_queue_name == normalized_queue_name and row["queue_rank"] is not None:
+            current_status = str(row["status"])
+            if (
+                current_queue_name == normalized_queue_name
+                and current_status == task_status
+                and row["queue_rank"] is not None
+            ):
                 queue_rank = int(row["queue_rank"])
             else:
                 queue_rank = self._next_queue_rank(conn, normalized_queue_name)
@@ -705,6 +725,7 @@ class Database:
                     command = ?,
                     cwd = ?,
                     env = ?,
+                    status = ?,
                     notes = ?,
                     requested_gpu = ?,
                     gpu_memory_budget_mb = ?,
@@ -716,13 +737,14 @@ class Database:
                     exit_code = NULL,
                     finished_at = NULL,
                     next_retry_at = NULL
-                WHERE id = ? AND status = 'queued'
+                WHERE id = ? AND status IN ('queued', 'staged')
                 """,
                 (
                     name,
                     command,
                     cwd,
                     json.dumps(env),
+                    task_status,
                     notes,
                     requested_gpu,
                     gpu_memory_budget_mb,
@@ -767,6 +789,58 @@ class Database:
             raise ValueError(f"任务不存在: {task_id}")
         return task
 
+    def move_task_to_queue(
+        self,
+        task_id: int,
+        *,
+        queue_name: str,
+    ) -> dict[str, object]:
+        normalized_queue_name = self._normalize_queue_name(queue_name)
+        task_status = self._status_for_queue(normalized_queue_name)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT status, queue_name, queue_rank
+                FROM tasks
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"任务不存在: {task_id}")
+            current_status = str(row["status"])
+            if current_status not in {"queued", "staged"}:
+                raise ValueError("只有排队或暂存中的任务可以移动队列")
+            current_queue_name = self._normalize_queue_name(row["queue_name"])
+            if (
+                current_status == task_status
+                and current_queue_name == normalized_queue_name
+                and row["queue_rank"] is not None
+            ):
+                queue_rank = int(row["queue_rank"])
+            else:
+                queue_rank = self._next_queue_rank(conn, normalized_queue_name)
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = ?,
+                    queue_name = ?,
+                    queue_rank = ?,
+                    assigned_gpu = NULL,
+                    pid = NULL,
+                    exit_code = NULL,
+                    finished_at = NULL,
+                    next_retry_at = NULL
+                WHERE id = ? AND status IN ('queued', 'staged')
+                """,
+                (task_status, normalized_queue_name, queue_rank, task_id),
+            )
+            conn.commit()
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        return task
+
     def reorder_queue(
         self,
         task_ids: Sequence[int],
@@ -774,27 +848,28 @@ class Database:
         queue_name: str = NORMAL_QUEUE,
     ) -> list[dict[str, object]]:
         normalized_queue_name = self._normalize_queue_name(queue_name)
+        task_status = self._status_for_queue(normalized_queue_name)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT id FROM tasks
-                WHERE status = 'queued' AND queue_name = ?
+                WHERE status = ? AND queue_name = ?
                 ORDER BY queue_rank ASC, id ASC
                 """,
-                (normalized_queue_name,),
+                (task_status, normalized_queue_name),
             ).fetchall()
             current_ids = [row["id"] for row in rows]
             if current_ids != list(task_ids):
                 if set(current_ids) != set(task_ids) or len(current_ids) != len(task_ids):
-                    raise ValueError("重排请求必须包含完整的排队任务列表")
+                    raise ValueError("重排请求必须包含完整的队列任务列表")
             for idx, task_id in enumerate(task_ids, start=1):
                 conn.execute(
                     """
                     UPDATE tasks
                     SET queue_rank = ?
-                    WHERE id = ? AND status = 'queued' AND queue_name = ?
+                    WHERE id = ? AND status = ? AND queue_name = ?
                     """,
-                    (idx, task_id, normalized_queue_name),
+                    (idx, task_id, task_status, normalized_queue_name),
                 )
             conn.commit()
         return self.list_queue_tasks(normalized_queue_name)
@@ -1422,24 +1497,26 @@ class Database:
         )
 
     def _next_queue_rank(self, conn: sqlite3.Connection, queue_name: str) -> int:
+        normalized_queue_name = self._normalize_queue_name(queue_name)
         row = conn.execute(
             """
             SELECT COALESCE(MAX(queue_rank), 0) AS max_rank
             FROM tasks
-            WHERE status = 'queued' AND queue_name = ?
+            WHERE status = ? AND queue_name = ?
             """,
-            (self._normalize_queue_name(queue_name),),
+            (self._status_for_queue(normalized_queue_name), normalized_queue_name),
         ).fetchone()
         return int(row["max_rank"]) + 1
 
     def _head_queue_rank(self, conn: sqlite3.Connection, queue_name: str) -> int:
+        normalized_queue_name = self._normalize_queue_name(queue_name)
         row = conn.execute(
             """
             SELECT MIN(queue_rank) AS min_rank
             FROM tasks
-            WHERE status = 'queued' AND queue_name = ?
+            WHERE status = ? AND queue_name = ?
             """,
-            (self._normalize_queue_name(queue_name),),
+            (self._status_for_queue(normalized_queue_name), normalized_queue_name),
         ).fetchone()
         min_rank = row["min_rank"]
         if min_rank is None:
@@ -1502,6 +1579,9 @@ class Database:
         if value not in VALID_QUEUE_NAMES:
             raise ValueError(f"未知队列类型: {value}")
         return value
+
+    def _status_for_queue(self, queue_name: str) -> str:
+        return "staged" if self._normalize_queue_name(queue_name) == STAGED_QUEUE else "queued"
 
     def _ensure_columns(
         self,

@@ -203,6 +203,45 @@ def test_reorder_queue_persists_to_database(tmp_path):
     assert [item["id"] for item in database.list_queued_tasks()] == [third, first, second]
 
 
+def test_staged_task_waits_until_moved_to_runnable_queue(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        created = client.post(
+            "/api/tasks",
+            json={
+                "name": "parked",
+                "command": command("print('parked')"),
+                "cwd": None,
+                "env": {},
+                "notes": None,
+                "queue_name": "staged",
+            },
+        )
+        created.raise_for_status()
+        task_id = created.json()["task"]["id"]
+
+        time.sleep(0.3)
+        payload = client.get("/api/tasks").json()
+        assert [task["id"] for task in payload["staged"]] == [task_id]
+        assert all(task["id"] != task_id for task in payload["running"])
+        assert all(task["id"] != task_id for task in payload["history"])
+
+        moved = client.patch(
+            f"/api/tasks/{task_id}/queue",
+            json={"queue_name": "normal"},
+        )
+        moved.raise_for_status()
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id
+            )
+        )
+        assert history_task["status"] == "succeeded"
+
+
 def test_task_environment_strips_scheduler_virtualenv(tmp_path):
     config = make_config(tmp_path)
     database = Database(config.db_path)
@@ -1234,6 +1273,39 @@ def test_text_log_default_tail_is_larger_than_32kb(tmp_path):
         assert "log-end-marker" in log_payload["content"]
 
 
+def test_text_log_can_load_full_content(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command(
+                "import sys; "
+                "print('full-log-start-marker'); "
+                "sys.stdout.write('x' * (1100 * 1024)); "
+                "sys.stdout.flush(); "
+                "print('\\nfull-log-end-marker')"
+            ),
+            name="full-log-demo",
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+
+        tail_payload = client.get(f"/api/tasks/{task_id}/log").json()
+        assert "full-log-start-marker" not in tail_payload["content"]
+        assert "full-log-end-marker" in tail_payload["content"]
+
+        full_payload = client.get(f"/api/tasks/{task_id}/log?full=1").json()
+        assert "full-log-start-marker" in full_payload["content"]
+        assert "full-log-end-marker" in full_payload["content"]
+
+
 def test_text_log_collapses_tqdm_carriage_return_updates(tmp_path):
     provider = FakeGPUProvider([gpu(0, idle=True)])
     with build_client(tmp_path, provider) as client:
@@ -1249,7 +1321,7 @@ def test_text_log_collapses_tqdm_carriage_return_updates(tmp_path):
             name="progress-demo",
         )
 
-        wait_for(
+        history_task = wait_for(
             lambda: next(
                 task
                 for task in client.get("/api/tasks").json()["history"]
@@ -1258,11 +1330,55 @@ def test_text_log_collapses_tqdm_carriage_return_updates(tmp_path):
             timeout=8,
         )
 
+        def compacted_program_bytes():
+            raw = Path(history_task["log_path"]).read_bytes()
+            if b"[exp-scheduler] attempt=1/1" not in raw:
+                return False
+            program = raw.split(b"[exp-scheduler] attempt=1/1", 1)[1]
+            if b"100%|done|" not in program:
+                return False
+            if b"0%|zero|" in program or b"50%|half|" in program:
+                return False
+            return program
+
+        raw_bytes = wait_for(compacted_program_bytes, timeout=4)
+        assert b"100%|done|" in raw_bytes
+
         log_payload = client.get(f"/api/tasks/{task_id}/log").json()
         program_output = log_payload["content"].split("[exp-scheduler] attempt=1/1", 1)[1]
         assert "100%|done|" in program_output
         assert "0%|zero|" not in program_output
         assert "50%|half|" not in program_output
+
+
+def test_text_log_collapses_repeated_progress_lines(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(
+            client,
+            command(
+                "for pct in (32, 33, 34, 35, 69): "
+                "print(f'multi_news: {pct}%|bar| {pct}/100 [00:00<?, 1.00it/s]', flush=True)"
+            ),
+            name="repeated-progress-demo",
+        )
+
+        history_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == task_id and task["status"] == "succeeded"
+            ),
+            timeout=8,
+        )
+
+        raw = Path(history_task["log_path"]).read_bytes()
+        program = raw.split(b"[exp-scheduler] attempt=1/1", 1)[1]
+        assert b"multi_news: 69%|bar|" in program
+        assert b"multi_news: 32%|bar|" not in program
+        assert b"multi_news: 33%|bar|" not in program
+        assert b"multi_news: 34%|bar|" not in program
+        assert b"multi_news: 35%|bar|" not in program
 
 
 def test_retryable_oom_failure_is_automatically_retried(tmp_path):

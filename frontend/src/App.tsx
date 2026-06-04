@@ -27,6 +27,8 @@ import {
   Loader2,
   Maximize2,
   Minimize2,
+  Archive,
+  Zap,
 	  Bookmark,
 	  Edit2,
 	  Link2,
@@ -40,6 +42,7 @@ import '@xterm/xterm/css/xterm.css';
 
 // --- Types ---
 type GpuScheduleAction = 'enable' | 'disable';
+type QueueName = 'normal' | 'urgent' | 'staged';
 
 interface GpuScheduleEntry {
   action: GpuScheduleAction;
@@ -68,7 +71,7 @@ interface GPUStatus {
 interface Task {
   id: string;
   name: string;
-  status: 'running' | 'pending' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  status: 'running' | 'pending' | 'staged' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
   command: string;
   workingDir?: string;
   gpu?: number;
@@ -83,7 +86,7 @@ interface Task {
   requestedGpu?: number | null;
   gpuMemoryBudgetMb?: number | null;
   profileId?: number | null;
-  queueName?: 'normal' | 'urgent';
+  queueName?: QueueName;
   dependsOn?: number[];
   dependencyCount?: number;
   hasDependencies?: boolean;
@@ -102,7 +105,7 @@ interface BackendTask {
   cwd?: string | null;
   env?: Record<string, string>;
   notes?: string | null;
-  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  status: 'queued' | 'staged' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
   assigned_gpu?: number | null;
   requested_gpu?: number | null;
   gpu_memory_budget_mb?: number | null;
@@ -112,7 +115,7 @@ interface BackendTask {
   finished_at?: string | null;
   exit_code?: number | null;
   attempt_count?: number | null;
-  queue_name?: 'normal' | 'urgent';
+  queue_name?: QueueName;
   depends_on?: number[];
   dependency_count?: number;
   has_dependencies?: boolean;
@@ -122,6 +125,7 @@ interface BackendTask {
 interface TaskCounts {
   queued: number;
   urgent_queued: number;
+  staged: number;
   running: number;
   history: number;
   history_filtered: number;
@@ -323,12 +327,21 @@ function currentAutoRestoreWaitSeconds(gpu: GPUStatus, nowMs: number) {
 function taskStatusLabel(status: Task['status']) {
   switch (status) {
     case 'pending': return '排队中';
+    case 'staged': return '暂存';
     case 'running': return '运行中';
     case 'succeeded': return '成功';
     case 'failed': return '失败';
     case 'cancelled': return '取消';
     case 'interrupted': return '中断';
     default: return status;
+  }
+}
+
+function queueLabel(queueName: QueueName) {
+  switch (queueName) {
+    case 'urgent': return '紧急队列';
+    case 'staged': return '暂存队列';
+    default: return '普通队列';
   }
 }
 
@@ -362,6 +375,7 @@ function activityEntityLabel(entityType?: string | null) {
 }
 
 function mapTask(task: BackendTask): Task {
+  const queueName = task.status === 'staged' ? 'staged' : (task.queue_name || 'normal');
   return {
     id: String(task.id),
     name: task.name || `任务 ${task.id}`,
@@ -373,14 +387,14 @@ function mapTask(task: BackendTask): Task {
     startedAt: formatTime(task.started_at),
     endedAt: formatTime(task.finished_at),
     exitCode: task.exit_code ?? undefined,
-    isUrgent: task.queue_name === 'urgent',
+    isUrgent: queueName === 'urgent',
     attempts: task.attempt_count || undefined,
     notes: task.notes || undefined,
     env: task.env || {},
     requestedGpu: task.requested_gpu ?? null,
     gpuMemoryBudgetMb: task.gpu_memory_budget_mb ?? null,
     profileId: task.profile_id ?? null,
-    queueName: task.queue_name || 'normal',
+    queueName,
     dependsOn: task.depends_on || [],
     dependencyCount: task.dependency_count ?? (task.depends_on?.length || 0),
     hasDependencies: task.has_dependencies ?? ((task.depends_on?.length || 0) > 0),
@@ -509,16 +523,17 @@ export default function App() {
   }, [resetCommandTextareaSize]);
 
   const runningTasks = useMemo(() => tasks.filter(t => t.status === 'running'), [tasks]);
-  const historyTasks = useMemo(() => tasks.filter(t => t.status !== 'running' && t.status !== 'pending'), [tasks]);
+  const historyTasks = useMemo(() => tasks.filter(t => !['running', 'pending', 'staged'].includes(t.status)), [tasks]);
   const urgentQueueTasks = useMemo(() => tasks.filter(t => t.isUrgent && (t.status === 'pending' || t.status === 'running')), [tasks]);
   const standardQueueTasks = useMemo(() => tasks.filter(t => !t.isUrgent && (t.status === 'pending' || t.status === 'running')), [tasks]);
+  const stagedQueueTasks = useMemo(() => tasks.filter(t => t.status === 'staged'), [tasks]);
   const selectedTask = useMemo(() => tasks.find(t => t.id === selectedTaskId) || null, [tasks, selectedTaskId]);
   const enabledGpuSet = useMemo(() => new Set(enabledGpus), [enabledGpus]);
   const hasGpuSettingsDraft = useMemo(() => !haveSameGpuIds(enabledGpus, appliedEnabledGpus), [appliedEnabledGpus, enabledGpus]);
   const visibleGpus = useMemo(() => gpus.filter(gpu => enabledGpuSet.has(gpu.id)), [gpus, enabledGpuSet]);
   const queueDepth = taskCounts
-    ? taskCounts.queued + taskCounts.urgent_queued
-    : urgentQueueTasks.filter(t => t.status === 'pending').length + standardQueueTasks.filter(t => t.status === 'pending').length;
+    ? taskCounts.queued + taskCounts.urgent_queued + (taskCounts.staged || 0)
+    : urgentQueueTasks.filter(t => t.status === 'pending').length + standardQueueTasks.filter(t => t.status === 'pending').length + stagedQueueTasks.length;
   const hasWaitingUrgentTask = urgentQueueTasks.some(task => task.status === 'pending');
   const totalTaskCount = taskCounts?.total ?? tasks.length;
   const runningTaskCount = taskCounts?.running ?? runningTasks.length;
@@ -541,7 +556,7 @@ export default function App() {
     const selectedIds = new Set((taskDraft?.dependsOn || []).map(String));
     const knownCandidates: DependencyCandidate[] = tasks.filter(task =>
       task.id !== currentTaskId &&
-      (task.status === 'pending' || task.status === 'running' || selectedIds.has(task.id))
+      (task.status === 'pending' || task.status === 'staged' || task.status === 'running' || selectedIds.has(task.id))
     );
     const knownIds = new Set(knownCandidates.map(task => task.id));
     const missingCandidates: DependencyCandidate[] = Array.from(selectedIds)
@@ -554,7 +569,7 @@ export default function App() {
     }));
     return [...knownCandidates, ...missingCandidates];
   }, [taskDraft, tasks]);
-  const isMetadataOnlyTaskEdit = Boolean(isEditingTask && taskDraft && taskDraft.status !== 'pending');
+  const isMetadataOnlyTaskEdit = Boolean(isEditingTask && taskDraft && taskDraft.status !== 'pending' && taskDraft.status !== 'staged');
   const autoRestoreIdleGpuSeconds = schedulerSettingsDraft.auto_restore_idle_gpu_seconds !== undefined
     ? schedulerSettingsDraft.auto_restore_idle_gpu_seconds
     : schedulerSettings
@@ -638,6 +653,7 @@ export default function App() {
       api<{
         queued: BackendTask[];
         urgent_queued: BackendTask[];
+        staged: BackendTask[];
         running: BackendTask[];
         history: BackendTask[];
         queue_paused: boolean;
@@ -654,6 +670,7 @@ export default function App() {
       ...(taskPayload.running || []),
       ...(taskPayload.urgent_queued || []),
       ...(taskPayload.queued || []),
+      ...(taskPayload.staged || []),
       ...(taskPayload.history || []),
     ].map(mapTask);
     setGpus(nextGpus);
@@ -945,13 +962,15 @@ export default function App() {
 
       const dependsOnRaw = formData.getAll('depends_on');
       const depends_on = dependsOnRaw.map(Number).filter(n => !isNaN(n));
+      const queue_name = String(formData.get('queue_name') || (formData.get('is_urgent') ? 'urgent' : 'normal')) as QueueName;
       const payload = {
         name,
         command: String(formData.get('command') || ''),
         cwd: String(formData.get('cwd') || '').trim() || null,
         notes,
         env: parseEnv(String(formData.get('env') || '')),
-        is_urgent: Boolean(formData.get('is_urgent')),
+        is_urgent: queue_name === 'urgent',
+        queue_name,
         requested_gpu: formData.get('requested_gpu') ? Number(formData.get('requested_gpu')) : null,
         gpu_memory_budget_mb: formData.get('gpu_memory_budget_gb') ? Math.round(Number(formData.get('gpu_memory_budget_gb')) * 1024) : null,
         profile_id: formData.get('profile_id') ? Number(formData.get('profile_id')) : null,
@@ -1016,6 +1035,20 @@ export default function App() {
     }
   };
 
+  const moveTaskToQueue = async (taskId: string, queueName: QueueName) => {
+    try {
+      await api(`/api/tasks/${taskId}/queue`, {
+        method: 'PATCH',
+        body: JSON.stringify({ queue_name: queueName }),
+      });
+      setMessage(`任务 #${taskId} 已移到${queueLabel(queueName)}。`);
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '任务移动队列失败');
+      await refreshAll();
+    }
+  };
+
   const handleDragStart = (e: React.DragEvent, taskId: string) => {
     e.dataTransfer.setData('text/plain', taskId);
     e.dataTransfer.effectAllowed = 'move';
@@ -1032,7 +1065,7 @@ export default function App() {
     setDragState(prev => prev ? { ...prev, overId: taskId, position: isTopHalf ? 'before' : 'after' } : null);
   };
 
-  const handleDrop = async (e: React.DragEvent, targetQueue: 'urgent' | 'normal', isDropZone = false) => {
+  const handleDrop = async (e: React.DragEvent, targetQueue: QueueName, isDropZone = false) => {
     e.preventDefault();
     if (!dragState) return;
     const { id, overId, position } = dragState;
@@ -1042,28 +1075,19 @@ export default function App() {
     if (!task) return;
 
     try {
-      if ((task.isUrgent && targetQueue === 'normal') || (!task.isUrgent && targetQueue === 'urgent')) {
-         await api(`/api/tasks/${task.id}`, {
-             method: 'PUT',
-             body: JSON.stringify({
-                 name: task.raw?.name ?? task.name ?? null,
-                 command: task.raw?.command ?? task.command,
-                 cwd: task.raw?.cwd ?? task.workingDir ?? null,
-                 env: task.raw?.env ?? task.env ?? {},
-                 notes: task.raw?.notes ?? task.notes ?? null,
-                 is_urgent: targetQueue === 'urgent',
-                 requested_gpu: task.raw?.requested_gpu ?? task.requestedGpu ?? null,
-                 gpu_memory_budget_mb: task.raw?.gpu_memory_budget_mb ?? task.gpuMemoryBudgetMb ?? null,
-                 profile_id: task.raw?.profile_id ?? task.profileId ?? null
-             })
+      const targetStatus = targetQueue === 'staged' ? 'staged' : 'pending';
+      if (task.queueName !== targetQueue || task.status !== targetStatus) {
+         await api(`/api/tasks/${task.id}/queue`, {
+             method: 'PATCH',
+             body: JSON.stringify({ queue_name: targetQueue })
          });
       }
 
       const targetPendingTaskIdsStr = tasks
-        .filter(t => t.status === 'pending')
+        .filter(t => targetQueue === 'staged' ? t.status === 'staged' : t.status === 'pending')
         .filter(t => {
            if (t.id === id) return false;
-           return targetQueue === 'urgent' ? t.isUrgent : !t.isUrgent;
+           return t.queueName === targetQueue;
         })
         .map(t => t.id);
 
@@ -1165,7 +1189,7 @@ export default function App() {
     setIsEditingTask(true);
     setIsTaskModalExpanded(false);
     setShowNewTask(true);
-    setMessage(task.status === 'pending' ? `正在重新编辑任务 #${task.id}。` : `正在编辑任务 #${task.id} 的记录信息。`);
+    setMessage(task.status === 'pending' || task.status === 'staged' ? `正在重新编辑任务 #${task.id}。` : `正在编辑任务 #${task.id} 的记录信息。`);
   };
 
   const copyActivityLog = async (log: ActivityLogEntry) => {
@@ -1818,6 +1842,7 @@ export default function App() {
                              onDuplicate={() => duplicateTask(task)}
                              onEdit={() => editTask(task)}
                              onDelete={() => task.status === 'running' ? cancelTask(task.id) : deleteTask(task.id)}
+                             onStage={() => moveTaskToQueue(task.id, 'staged')}
                              onSelectLog={() => openLogTask(task.id)}
                              isMarked={markedTaskIds.has(task.id)}
                              toggleMark={(e) => { e.stopPropagation(); toggleTaskMark(task.id); }}
@@ -1871,6 +1896,7 @@ export default function App() {
                              onDuplicate={() => duplicateTask(task)}
                              onEdit={() => editTask(task)}
                              onDelete={() => task.status === 'running' ? cancelTask(task.id) : deleteTask(task.id)}
+                             onStage={() => moveTaskToQueue(task.id, 'staged')}
                              onSelectLog={() => openLogTask(task.id)}
                              isMarked={markedTaskIds.has(task.id)}
                              toggleMark={(e) => { e.stopPropagation(); toggleTaskMark(task.id); }}
@@ -1894,6 +1920,62 @@ export default function App() {
                       >
                         <Layers className="w-10 h-10 mb-2 opacity-50" />
                         <p className="text-sm font-medium">暂无普通排队任务，支持拖拽移入</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Staged Queue */}
+                <div className="space-y-4 bg-emerald-50/30 p-5 rounded-2xl border border-emerald-100">
+                  <div className="flex items-center justify-between px-1">
+                    <div className="flex items-center gap-2">
+                       <Archive className="w-4 h-4 text-emerald-500" />
+                       <h3 className="text-sm font-bold text-slate-800">暂存队列 (Staged)</h3>
+                    </div>
+                    <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100 uppercase">暂不调度</span>
+                  </div>
+                  <div className="min-h-[120px] flex flex-col">
+                    {stagedQueueTasks.length > 0 ? (
+                       <div
+                         className={`space-y-4 min-h-[120px] pb-4 transition-colors ${dragState && dragState.overId === 'empty-staged' ? 'bg-emerald-50/50' : ''}`}
+                         onDragOver={(e) => { e.preventDefault(); if(e.target === e.currentTarget) setDragState(prev => prev ? { ...prev, overId: 'empty-staged', position: 'after' } : null); }}
+                         onDrop={(e) => {
+                           if(dragState?.overId === 'empty-staged') { handleDrop(e, 'staged', true); }
+                         }}
+                       >
+                         {stagedQueueTasks.map(task => (
+                           <HistoryRowInner
+                             key={task.id}
+                             task={task}
+                             isQueueView={true}
+                             onDuplicate={() => duplicateTask(task)}
+                             onEdit={() => editTask(task)}
+                             onDelete={() => deleteTask(task.id)}
+                             onMoveToNormal={() => moveTaskToQueue(task.id, 'normal')}
+                             onMoveToUrgent={() => moveTaskToQueue(task.id, 'urgent')}
+                             onSelectLog={() => openLogTask(task.id)}
+                             isMarked={markedTaskIds.has(task.id)}
+                             toggleMark={(e) => { e.stopPropagation(); toggleTaskMark(task.id); }}
+                             isBatchDeleteMode={isBatchDeleteMode}
+                             isSelectedForDelete={selectedForDelete.has(task.id)}
+                             onToggleSelectForDelete={() => toggleTaskForBatchDelete(task)}
+                             isDragging={dragState?.id === task.id}
+                             dragOverPosition={dragState?.overId === task.id ? dragState.position : null}
+                             onDragStart={(e) => handleDragStart(e, task.id)}
+                             onDragOver={(e) => handleDragOver(e, task.id, 'staged')}
+                             onDrop={(e) => handleDrop(e, 'staged')}
+                             onDragEnd={() => setDragState(null)}
+                           />
+                         ))}
+                       </div>
+                    ) : (
+                      <div
+                        onDragOver={(e) => { e.preventDefault(); setDragState(prev => prev ? { ...prev, overId: 'empty-staged', position: 'after' } : null); }}
+                        onDrop={(e) => handleDrop(e, 'staged', true)}
+                        className={`bg-white/50 border border-dashed rounded-xl flex-1 flex flex-col items-center justify-center p-8 transition-colors ${dragState && dragState.overId === 'empty-staged' ? 'border-emerald-400 bg-emerald-50 text-emerald-500' : 'border-slate-200 text-slate-300'}`}
+                      >
+                        <Archive className="w-10 h-10 mb-2 opacity-50" />
+                        <p className="text-sm font-medium">暂无暂存任务，支持拖拽移入</p>
                       </div>
                     )}
                   </div>
@@ -2429,10 +2511,29 @@ export default function App() {
                       {/* Queue Type */}
                       <div className="space-y-1.5">
                         <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">队列策略</label>
-                        <label className="flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-lg px-4 py-[7px] cursor-pointer hover:bg-slate-100 transition-all">
-                          <input type="checkbox" name="is_urgent" defaultChecked={Boolean(taskDraft?.isUrgent)} className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
-                          <span className="text-sm font-semibold text-slate-600">加入紧急队列 (Priority)</span>
-                        </label>
+                        <div className="grid grid-cols-3 gap-1 bg-slate-100 border border-slate-200 rounded-lg p-1">
+                          {([
+                            ['normal', '普通'],
+                            ['urgent', '紧急'],
+                            ['staged', '暂存'],
+                          ] as [QueueName, string][]).map(([queueName, label]) => {
+                            const selectedQueue = taskDraft?.queueName || (taskDraft?.isUrgent ? 'urgent' : 'normal');
+                            return (
+                              <label key={queueName} className="cursor-pointer">
+                                <input
+                                  type="radio"
+                                  name="queue_name"
+                                  value={queueName}
+                                  defaultChecked={selectedQueue === queueName}
+                                  className="peer sr-only"
+                                />
+                                <span className="block rounded-md px-2 py-1.5 text-center text-[11px] font-bold text-slate-500 transition-all peer-checked:bg-white peer-checked:text-blue-600 peer-checked:shadow-sm">
+                                  {label}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
                       </div>
 
                       {/* GPU Memory Budget */}
@@ -2441,7 +2542,7 @@ export default function App() {
                         <input
                           type="number"
                           min="0"
-                          step="0.1"
+                          step="any"
                           name="gpu_memory_budget_gb"
                           defaultValue={taskDraft?.gpuMemoryBudgetMb ? taskDraft.gpuMemoryBudgetMb / 1024 : ''}
                           placeholder="不填写则使用默认空闲阈值"
@@ -2725,7 +2826,7 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
 
   const TaskCardInner = ({ task, isSelected, onSelect, onCancel, onPreempt, canPreempt, onDuplicate, onEdit, isMarked, toggleMark }: { task: Task; isSelected?: boolean; onSelect?: () => void; onCancel?: () => void; onPreempt?: () => void; canPreempt?: boolean; onDuplicate?: () => void; onEdit?: () => void; isMarked?: boolean; toggleMark?: (e: React.MouseEvent) => void; key?: React.Key }) => {
   const canEdit = Boolean(onEdit);
-  const editTitle = task.status === 'pending' ? '编辑任务' : '编辑记录信息';
+  const editTitle = task.status === 'pending' || task.status === 'staged' ? '编辑任务' : '编辑记录信息';
 
   return (
     <div
@@ -2864,6 +2965,9 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
   onDuplicate,
   onDelete,
   onRequeue,
+  onStage,
+  onMoveToNormal,
+  onMoveToUrgent,
   onSelectLog,
   onEdit,
   isMarked,
@@ -2885,6 +2989,9 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
   onDuplicate?: () => void;
   onDelete?: () => void;
   onRequeue?: () => void;
+  onStage?: () => void;
+  onMoveToNormal?: () => void;
+  onMoveToUrgent?: () => void;
   onSelectLog?: () => void;
   onEdit?: () => void;
   isMarked?: boolean;
@@ -2902,12 +3009,13 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
 }) => {
   const canRequeue = task.status === 'failed' || task.status === 'cancelled' || task.status === 'interrupted';
 	  const canEdit = Boolean(onEdit);
-	  const editTitle = task.status === 'pending' ? '编辑任务' : '编辑记录信息';
+	  const editTitle = task.status === 'pending' || task.status === 'staged' ? '编辑任务' : '编辑记录信息';
   const canBatchDelete = task.status !== 'running';
   const attemptOptions = useMemo(() => task.attemptLogs || [], [task.attemptLogs]);
   const latestAttempt = attemptOptions.length > 0
     ? attemptOptions[attemptOptions.length - 1].attempt
     : (task.attempts || 1);
+  const canViewLogs = task.status === 'running' || attemptOptions.length > 0 || Boolean(task.attempts && task.attempts > 0);
 
   const [isLogExpanded, setIsLogExpanded] = useState(false);
   const [isLogFullScreen, setIsLogFullScreen] = useState(false);
@@ -2967,6 +3075,7 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
       case 'failed': return 'bg-rose-50 text-rose-700 border-rose-100';
       case 'interrupted': return 'bg-amber-50 text-amber-700 border-amber-100';
       case 'cancelled': return 'bg-slate-100 text-slate-500 border-slate-200';
+      case 'staged': return 'bg-emerald-50 text-emerald-700 border-emerald-100';
       default: return 'bg-slate-50 text-slate-400 border-slate-100';
     }
   };
@@ -2978,6 +3087,7 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
       case 'interrupted': return '中断';
       case 'cancelled': return '取消';
       case 'running': return '运行中';
+      case 'staged': return '暂存';
       case 'pending': return '待排队';
       default: return task.status;
     }
@@ -2987,14 +3097,14 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
     <div
       onClick={isBatchDeleteMode && canBatchDelete ? onToggleSelectForDelete : undefined}
       onDoubleClick={!isBatchDeleteMode && !isQueueView ? handleToggleLog : undefined}
-      draggable={!isBatchDeleteMode && isQueueView && task.status === 'pending'}
+      draggable={!isBatchDeleteMode && isQueueView && (task.status === 'pending' || task.status === 'staged')}
       onDragStart={!isBatchDeleteMode ? onDragStart : undefined}
       onDragOver={!isBatchDeleteMode ? onDragOver : undefined}
       onDragLeave={!isBatchDeleteMode ? onDragLeave : undefined}
       onDrop={!isBatchDeleteMode ? onDrop : undefined}
       onDragEnd={!isBatchDeleteMode ? onDragEnd : undefined}
       style={isDragging ? { opacity: 0.4 } : undefined}
-      className={`px-5 py-4 rounded-xl border transition-all group shadow-sm hover:shadow-md ${isBatchDeleteMode && canBatchDelete ? 'cursor-pointer' : ''} ${isBatchDeleteMode && !canBatchDelete ? 'cursor-not-allowed opacity-60' : ''} ${!isBatchDeleteMode && isQueueView && task.status === 'pending' ? 'cursor-grab active:cursor-grabbing' : ''} ${
+      className={`px-5 py-4 rounded-xl border transition-all group shadow-sm hover:shadow-md ${isBatchDeleteMode && canBatchDelete ? 'cursor-pointer' : ''} ${isBatchDeleteMode && !canBatchDelete ? 'cursor-not-allowed opacity-60' : ''} ${!isBatchDeleteMode && isQueueView && (task.status === 'pending' || task.status === 'staged') ? 'cursor-grab active:cursor-grabbing' : ''} ${
         isBatchDeleteMode
           ? (isSelectedForDelete ? 'bg-rose-50 !border-rose-400 ring-1 ring-rose-300 shadow-rose-500/20' : canBatchDelete ? 'bg-white border-slate-200 hover:border-rose-300 hover:bg-rose-50/30' : 'bg-slate-50 border-slate-200')
           : (isMarked ? 'bg-amber-50/40 border-amber-300 hover:border-amber-400' : 'bg-white border-slate-200 hover:border-blue-200')
@@ -3013,7 +3123,9 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
             {isQueueView && (
               task.status === 'running'
                 ? <Loader2 className="w-4 h-4 text-emerald-500 animate-spin" />
-                : <Clock className="w-4 h-4 text-slate-300" />
+                : task.status === 'staged'
+                  ? <Archive className="w-4 h-4 text-emerald-500" />
+                  : <Clock className="w-4 h-4 text-slate-300" />
             )}
             <h5 className="font-bold text-slate-900 text-[13px] tracking-tight">{task.name}</h5>
             <span className="text-[10px] text-slate-400 font-mono">ID:{task.id}</span>
@@ -3038,14 +3150,29 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
             </div>
           ) : (
             <div className="flex items-center gap-0.5">
-              {!isQueueView && (
+              {isQueueView && task.status === 'staged' && (
+                <>
+                  <button title="加入普通队列" onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onMoveToNormal?.(); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all active:scale-90">
+                    <Layers className="w-3.5 h-3.5" />
+                  </button>
+                  <button title="加入紧急队列" onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onMoveToUrgent?.(); }} className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-all active:scale-90">
+                    <Zap className="w-3.5 h-3.5" />
+                  </button>
+                </>
+              )}
+              {isQueueView && task.status === 'pending' && (
+                <button title="移入暂存队列" onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onStage?.(); }} className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-all active:scale-90">
+                  <Archive className="w-3.5 h-3.5" />
+                </button>
+              )}
+              {(!isQueueView || canViewLogs) && (
                  <>
-                     {canRequeue && (
+                     {!isQueueView && canRequeue && (
                        <button title="重新入队" onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onRequeue?.(); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all active:scale-90">
                          <RotateCw className="w-3.5 h-3.5" />
                        </button>
                      )}
-                     <button title="查看日志" onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); handleToggleLog(); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all active:scale-90">
+                     <button title={isLogExpanded ? "收起日志" : "查看日志"} onDoubleClick={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); handleToggleLog(); }} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all active:scale-90">
                        <FileText className="w-3.5 h-3.5" />
                      </button>
                  </>
@@ -3229,11 +3356,80 @@ function decodeBase64Bytes(value: string) {
 
 const CARRIAGE_RETURN = 13;
 const LINE_FEED = 10;
+const ESCAPE = 27;
+const DEFAULT_TERMINAL_COLUMNS = 160;
 const ANSI_ERASE_LINE = [27, 91, 50, 75];
+const ANSI_CURSOR_UP = [27, 91, 49, 65];
+
+type AnsiParseState = 'normal' | 'escape' | 'csi' | 'osc' | 'oscEscape';
+
+function wrappedRowCount(cellWidth: number, columns: number) {
+  const safeColumns = Math.max(1, columns || DEFAULT_TERMINAL_COLUMNS);
+  const safeWidth = Math.max(1, cellWidth);
+  return Math.floor((safeWidth - 1) / safeColumns) + 1;
+}
+
+function pushEraseWrappedLine(output: number[], rows: number) {
+  output.push(CARRIAGE_RETURN, ...ANSI_ERASE_LINE);
+  for (let row = 1; row < rows; row += 1) {
+    output.push(...ANSI_CURSOR_UP, CARRIAGE_RETURN, ...ANSI_ERASE_LINE);
+  }
+}
+
+function trackTerminalCellWidth(
+  byte: number,
+  lineCellWidthRef: React.MutableRefObject<number>,
+  ansiParseStateRef: React.MutableRefObject<AnsiParseState>,
+) {
+  const state = ansiParseStateRef.current;
+  if (state === 'escape') {
+    if (byte === 91) {
+      ansiParseStateRef.current = 'csi';
+    } else if (byte === 93) {
+      ansiParseStateRef.current = 'osc';
+    } else {
+      ansiParseStateRef.current = 'normal';
+    }
+    return;
+  }
+  if (state === 'csi') {
+    if (byte >= 64 && byte <= 126) {
+      ansiParseStateRef.current = 'normal';
+    }
+    return;
+  }
+  if (state === 'osc') {
+    if (byte === 7) {
+      ansiParseStateRef.current = 'normal';
+    } else if (byte === ESCAPE) {
+      ansiParseStateRef.current = 'oscEscape';
+    }
+    return;
+  }
+  if (state === 'oscEscape') {
+    ansiParseStateRef.current = byte === 92 ? 'normal' : 'osc';
+    return;
+  }
+
+  if (byte === ESCAPE) {
+    ansiParseStateRef.current = 'escape';
+  } else if (byte === LINE_FEED) {
+    lineCellWidthRef.current = 0;
+  } else if (byte === 9) {
+    lineCellWidthRef.current += 4;
+  } else if (byte === 8) {
+    lineCellWidthRef.current = Math.max(0, lineCellWidthRef.current - 1);
+  } else if (byte >= 32 && byte !== 127 && (byte < 128 || byte >= 192)) {
+    lineCellWidthRef.current += 1;
+  }
+}
 
 function decodeTerminalBytes(
   value: string,
   pendingCarriageReturnRef: React.MutableRefObject<boolean>,
+  lineCellWidthRef: React.MutableRefObject<number>,
+  ansiParseStateRef: React.MutableRefObject<AnsiParseState>,
+  columns: number,
 ) {
   const decoded = decodeBase64Bytes(value);
   if (!decoded.length) return decoded;
@@ -3243,12 +3439,15 @@ function decodeTerminalBytes(
 
   if (pendingCarriageReturnRef.current) {
     pendingCarriageReturnRef.current = false;
-    output.push(CARRIAGE_RETURN);
     if (decoded[0] === LINE_FEED) {
-      output.push(LINE_FEED);
+      output.push(CARRIAGE_RETURN, LINE_FEED);
+      lineCellWidthRef.current = 0;
+      ansiParseStateRef.current = 'normal';
       startIndex = 1;
     } else {
-      output.push(...ANSI_ERASE_LINE);
+      pushEraseWrappedLine(output, wrappedRowCount(lineCellWidthRef.current, columns));
+      lineCellWidthRef.current = 0;
+      ansiParseStateRef.current = 'normal';
     }
   }
 
@@ -3256,6 +3455,7 @@ function decodeTerminalBytes(
     const byte = decoded[index];
     if (byte !== CARRIAGE_RETURN) {
       output.push(byte);
+      trackTerminalCellWidth(byte, lineCellWidthRef, ansiParseStateRef);
       continue;
     }
 
@@ -3264,12 +3464,15 @@ function decodeTerminalBytes(
       continue;
     }
 
-    output.push(CARRIAGE_RETURN);
     if (decoded[index + 1] === LINE_FEED) {
-      output.push(LINE_FEED);
+      output.push(CARRIAGE_RETURN, LINE_FEED);
+      lineCellWidthRef.current = 0;
+      ansiParseStateRef.current = 'normal';
       index += 1;
     } else {
-      output.push(...ANSI_ERASE_LINE);
+      pushEraseWrappedLine(output, wrappedRowCount(lineCellWidthRef.current, columns));
+      lineCellWidthRef.current = 0;
+      ansiParseStateRef.current = 'normal';
     }
   }
 
@@ -3327,6 +3530,8 @@ function TaskLogViewer({
   const [content, setContent] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [loadFullLogRequested, setLoadFullLogRequested] = useState(false);
+  const loadFullLog = isFullScreen || loadFullLogRequested;
   const hasLoadedRef = useRef(false);
 
   const selectableLogs = useMemo(
@@ -3348,6 +3553,7 @@ function TaskLogViewer({
     if (!isAttemptControlled) {
       setInternalSelectedAttempt(null);
     }
+    setLoadFullLogRequested(false);
     setContent(canUseLive ? '实时终端连接中...' : '正在加载日志...');
     hasLoadedRef.current = false;
   }, [task.id, task.status, canUseLive, isAttemptControlled]);
@@ -3369,7 +3575,14 @@ function TaskLogViewer({
           return;
         }
 
-        const suffix = currentSelectedAttempt !== null ? `?attempt=${currentSelectedAttempt}` : '';
+        const params = new URLSearchParams();
+        if (currentSelectedAttempt !== null) {
+          params.set('attempt', String(currentSelectedAttempt));
+        }
+        if (loadFullLog) {
+          params.set('full', '1');
+        }
+        const suffix = params.toString() ? `?${params.toString()}` : '';
         const payload = await api<TaskLogPayload>(`/api/tasks/${task.id}/log${suffix}`);
         if (cancelled) return;
         const nextLogs = payload.logs || [];
@@ -3392,12 +3605,15 @@ function TaskLogViewer({
     };
 
     loadLogs();
-    const timer = window.setInterval(loadLogs, 2000);
+    const shouldPoll = isLiveSelected || !loadFullLog || task.status === 'running';
+    const timer = shouldPoll ? window.setInterval(loadLogs, 2000) : null;
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
     };
-  }, [task.id, currentSelectedAttempt, isLiveSelected, updateSelectedAttempt]);
+  }, [task.id, task.status, currentSelectedAttempt, isLiveSelected, loadFullLog, updateSelectedAttempt]);
 
   const handleSelectAttempt = (value: string) => {
     hasLoadedRef.current = false;
@@ -3440,6 +3656,12 @@ function TaskLogViewer({
     }
   };
 
+  const handleToggleFullLog = () => {
+    hasLoadedRef.current = false;
+    setLoadFullLogRequested(prev => !prev);
+    setContent(isLiveSelected ? '实时终端连接中...' : '正在加载日志...');
+  };
+
   const selectValue = isLiveSelected ? 'live' : (currentSelectedAttempt !== null ? String(currentSelectedAttempt) : '');
   const hasSelectableOptions = canUseLive || selectableLogs.length > 0 || currentSelectedAttempt !== null;
   const selectedLogTime = formatTime(selectedLog?.finished_at || selectedLog?.modified_at);
@@ -3467,23 +3689,44 @@ function TaskLogViewer({
         {selectedLogTime && (
           <span className="text-[10px] font-mono text-slate-500">{selectedLogTime}</span>
         )}
-        <button
-          type="button"
-          title={currentSelectedAttempt === null ? '实时终端不能删除' : '删除当前日志'}
-          disabled={currentSelectedAttempt === null || !selectedLog || isDeleting}
-          onClick={handleDeleteLog}
-          className={`ml-auto rounded p-1.5 transition-colors ${
-            currentSelectedAttempt === null || !selectedLog || isDeleting
-              ? 'cursor-not-allowed text-slate-700'
-              : 'text-slate-500 hover:bg-rose-500/10 hover:text-rose-400'
-          }`}
-        >
-          {isDeleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
-        </button>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            type="button"
+            title={loadFullLog ? '当前加载完整日志' : '加载完整日志'}
+            disabled={isFullScreen}
+            onClick={handleToggleFullLog}
+            className={`inline-flex items-center gap-1 rounded px-1.5 py-1 text-[10px] font-bold transition-colors ${
+              loadFullLog
+                ? 'bg-emerald-500/10 text-emerald-400'
+                : 'text-slate-500 hover:bg-slate-800 hover:text-slate-300'
+            } ${isFullScreen ? 'cursor-default' : ''}`}
+          >
+            <FileText className="h-3.5 w-3.5" />
+            <span>{loadFullLog ? '完整' : '尾部'}</span>
+          </button>
+          <button
+            type="button"
+            title={currentSelectedAttempt === null ? '实时终端不能删除' : '删除当前日志'}
+            disabled={currentSelectedAttempt === null || !selectedLog || isDeleting}
+            onClick={handleDeleteLog}
+            className={`rounded p-1.5 transition-colors ${
+              currentSelectedAttempt === null || !selectedLog || isDeleting
+                ? 'cursor-not-allowed text-slate-700'
+                : 'text-slate-500 hover:bg-rose-500/10 hover:text-rose-400'
+            }`}
+          >
+            {isDeleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+          </button>
+        </div>
       </div>
       <div className="relative min-h-0 flex-1 overflow-hidden">
         {isLiveSelected ? (
-          <LiveTerminal taskId={task.id} taskName={task.name} isFullScreen={isFullScreen} />
+          <LiveTerminal
+            taskId={task.id}
+            taskName={task.name}
+            isFullScreen={isFullScreen}
+            loadFullSnapshot={loadFullLog}
+          />
         ) : (
           <>
             {isLoading && (
@@ -3505,16 +3748,20 @@ function TaskLogViewer({
 function LiveTerminal({
   taskId,
   taskName,
+  isFullScreen = false,
+  loadFullSnapshot = false,
 }: {
   taskId: string;
   taskName: string;
   isFullScreen?: boolean;
+  loadFullSnapshot?: boolean;
 }) {
+  const streamUrl = `/api/tasks/${taskId}/terminal/stream${isFullScreen || loadFullSnapshot ? '?full=1' : ''}`;
   return (
     <StreamingTerminal
       streamKey={`task-${taskId}`}
       title={taskName}
-      streamUrl={`/api/tasks/${taskId}/terminal/stream`}
+      streamUrl={streamUrl}
       resizeUrl={`/api/tasks/${taskId}/terminal/resize`}
       statusSuffix={`#${taskId}`}
       connectingMessage={`[exp-scheduler] connecting terminal stream for task #${taskId}`}
@@ -3552,7 +3799,7 @@ function StreamingTerminal({
   liveStatus,
   finishedFallback,
   normalizeCarriageReturns = true,
-  scrollback = 5000,
+  scrollback = 20000,
   streamWithInitialSize = false,
 }: {
   streamKey: string;
@@ -3574,6 +3821,8 @@ function StreamingTerminal({
   const lastSizeKeyRef = useRef('');
   const autoFollowRef = useRef(true);
   const pendingCarriageReturnRef = useRef(false);
+  const lineCellWidthRef = useRef(0);
+  const ansiParseStateRef = useRef<AnsiParseState>('normal');
   const [connectionStatus, setConnectionStatus] = useState('连接中');
 
   const sendResize = useCallback(async () => {
@@ -3641,12 +3890,20 @@ function StreamingTerminal({
       terminal.reset();
       autoFollowRef.current = true;
       pendingCarriageReturnRef.current = false;
+      lineCellWidthRef.current = 0;
+      ansiParseStateRef.current = 'normal';
     }
     if (!data) return;
     const shouldFollow = Boolean(options.reset || autoFollowRef.current || isTerminalNearBottom(terminal));
     try {
       const bytes = normalizeCarriageReturns
-        ? decodeTerminalBytes(data, pendingCarriageReturnRef)
+        ? decodeTerminalBytes(
+            data,
+            pendingCarriageReturnRef,
+            lineCellWidthRef,
+            ansiParseStateRef,
+            terminal.cols || DEFAULT_TERMINAL_COLUMNS,
+          )
         : decodeBase64Bytes(data);
       terminal.write(bytes, () => {
         if (shouldFollow) {
@@ -3707,6 +3964,8 @@ function StreamingTerminal({
       fitAddonRef.current = null;
       lastSizeKeyRef.current = '';
       pendingCarriageReturnRef.current = false;
+      lineCellWidthRef.current = 0;
+      ansiParseStateRef.current = 'normal';
     };
   }, [fitAndResize, scrollback]);
 
@@ -3717,6 +3976,8 @@ function StreamingTerminal({
     setConnectionStatus('连接中');
     terminal.reset();
     pendingCarriageReturnRef.current = false;
+    lineCellWidthRef.current = 0;
+    ansiParseStateRef.current = 'normal';
     terminal.writeln(connectingMessage);
 
     const source = new EventSource(streamUrlWithCurrentSize());

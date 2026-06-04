@@ -12,7 +12,8 @@ from typing import BinaryIO
 
 
 TERMINAL_SNAPSHOT_BYTES = 256 * 1024
-TERMINAL_SCROLLBACK_LINES = 5000
+TASK_TERMINAL_SNAPSHOT_BYTES = 2 * 1024 * 1024
+TERMINAL_SCROLLBACK_LINES = 20000
 TERMINAL_CHUNK_BYTES = 4096
 TERMINAL_SUBSCRIBER_QUEUE_SIZE = 128
 DEFAULT_TERMINAL_COLUMNS = 160
@@ -23,6 +24,8 @@ ANSI_OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 ANSI_ESCAPE_RE = re.compile(r"\x1b[@-_]")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 PROGRESS_RETURN_RE = re.compile(r"(?:\d{1,3}%\||\|\s*\d+/\d+|\bit/s\b|[KMGT]?B/s)")
+PROGRESS_PERCENT_KEY_RE = re.compile(r"^(?P<key>.*?)(?:\d{1,3}%\|)")
+PROGRESS_COUNT_KEY_RE = re.compile(r"^(?P<key>.*?)(?:\|\s*\d+/\d+)")
 
 
 def encode_terminal_text(text: str) -> bytes:
@@ -52,7 +55,7 @@ class TerminalSession:
     reader_task: asyncio.Task[None] | None = None
     closed: bool = False
 
-    def subscribe(self, *, snapshot_bytes: int = TERMINAL_SNAPSHOT_BYTES) -> tuple[TerminalSubscriber, bytes]:
+    def subscribe(self, *, snapshot_bytes: int | None = TERMINAL_SNAPSHOT_BYTES) -> tuple[TerminalSubscriber, bytes]:
         snapshot = read_bytes_tail(self.log_path, tail_bytes=snapshot_bytes)
         subscriber = TerminalSubscriber()
         self.subscribers.add(subscriber)
@@ -88,14 +91,90 @@ class TerminalSession:
         self.subscribers.clear()
 
 
-def read_bytes_tail(path: Path, *, tail_bytes: int) -> bytes:
+def read_bytes_tail(path: Path, *, tail_bytes: int | None) -> bytes:
     if not path.exists():
         return b""
     with path.open("rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        fh.seek(max(0, size - tail_bytes))
+        if tail_bytes is not None:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - tail_bytes))
         return fh.read()
+
+
+def compact_progress_terminal_bytes(data: bytes) -> bytes:
+    text = data.decode("utf-8", errors="replace")
+    if not has_compactable_progress_returns(text) and not has_repeated_progress_lines(text):
+        return data
+    compacted_text = collapse_repeated_progress_lines(
+        collapse_progress_carriage_returns(text)
+    )
+    compacted = encode_terminal_text(compacted_text)
+    return compacted if len(compacted) < len(data) else data
+
+
+def compact_progress_log_file(path: Path) -> bool:
+    if not path.exists():
+        return False
+    original = path.read_bytes()
+    compacted = compact_progress_terminal_bytes(original)
+    if compacted == original:
+        return False
+    temp_path = path.with_name(f".{path.name}.compact-{os.getpid()}.tmp")
+    try:
+        temp_path.write_bytes(compacted)
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+    return True
+
+
+def has_compactable_progress_returns(text: str) -> bool:
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if "\r" not in line:
+            continue
+        segments = [segment for segment in line.split("\r") if segment]
+        if len(segments) > 1 and any(PROGRESS_RETURN_RE.search(segment) for segment in segments):
+            return True
+    return False
+
+
+def has_repeated_progress_lines(text: str) -> bool:
+    previous_key: str | None = None
+    repeat_count = 0
+    for line in text.replace("\r\n", "\n").split("\n"):
+        key = progress_line_key(line)
+        if key is None:
+            previous_key = None
+            repeat_count = 0
+            continue
+        if key == previous_key:
+            repeat_count += 1
+            if repeat_count >= 3:
+                return True
+        else:
+            previous_key = key
+            repeat_count = 1
+    return False
+
+
+def progress_line_key(line: str) -> str | None:
+    clean_line = ANSI_OSC_RE.sub("", line)
+    clean_line = ANSI_CSI_RE.sub("", clean_line)
+    clean_line = ANSI_ESCAPE_RE.sub("", clean_line)
+    clean_line = CONTROL_CHAR_RE.sub("", clean_line).strip()
+    if not clean_line or clean_line.startswith("[exp-scheduler]"):
+        return None
+    if not PROGRESS_RETURN_RE.search(clean_line):
+        return None
+    match = PROGRESS_PERCENT_KEY_RE.search(clean_line) or PROGRESS_COUNT_KEY_RE.search(clean_line)
+    if match is None:
+        return "__progress__"
+    key = match.group("key").strip()
+    return key or "__progress__"
 
 
 def normalize_terminal_size(*, cols: int, rows: int) -> tuple[int, int]:
@@ -137,7 +216,41 @@ def collapse_progress_carriage_returns(text: str) -> str:
     return "\n".join(lines)
 
 
-def read_text_tail(path: Path, *, tail_bytes: int) -> str:
+def collapse_repeated_progress_lines(text: str) -> str:
+    lines = text.replace("\r\n", "\n").split("\n")
+    output: list[str] = []
+    run_key: str | None = None
+    run_lines: list[str] = []
+
+    def flush_run() -> None:
+        nonlocal run_key, run_lines
+        if not run_lines:
+            return
+        if len(run_lines) >= 3:
+            output.append(run_lines[-1])
+        else:
+            output.extend(run_lines)
+        run_key = None
+        run_lines = []
+
+    for line in lines:
+        key = progress_line_key(line)
+        if key is None:
+            flush_run()
+            output.append(line)
+            continue
+        if run_lines and key == run_key:
+            run_lines.append(line)
+            continue
+        flush_run()
+        run_key = key
+        run_lines = [line]
+
+    flush_run()
+    return "\n".join(output)
+
+
+def read_text_tail(path: Path, *, tail_bytes: int | None) -> str:
     return normalize_terminal_bytes_to_text(read_bytes_tail(path, tail_bytes=tail_bytes))
 
 

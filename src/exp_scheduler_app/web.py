@@ -41,6 +41,7 @@ class CreateTaskRequest(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     notes: str | None = None
     is_urgent: bool = False
+    queue_name: str | None = None
     requested_gpu: int | None = None
     gpu_memory_budget_mb: int | None = Field(default=None, gt=0)
     profile_id: int | None = None
@@ -58,6 +59,10 @@ class UpdateTaskMetadataRequest(BaseModel):
 
 class SetDependenciesRequest(BaseModel):
     depends_on: list[int]
+
+
+class MoveTaskQueueRequest(BaseModel):
+    queue_name: str
 
 
 class ProfileRequest(BaseModel):
@@ -197,7 +202,7 @@ def create_app(
             history_sort=history_sort,
             history_status=history_status,
         )
-        for key in ("queued", "urgent_queued", "running", "history"):
+        for key in ("queued", "urgent_queued", "staged", "running", "history"):
             for task in result.get(key, []):
                 add_dependency_payload(task)
         return result
@@ -283,6 +288,7 @@ def create_app(
                 env=payload.env,
                 notes=payload.notes,
                 is_urgent=payload.is_urgent,
+                queue_name=payload.queue_name,
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
                 profile_id=payload.profile_id,
@@ -307,6 +313,7 @@ def create_app(
                 env=payload.env,
                 notes=payload.notes,
                 is_urgent=payload.is_urgent,
+                queue_name=payload.queue_name,
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
                 profile_id=payload.profile_id,
@@ -335,6 +342,23 @@ def create_app(
                 notes=payload.notes,
                 update_name="name" in fields_set,
                 update_notes="notes" in fields_set,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "不存在" in message else 400
+            raise HTTPException(status_code=status_code, detail=message) from exc
+        add_dependency_payload(task, include_details=True)
+        return {"task": task}
+
+    @app.patch("/api/tasks/{task_id}/queue")
+    async def move_task_queue_endpoint(
+        task_id: int,
+        payload: MoveTaskQueueRequest,
+    ) -> dict[str, object]:
+        try:
+            task = await scheduler.move_task_to_queue(
+                task_id,
+                queue_name=payload.queue_name,
             )
         except ValueError as exc:
             message = str(exc)
@@ -564,8 +588,11 @@ def create_app(
     async def get_task_log_endpoint(
         task_id: int,
         attempt: int | None = Query(default=None, ge=1),
+        full: bool = Query(default=False),
     ) -> dict[str, object]:
         try:
+            if full:
+                return await scheduler.read_task_log(task_id, attempt=attempt, tail_bytes=None)
             return await scheduler.read_task_log(task_id, attempt=attempt)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -587,9 +614,15 @@ def create_app(
             raise HTTPException(status_code=status_code, detail=message) from exc
 
     @app.get("/api/tasks/{task_id}/terminal/stream")
-    async def get_task_terminal_stream_endpoint(task_id: int) -> StreamingResponse:
+    async def get_task_terminal_stream_endpoint(
+        task_id: int,
+        full: bool = Query(default=False),
+    ) -> StreamingResponse:
         try:
-            _, subscriber, snapshot = await scheduler.subscribe_terminal_stream(task_id)
+            _, subscriber, snapshot = await scheduler.subscribe_terminal_stream(
+                task_id,
+                full_snapshot=full,
+            )
         except ValueError as exc:
             message = str(exc)
             status_code = 404 if "不存在" in message else 409

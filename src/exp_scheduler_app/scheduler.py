@@ -17,17 +17,18 @@ from typing import Callable
 from uuid import uuid4
 
 from .config import SchedulerConfig
-from .database import Database, NORMAL_QUEUE, URGENT_QUEUE
+from .database import Database, NORMAL_QUEUE, STAGED_QUEUE, URGENT_QUEUE
 from .events import EventBroker
 from .gpu import GPUInfo, query_gpus
 from .profile_discovery import discover_installed_environments
 from .terminal import (
     DEFAULT_TERMINAL_COLUMNS,
     DEFAULT_TERMINAL_ROWS,
+    TASK_TERMINAL_SNAPSHOT_BYTES,
     TERMINAL_CHUNK_BYTES,
-    TERMINAL_SNAPSHOT_BYTES,
     TerminalSession,
     TerminalSubscriber,
+    compact_progress_log_file,
     encode_terminal_text,
     read_text,
     read_text_tail,
@@ -59,6 +60,14 @@ RETRYABLE_OOM_PATTERN = re.compile(
     r"cudaerrordevicesunavailable|killed|terminated|oom-kill|out of memory: kill process",
     re.IGNORECASE,
 )
+
+
+def queue_display_name(queue_name: str) -> str:
+    if queue_name == URGENT_QUEUE:
+        return "紧急"
+    if queue_name == STAGED_QUEUE:
+        return "暂存"
+    return "普通"
 
 
 @dataclass(slots=True)
@@ -244,6 +253,7 @@ class SchedulerService:
         env: dict[str, str],
         notes: str | None,
         is_urgent: bool = False,
+        queue_name: str | None = None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
         profile_id: int | None = None,
@@ -253,7 +263,7 @@ class SchedulerService:
         normalized_gpu_memory_budget_mb = self._normalize_gpu_memory_budget_mb(
             gpu_memory_budget_mb
         )
-        queue_name = URGENT_QUEUE if is_urgent else NORMAL_QUEUE
+        final_queue_name = queue_name or (URGENT_QUEUE if is_urgent else NORMAL_QUEUE)
         final_name = (name or "").strip() or command.strip()[:80]
         profile_name: str | None = None
         shell_setup: str | None = None
@@ -281,7 +291,7 @@ class SchedulerService:
             notes=notes,
             requested_gpu=normalized_requested_gpu,
             gpu_memory_budget_mb=normalized_gpu_memory_budget_mb,
-            queue_name=queue_name,
+            queue_name=final_queue_name,
             profile_id=profile_id,
             profile_name=profile_name,
             shell_setup=shell_setup,
@@ -292,8 +302,12 @@ class SchedulerService:
             action="task_created",
             entity_type="task",
             entity_id=int(task["id"]),
-            title=f"任务 #{task['id']} 已加入队列",
-            detail=f"任务 {task['name']} 已加入{'紧急' if queue_name == URGENT_QUEUE else '普通'}队列。",
+            title=(
+                f"任务 #{task['id']} 已加入暂存队列"
+                if task.get("queue_name") == STAGED_QUEUE
+                else f"任务 #{task['id']} 已加入队列"
+            ),
+            detail=f"任务 {task['name']} 已加入{queue_display_name(str(task.get('queue_name')))}队列。",
             metadata=self._task_log_metadata(task),
         )
         await self.events.publish("task_created", {"task_id": task["id"]})
@@ -445,6 +459,7 @@ class SchedulerService:
         env: dict[str, str],
         notes: str | None,
         is_urgent: bool = False,
+        queue_name: str | None = None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
         profile_id: int | None = None,
@@ -454,7 +469,7 @@ class SchedulerService:
         normalized_gpu_memory_budget_mb = self._normalize_gpu_memory_budget_mb(
             gpu_memory_budget_mb
         )
-        queue_name = URGENT_QUEUE if is_urgent else NORMAL_QUEUE
+        final_queue_name = queue_name or (URGENT_QUEUE if is_urgent else NORMAL_QUEUE)
         final_name = (name or "").strip() or command.strip()[:80]
         profile_name: str | None = None
         shell_setup: str | None = None
@@ -484,7 +499,7 @@ class SchedulerService:
                 notes=notes,
                 requested_gpu=normalized_requested_gpu,
                 gpu_memory_budget_mb=normalized_gpu_memory_budget_mb,
-                queue_name=queue_name,
+                queue_name=final_queue_name,
                 profile_id=profile_id,
                 profile_name=profile_name,
                 shell_setup=shell_setup,
@@ -501,6 +516,32 @@ class SchedulerService:
         )
         await self.events.publish("task_updated", {"task_id": task["id"]})
         await self._trigger_immediate_schedule()
+        return task
+
+    async def move_task_to_queue(
+        self,
+        task_id: int,
+        *,
+        queue_name: str,
+    ) -> dict[str, object]:
+        async with self._lock:
+            task = self.database.move_task_to_queue(task_id, queue_name=queue_name)
+        final_queue_name = str(task.get("queue_name") or NORMAL_QUEUE)
+        await self._record_operation(
+            level="info",
+            action="task_moved_to_queue",
+            entity_type="task",
+            entity_id=int(task["id"]),
+            title=f"任务 #{task['id']} 已移到{queue_display_name(final_queue_name)}队列",
+            detail=f"任务 {task['name']} 当前位于{queue_display_name(final_queue_name)}队列。",
+            metadata=self._task_log_metadata(task, extra={"queue_name": final_queue_name}),
+        )
+        await self.events.publish(
+            "task_moved_to_queue",
+            {"task_id": task["id"], "queue_name": final_queue_name},
+        )
+        if final_queue_name != STAGED_QUEUE:
+            await self._trigger_immediate_schedule()
         return task
 
     async def update_task_metadata(
@@ -552,7 +593,7 @@ class SchedulerService:
             level="info",
             action="queue_reordered",
             entity_type="queue",
-            title=f"{'紧急' if queue_name == URGENT_QUEUE else '普通'}队列已重排",
+            title=f"{queue_display_name(queue_name)}队列已重排",
             detail=f"新的任务顺序: {task_ids}",
             metadata={"queue_name": queue_name, "task_ids": task_ids},
         )
@@ -938,7 +979,7 @@ class SchedulerService:
         task_id: int,
         *,
         attempt: int | None = None,
-        tail_bytes: int = LOG_TAIL_BYTES,
+        tail_bytes: int | None = LOG_TAIL_BYTES,
     ) -> dict[str, object]:
         task = self.database.get_task(task_id)
         if task is None:
@@ -1010,6 +1051,8 @@ class SchedulerService:
     async def subscribe_terminal_stream(
         self,
         task_id: int,
+        *,
+        full_snapshot: bool = False,
     ) -> tuple[dict[str, object], TerminalSubscriber, bytes]:
         task = self.database.get_task(task_id)
         if task is None:
@@ -1020,7 +1063,9 @@ class SchedulerService:
             session = self._terminal_sessions.get(task_id)
             if session is None or session.closed:
                 raise ValueError("运行中的任务终端不可用")
-            subscriber, snapshot = session.subscribe(snapshot_bytes=TERMINAL_SNAPSHOT_BYTES)
+            subscriber, snapshot = session.subscribe(
+                snapshot_bytes=None if full_snapshot else TASK_TERMINAL_SNAPSHOT_BYTES
+            )
         return task, subscriber, snapshot
 
     async def unsubscribe_terminal_stream(
@@ -2789,6 +2834,10 @@ class SchedulerService:
         if not session.log_file.closed:
             session.log_file.flush()
             session.log_file.close()
+        try:
+            compact_progress_log_file(session.log_path)
+        except OSError:
+            LOGGER.warning("Failed to compact progress log for task %s", session.task_id, exc_info=True)
 
     def _append_terminal_bytes(self, session: TerminalSession, data: bytes) -> None:
         session.append_bytes(data)

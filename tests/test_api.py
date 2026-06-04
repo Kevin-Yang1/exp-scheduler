@@ -522,6 +522,70 @@ def test_urgent_queue_listing_and_preempt_requires_waiting_urgent_task(tmp_path)
         assert preempt.status_code == 409
 
 
+def test_staged_queue_listing_and_quick_move(tmp_path):
+    with make_client(tmp_path) as client:
+        client.fake_gpu_provider.set_gpus([gpu(0, idle=False)])
+
+        staged = client.post(
+            "/api/tasks",
+            json={
+                "name": "later-job",
+                "command": command("print('later')"),
+                "cwd": None,
+                "env": {},
+                "notes": None,
+                "queue_name": "staged",
+            },
+        )
+        staged.raise_for_status()
+        task_id = staged.json()["task"]["id"]
+        assert staged.json()["task"]["status"] == "staged"
+        assert staged.json()["task"]["queue_name"] == "staged"
+
+        tasks = client.get("/api/tasks")
+        tasks.raise_for_status()
+        payload = tasks.json()
+        assert [task["id"] for task in payload["staged"]] == [task_id]
+        assert payload["queued"] == []
+        assert payload["urgent_queued"] == []
+        assert payload["history"] == []
+        assert payload["counts"]["staged"] == 1
+        assert payload["counts"]["history"] == 0
+        assert payload["counts"]["total"] == 1
+
+        move_normal = client.patch(
+            f"/api/tasks/{task_id}/queue",
+            json={"queue_name": "normal"},
+        )
+        move_normal.raise_for_status()
+        assert move_normal.json()["task"]["status"] == "queued"
+        assert move_normal.json()["task"]["queue_name"] == "normal"
+
+        tasks = client.get("/api/tasks")
+        tasks.raise_for_status()
+        assert [task["id"] for task in tasks.json()["queued"]] == [task_id]
+        assert tasks.json()["staged"] == []
+
+        move_staged = client.patch(
+            f"/api/tasks/{task_id}/queue",
+            json={"queue_name": "staged"},
+        )
+        move_staged.raise_for_status()
+        assert move_staged.json()["task"]["status"] == "staged"
+
+        move_urgent = client.patch(
+            f"/api/tasks/{task_id}/queue",
+            json={"queue_name": "urgent"},
+        )
+        move_urgent.raise_for_status()
+        assert move_urgent.json()["task"]["status"] == "queued"
+        assert move_urgent.json()["task"]["queue_name"] == "urgent"
+
+        tasks = client.get("/api/tasks")
+        tasks.raise_for_status()
+        assert [task["id"] for task in tasks.json()["urgent_queued"]] == [task_id]
+
+
 def test_update_queued_task_endpoint_supports_in_place_edit(tmp_path):
     with make_client(tmp_path) as client:
         profile = client.post(
