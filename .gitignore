@@ -1,0 +1,17 @@
+.DS_Store
+Thumbs.db
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+frontend/node_modules/
+frontend/dist/
+
+tmp/

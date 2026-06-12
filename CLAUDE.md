@@ -5,47 +5,45 @@ GPU 实验任务调度器 — 在多 GPU 服务器上排队、调度和管理深
 ## 项目结构
 
 ```
-scripts/exp_scheduler.py          # CLI 入口，调用 src/exp_scheduler_app/cli.py
-tools/exp-scheduler/
-  src/exp_scheduler_app/          # Python 后端包
-    cli.py                        # argparse: init, serve, doctor
-    config.py                     # TOML 配置加载 (dataclass SchedulerConfig)
-    database.py                   # SQLite ORM (threading.RLock, WAL mode)
-    scheduler.py                  # 核心调度引擎 (SchedulerService)
-    web.py                        # FastAPI 应用 + API 路由 + SSE
-    gpu.py                        # nvidia-smi GPU 查询
-    events.py                     # 异步事件发布/订阅 (asyncio.Queue)
-    terminal.py                   # PTY 终端会话管理
-    system_terminal.py            # nvitop 系统终端服务
-    profile_discovery.py          # conda/venv 环境自动发现
-    static/                       # Vite 构建产物，由 FastAPI 静态服务
-  frontend/                       # React 前端源码
-    src/App.tsx                   # 单文件 React 应用
-    src/index.css                 # Tailwind + 自定义样式
-    src/main.tsx                  # React 入口
-  tests/                          # pytest 测试
-    test_api.py                   # API 集成测试
-    test_scheduler.py             # 调度器单元测试
-    test_profile_discovery.py     # 环境发现测试
-  deploy/exp-scheduler.service    # systemd 用户服务模板
+pyproject.toml                    # Python 包配置与 exp-scheduler 命令入口
+src/exp_scheduler_app/            # Python 后端包
+  cli.py                          # argparse: init, serve, doctor
+  config.py                       # TOML 配置加载 (dataclass SchedulerConfig)
+  database.py                     # SQLite ORM (threading.RLock, WAL mode)
+  scheduler.py                    # 核心调度引擎 (SchedulerService)
+  web.py                          # FastAPI 应用 + API 路由 + SSE
+  gpu.py                          # nvidia-smi GPU 查询
+  events.py                       # 异步事件发布/订阅 (asyncio.Queue)
+  terminal.py                     # PTY 终端会话管理
+  system_terminal.py              # nvitop 系统终端服务
+  profile_discovery.py            # conda/venv 环境自动发现
+  static/                         # Vite 构建产物，由 FastAPI 静态服务
+frontend/                         # React 前端源码
+  src/App.tsx                     # 单文件 React 应用
+  src/index.css                   # Tailwind + 自定义样式
+  src/main.tsx                    # React 入口
+tests/                            # pytest 测试
+  test_api.py                     # API 集成测试
+  test_scheduler.py               # 调度器单元测试
+  test_profile_discovery.py       # 环境发现测试
+deploy/exp-scheduler.service      # systemd 用户服务模板
 ```
 
 ## 常用命令
 
 ```bash
 # 后端
-python scripts/exp_scheduler.py init             # 初始化配置和数据库
-python scripts/exp_scheduler.py serve            # 启动 Web 服务 (默认 127.0.0.1:17861)
-python scripts/exp_scheduler.py doctor           # 环境诊断
+exp-scheduler init                 # 初始化配置和数据库
+exp-scheduler serve                # 启动 Web 服务 (默认 127.0.0.1:17861)
+exp-scheduler doctor               # 环境诊断
 
 # 前端开发
-cd tools/exp-scheduler/frontend
+cd frontend
 npm run dev                    # Vite 开发服务器 (端口 3000)
 npm run build                  # 构建到 src/exp_scheduler_app/static/
 npm run lint                   # TypeScript 类型检查
 
 # 测试
-cd tools/exp-scheduler
 pytest tests/ -v               # 运行全部测试
 pytest tests/test_scheduler.py # 调度器单元测试
 pytest tests/test_api.py       # API 集成测试
