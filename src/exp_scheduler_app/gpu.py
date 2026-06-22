@@ -60,7 +60,12 @@ def _run_nvidia_smi(query: str, *, process_query: bool = False) -> subprocess.Co
 
 
 def query_gpus() -> list[GPUInfo]:
-    result = _run_nvidia_smi(GPU_QUERY)
+    # 无 GPU 的机器（如作为主控的本地 WSL）按零 GPU 运行，
+    # 文件同步 / 交互终端等功能不依赖 GPU。
+    try:
+        result = _run_nvidia_smi(GPU_QUERY)
+    except FileNotFoundError:
+        return []
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "nvidia-smi 调用失败")
 

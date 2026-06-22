@@ -17,6 +17,8 @@ DEFAULT_AUTO_RESTORE_IDLE_GPU_SECONDS = 5 * 60
 DEFAULT_AUTO_RETRY_MAX_RETRIES = 0
 DEFAULT_AUTO_RETRY_DELAY_SECONDS = 5
 DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS = 5 * 60
+DEFAULT_MAX_INTERACTIVE_TERMINALS = 16
+DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS = 30 * 60
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "exp-scheduler" / "config.toml"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "share" / "exp-scheduler"
 
@@ -118,6 +120,8 @@ class SchedulerConfig:
     external_kill_gpu_cooldown_seconds: float = (
         DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS
     )
+    max_interactive_terminals: int = DEFAULT_MAX_INTERACTIVE_TERMINALS
+    terminal_idle_timeout_seconds: float = DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS
     state_dir: Path = DEFAULT_STATE_DIR
     log_dir: Path = DEFAULT_STATE_DIR / "logs"
 
@@ -188,6 +192,16 @@ def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
             ),
             name="external_kill_gpu_cooldown_seconds",
         ),
+        max_interactive_terminals=int(
+            data.get("max_interactive_terminals", DEFAULT_MAX_INTERACTIVE_TERMINALS)
+        ),
+        terminal_idle_timeout_seconds=_nonnegative_seconds(
+            data.get(
+                "terminal_idle_timeout_seconds",
+                DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS,
+            ),
+            name="terminal_idle_timeout_seconds",
+        ),
         state_dir=state_dir,
         log_dir=log_dir,
     )
@@ -207,6 +221,8 @@ def default_config_text() -> str:
             f"auto_retry_max_retries = {DEFAULT_AUTO_RETRY_MAX_RETRIES}",
             f"auto_retry_delay_seconds = {DEFAULT_AUTO_RETRY_DELAY_SECONDS}",
             f"external_kill_gpu_cooldown_seconds = {DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS}",
+            f"max_interactive_terminals = {DEFAULT_MAX_INTERACTIVE_TERMINALS}",
+            f"terminal_idle_timeout_seconds = {DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS}",
             f'state_dir = "{DEFAULT_STATE_DIR}"',
             f'log_dir = "{DEFAULT_STATE_DIR / "logs"}"',
             "",

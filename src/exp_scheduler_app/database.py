@@ -17,6 +17,43 @@ URGENT_QUEUE = "urgent"
 STAGED_QUEUE = "staged"
 VALID_QUEUE_NAMES = {NORMAL_QUEUE, URGENT_QUEUE, STAGED_QUEUE}
 SCHEDULER_SETTINGS_META_KEY = "scheduler_settings"
+TRANSFER_SETTINGS_META_KEY = "transfer_settings"
+
+# 主控自身的隐含伪节点 id（不入 nodes 表）
+LOCAL_NODE_ID = "local"
+
+TRANSFER_JOB_STATUSES = {
+    "pending",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "interrupted",
+}
+
+# update_transfer_job 允许更新的列白名单
+_TRANSFER_JOB_UPDATABLE_FIELDS = {
+    "name",
+    "route",
+    "route_resolved_by",
+    "route_attempts",
+    "status",
+    "phase",
+    "progress_percent",
+    "bytes_transferred",
+    "transfer_rate",
+    "eta",
+    "files_transferred",
+    "exit_code",
+    "error",
+    "error_code",
+    "pid",
+    "agent_pid",
+    "bridge_port",
+    "log_path",
+    "started_at",
+    "finished_at",
+}
 
 
 class Database:
@@ -168,6 +205,108 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_agent_gpu_leases_active
                 ON agent_gpu_leases(released_at, expires_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ssh_keys (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,
+                    key_path TEXT NOT NULL,
+                    public_key TEXT,
+                    fingerprint TEXT,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS nodes (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    host TEXT NOT NULL,
+                    ssh_port INTEGER NOT NULL DEFAULT 22,
+                    username TEXT NOT NULL,
+                    auth_method TEXT NOT NULL,
+                    ssh_key_id TEXT,
+                    password TEXT,
+                    notes TEXT,
+                    rsync_version TEXT,
+                    has_sshpass INTEGER,
+                    tcp_forward_ok INTEGER,
+                    agent_forward_ok INTEGER,
+                    last_capabilities_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS node_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_node_id TEXT NOT NULL,
+                    to_node_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    latency_ms REAL,
+                    last_probe_at TEXT,
+                    last_error TEXT,
+                    probe_method TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(from_node_id, to_node_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_node_links_from
+                ON node_links(from_node_id, status)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transfer_jobs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    src_node_id TEXT NOT NULL,
+                    src_path TEXT NOT NULL,
+                    dst_node_id TEXT NOT NULL,
+                    dst_path TEXT NOT NULL,
+                    route TEXT NOT NULL,
+                    route_resolved_by TEXT NOT NULL DEFAULT 'auto',
+                    route_attempts TEXT NOT NULL DEFAULT '[]',
+                    rsync_args TEXT NOT NULL DEFAULT '[]',
+                    delete_extras INTEGER NOT NULL DEFAULT 0,
+                    dry_run INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    phase TEXT,
+                    progress_percent REAL,
+                    bytes_transferred INTEGER,
+                    transfer_rate TEXT,
+                    eta TEXT,
+                    files_transferred INTEGER,
+                    exit_code INTEGER,
+                    error TEXT,
+                    error_code TEXT,
+                    pid INTEGER,
+                    agent_pid INTEGER,
+                    bridge_port INTEGER,
+                    log_path TEXT,
+                    node_snapshot TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_transfer_jobs_status
+                ON transfer_jobs(status, created_at DESC)
                 """
             )
             conn.execute(
@@ -1058,6 +1197,612 @@ class Database:
         if row is None:
             return None
         return self._row_to_agent_gpu_lease(row, now_iso=now)
+
+    # ---------- SSH 密钥库 ----------
+
+    def create_ssh_key(
+        self,
+        *,
+        key_id: str,
+        name: str,
+        kind: str,
+        key_path: str,
+        public_key: str | None,
+        fingerprint: str | None,
+        notes: str | None,
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ssh_keys(
+                    id, name, kind, key_path, public_key, fingerprint, notes,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (key_id, name, kind, key_path, public_key, fingerprint, notes, now, now),
+            )
+            conn.commit()
+        key = self.get_ssh_key(key_id)
+        if key is None:
+            raise ValueError(f"SSH 密钥不存在: {key_id}")
+        return key
+
+    def get_ssh_key(self, key_id: str) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM ssh_keys WHERE id = ?",
+                (key_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_ssh_key(row)
+
+    def list_ssh_keys(self) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ssh_keys ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+        return [self._row_to_ssh_key(row) for row in rows]
+
+    def update_ssh_key(
+        self,
+        key_id: str,
+        *,
+        name: str,
+        notes: str | None,
+    ) -> dict[str, object]:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE ssh_keys
+                SET name = ?, notes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (name, notes, utc_now_iso(), key_id),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise ValueError(f"SSH 密钥不存在: {key_id}")
+        key = self.get_ssh_key(key_id)
+        if key is None:
+            raise ValueError(f"SSH 密钥不存在: {key_id}")
+        return key
+
+    def delete_ssh_key(self, key_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM ssh_keys WHERE id = ?", (key_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def count_nodes_using_key(self, key_id: str) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM nodes WHERE ssh_key_id = ?",
+                (key_id,),
+            ).fetchone()
+        return int(row["count"])
+
+    # ---------- 节点注册表 ----------
+
+    def create_node(
+        self,
+        *,
+        node_id: str,
+        name: str,
+        host: str,
+        ssh_port: int,
+        username: str,
+        auth_method: str,
+        ssh_key_id: str | None,
+        password: str | None,
+        notes: str | None,
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO nodes(
+                    id, name, host, ssh_port, username, auth_method,
+                    ssh_key_id, password, notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    node_id,
+                    name,
+                    host,
+                    ssh_port,
+                    username,
+                    auth_method,
+                    ssh_key_id,
+                    password,
+                    notes,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        node = self.get_node(node_id)
+        if node is None:
+            raise ValueError(f"节点不存在: {node_id}")
+        return node
+
+    def get_node(self, node_id: str) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_node(row)
+
+    def list_nodes(self) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM nodes ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [self._row_to_node(row) for row in rows]
+
+    def update_node(
+        self,
+        node_id: str,
+        *,
+        name: str,
+        host: str,
+        ssh_port: int,
+        username: str,
+        auth_method: str,
+        ssh_key_id: str | None,
+        password: str | None,
+        notes: str | None,
+    ) -> dict[str, object]:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE nodes
+                SET name = ?, host = ?, ssh_port = ?, username = ?,
+                    auth_method = ?, ssh_key_id = ?, password = ?, notes = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    host,
+                    ssh_port,
+                    username,
+                    auth_method,
+                    ssh_key_id,
+                    password,
+                    notes,
+                    utc_now_iso(),
+                    node_id,
+                ),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise ValueError(f"节点不存在: {node_id}")
+        node = self.get_node(node_id)
+        if node is None:
+            raise ValueError(f"节点不存在: {node_id}")
+        return node
+
+    def update_node_capabilities(
+        self,
+        node_id: str,
+        *,
+        rsync_version: str | None,
+        has_sshpass: bool | None,
+        tcp_forward_ok: bool | None,
+        agent_forward_ok: bool | None,
+    ) -> None:
+        def to_int(value: bool | None) -> int | None:
+            return None if value is None else int(value)
+
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE nodes
+                SET rsync_version = ?, has_sshpass = ?, tcp_forward_ok = ?,
+                    agent_forward_ok = ?, last_capabilities_at = ?
+                WHERE id = ?
+                """,
+                (
+                    rsync_version,
+                    to_int(has_sshpass),
+                    to_int(tcp_forward_ok),
+                    to_int(agent_forward_ok),
+                    utc_now_iso(),
+                    node_id,
+                ),
+            )
+            conn.commit()
+
+    def delete_node(self, node_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+            conn.execute(
+                "DELETE FROM node_links WHERE from_node_id = ? OR to_node_id = ?",
+                (node_id, node_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ---------- 节点连通性矩阵 ----------
+
+    def upsert_node_link(
+        self,
+        *,
+        from_node_id: str,
+        to_node_id: str,
+        status: str,
+        latency_ms: float | None,
+        last_error: str | None,
+        probe_method: str | None,
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO node_links(
+                    from_node_id, to_node_id, status, latency_ms,
+                    last_probe_at, last_error, probe_method, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(from_node_id, to_node_id) DO UPDATE SET
+                    status = excluded.status,
+                    latency_ms = excluded.latency_ms,
+                    last_probe_at = excluded.last_probe_at,
+                    last_error = excluded.last_error,
+                    probe_method = excluded.probe_method,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    from_node_id,
+                    to_node_id,
+                    status,
+                    latency_ms,
+                    now,
+                    last_error,
+                    probe_method,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        link = self.get_node_link(from_node_id, to_node_id)
+        if link is None:
+            raise ValueError("连通性记录写入失败")
+        return link
+
+    def get_node_link(
+        self,
+        from_node_id: str,
+        to_node_id: str,
+    ) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM node_links
+                WHERE from_node_id = ? AND to_node_id = ?
+                """,
+                (from_node_id, to_node_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_node_link(row)
+
+    def list_node_links(self) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM node_links ORDER BY from_node_id ASC, to_node_id ASC"
+            ).fetchall()
+        return [self._row_to_node_link(row) for row in rows]
+
+    # ---------- 传输任务 ----------
+
+    def create_transfer_job(
+        self,
+        *,
+        job_id: str,
+        name: str | None,
+        src_node_id: str,
+        src_path: str,
+        dst_node_id: str,
+        dst_path: str,
+        route: str,
+        route_resolved_by: str,
+        rsync_args: list[str],
+        delete_extras: bool,
+        dry_run: bool,
+        node_snapshot: dict[str, object],
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO transfer_jobs(
+                    id, name, src_node_id, src_path, dst_node_id, dst_path,
+                    route, route_resolved_by, route_attempts, rsync_args,
+                    delete_extras, dry_run, status, node_snapshot, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    job_id,
+                    name,
+                    src_node_id,
+                    src_path,
+                    dst_node_id,
+                    dst_path,
+                    route,
+                    route_resolved_by,
+                    json.dumps(rsync_args),
+                    int(delete_extras),
+                    int(dry_run),
+                    json.dumps(node_snapshot),
+                    now,
+                ),
+            )
+            conn.commit()
+        job = self.get_transfer_job(job_id)
+        if job is None:
+            raise ValueError(f"传输任务不存在: {job_id}")
+        return job
+
+    def get_transfer_job(self, job_id: str) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM transfer_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_transfer_job(row)
+
+    def list_transfer_jobs(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            if status is not None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM transfer_jobs
+                    WHERE status = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (status, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM transfer_jobs
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+        return [self._row_to_transfer_job(row) for row in rows]
+
+    def list_active_transfer_jobs(self) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM transfer_jobs
+                WHERE status IN ('pending', 'running')
+                ORDER BY created_at ASC, id ASC
+                """
+            ).fetchall()
+        return [self._row_to_transfer_job(row) for row in rows]
+
+    def update_transfer_job(self, job_id: str, **fields: object) -> dict[str, object]:
+        invalid = set(fields) - _TRANSFER_JOB_UPDATABLE_FIELDS
+        if invalid:
+            raise ValueError(f"不允许更新的传输任务字段: {sorted(invalid)}")
+        if not fields:
+            job = self.get_transfer_job(job_id)
+            if job is None:
+                raise ValueError(f"传输任务不存在: {job_id}")
+            return job
+        columns = ", ".join(f"{key} = ?" for key in fields)
+        values = [
+            json.dumps(value) if key == "route_attempts" and not isinstance(value, str) else value
+            for key, value in fields.items()
+        ]
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE transfer_jobs SET {columns} WHERE id = ?",
+                (*values, job_id),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise ValueError(f"传输任务不存在: {job_id}")
+        job = self.get_transfer_job(job_id)
+        if job is None:
+            raise ValueError(f"传输任务不存在: {job_id}")
+        return job
+
+    def append_transfer_route_attempt(
+        self,
+        job_id: str,
+        attempt: dict[str, object],
+    ) -> dict[str, object]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT route_attempts FROM transfer_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"传输任务不存在: {job_id}")
+            try:
+                attempts = json.loads(row["route_attempts"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                attempts = []
+            if not isinstance(attempts, list):
+                attempts = []
+            attempts.append(attempt)
+            conn.execute(
+                "UPDATE transfer_jobs SET route_attempts = ? WHERE id = ?",
+                (json.dumps(attempts), job_id),
+            )
+            conn.commit()
+        job = self.get_transfer_job(job_id)
+        if job is None:
+            raise ValueError(f"传输任务不存在: {job_id}")
+        return job
+
+    def delete_transfer_job(self, job_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM transfer_jobs WHERE id = ?",
+                (job_id,),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def mark_running_transfer_jobs_interrupted(
+        self,
+        *,
+        error: str = "服务重启，传输中断",
+    ) -> list[dict[str, object]]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM transfer_jobs WHERE status = 'running'"
+            ).fetchall()
+            interrupted = [self._row_to_transfer_job(row) for row in rows]
+            conn.execute(
+                """
+                UPDATE transfer_jobs
+                SET status = 'interrupted', finished_at = ?, error = ?
+                WHERE status = 'running'
+                """,
+                (now, error),
+            )
+            conn.commit()
+        return interrupted
+
+    def get_transfer_settings(self) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (TRANSFER_SETTINGS_META_KEY,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def set_transfer_settings(self, settings: dict[str, object]) -> dict[str, object]:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (TRANSFER_SETTINGS_META_KEY, json.dumps(settings)),
+            )
+            conn.commit()
+        return settings
+
+    def _row_to_ssh_key(self, row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "kind": row["kind"],
+            "key_path": row["key_path"],
+            "public_key": row["public_key"],
+            "fingerprint": row["fingerprint"],
+            "notes": row["notes"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _row_to_node(self, row: sqlite3.Row) -> dict[str, object]:
+        # 注意：包含明文 password 字段，仅供后端内部解析认证使用；
+        # API 响应必须经 NodeRegistryService 脱敏后输出。
+        def to_bool(value: object) -> bool | None:
+            return None if value is None else bool(value)
+
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "host": row["host"],
+            "ssh_port": int(row["ssh_port"]),
+            "username": row["username"],
+            "auth_method": row["auth_method"],
+            "ssh_key_id": row["ssh_key_id"],
+            "password": row["password"],
+            "notes": row["notes"],
+            "rsync_version": row["rsync_version"],
+            "has_sshpass": to_bool(row["has_sshpass"]),
+            "tcp_forward_ok": to_bool(row["tcp_forward_ok"]),
+            "agent_forward_ok": to_bool(row["agent_forward_ok"]),
+            "last_capabilities_at": row["last_capabilities_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _row_to_node_link(self, row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "from_node_id": row["from_node_id"],
+            "to_node_id": row["to_node_id"],
+            "status": row["status"],
+            "latency_ms": row["latency_ms"],
+            "last_probe_at": row["last_probe_at"],
+            "last_error": row["last_error"],
+            "probe_method": row["probe_method"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _row_to_transfer_job(self, row: sqlite3.Row) -> dict[str, object]:
+        def parse_json(value: object, fallback: object) -> object:
+            try:
+                parsed = json.loads(value or "")
+            except (TypeError, json.JSONDecodeError):
+                return fallback
+            return parsed if isinstance(parsed, type(fallback)) else fallback
+
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "src_node_id": row["src_node_id"],
+            "src_path": row["src_path"],
+            "dst_node_id": row["dst_node_id"],
+            "dst_path": row["dst_path"],
+            "route": row["route"],
+            "route_resolved_by": row["route_resolved_by"],
+            "route_attempts": parse_json(row["route_attempts"], []),
+            "rsync_args": parse_json(row["rsync_args"], []),
+            "delete_extras": bool(row["delete_extras"]),
+            "dry_run": bool(row["dry_run"]),
+            "status": row["status"],
+            "phase": row["phase"],
+            "progress_percent": row["progress_percent"],
+            "bytes_transferred": row["bytes_transferred"],
+            "transfer_rate": row["transfer_rate"],
+            "eta": row["eta"],
+            "files_transferred": row["files_transferred"],
+            "exit_code": row["exit_code"],
+            "error": row["error"],
+            "error_code": row["error_code"],
+            "pid": row["pid"],
+            "agent_pid": row["agent_pid"],
+            "bridge_port": row["bridge_port"],
+            "log_path": row["log_path"],
+            "node_snapshot": parse_json(row["node_snapshot"], {}),
+            "created_at": row["created_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
 
 
     def get_gpu_schedule(self) -> dict[str, dict[str, str | int]]:

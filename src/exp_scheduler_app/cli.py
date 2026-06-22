@@ -54,6 +54,33 @@ def run_init(config_path: Path, *, force: bool) -> int:
     return 0
 
 
+def _state_dir_fstype(path: Path) -> str | None:
+    """从 /proc/mounts 找出 path 所在挂载点的文件系统类型（找不到返回 None）。"""
+    try:
+        resolved = str(path.expanduser().resolve())
+        lines = Path("/proc/mounts").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    best_len = -1
+    best_fstype: str | None = None
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        # /proc/mounts 中空格/制表符以八进制转义出现
+        mountpoint = fields[1].replace("\\040", " ").replace("\\011", "\t")
+        normalized = mountpoint.rstrip("/") or "/"
+        if (
+            resolved == normalized
+            or resolved.startswith(normalized + "/")
+            or normalized == "/"
+        ):
+            if len(normalized) > best_len:
+                best_len = len(normalized)
+                best_fstype = fields[2]
+    return best_fstype
+
+
 def run_doctor(config_path: Path) -> int:
     try:
         config = load_config(config_path)
@@ -111,6 +138,27 @@ def run_doctor(config_path: Path) -> int:
         except OSError as exc:
             print(f"{label} 不可写: {path} ({exc})")
             return 1
+
+    # SSH / rsync 工具链（文件同步与多节点终端依赖）
+    for binary in ("ssh", "rsync", "ssh-keygen", "ssh-agent"):
+        binary_path = shutil.which(binary)
+        if binary_path:
+            print(f"{binary}: {binary_path}")
+        else:
+            print(f"{binary}: missing（警告: 缺少 {binary}，文件同步/远程终端功能将不可用）")
+    sshpass_path = shutil.which("sshpass")
+    print(f"sshpass: {sshpass_path or '未安装（可选，仅密码认证的节点需要）'}")
+
+    # state_dir 文件系统：9p/drvfs 上 0600 私钥权限与 ssh-agent socket 不可用
+    fstype = _state_dir_fstype(config.state_dir)
+    if fstype:
+        print(f"state_dir 文件系统: {fstype}")
+        if fstype in {"9p", "drvfs", "v9fs"}:
+            print(
+                "警告: state_dir 位于 9p/drvfs/v9fs 文件系统，"
+                "私钥 0600 与 ssh-agent socket 在该文件系统不可用，"
+                "请将 state_dir 移至 Linux 原生分区"
+            )
     return 0
 
 

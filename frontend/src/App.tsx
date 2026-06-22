@@ -32,7 +32,13 @@ import {
 	  Bookmark,
 	  Edit2,
 	  Link2,
-	  Search
+	  Search,
+	  ArrowLeftRight,
+	  KeyRound,
+	  Network,
+	  HardDrive,
+	  ChevronDown,
+	  SquareTerminal
 	} from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import React, { useCallback, useEffect, useMemo, useRef, useState, ReactNode, FormEvent } from 'react';
@@ -437,7 +443,7 @@ function haveSameGpuIds(left: number[], right: number[]) {
     normalizedLeft.every((id, index) => id === normalizedRight[index]);
 }
 
-type AppTab = 'dashboard' | 'queue' | 'history' | 'activity' | 'nvitop' | 'settings';
+type AppTab = 'dashboard' | 'queue' | 'history' | 'activity' | 'nvitop' | 'sync' | 'terminals' | 'settings';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('dashboard');
@@ -728,7 +734,16 @@ export default function App() {
   useEffect(() => {
     refreshAll().catch(error => setMessage(error.message));
     const source = new EventSource('/api/events');
-    source.addEventListener('update', () => {
+    source.addEventListener('update', (event) => {
+      try {
+        const parsed = JSON.parse(((event as MessageEvent).data as string) || '{}');
+        const type = String(parsed?.type || '');
+        // 文件同步/节点/终端相关事件由 SyncPage 自行订阅处理，
+        // 高频 transfer_progress 等事件不应触发全量刷新
+        if (/^(transfer_|node_|ssh_keys_|terminal_|conda_)/.test(type)) return;
+      } catch {
+        // 数据解析失败时退回全量刷新
+      }
       refreshAll().catch(error => setMessage(error.message));
     });
     source.onerror = () => {
@@ -1295,6 +1310,18 @@ export default function App() {
             label="GPU 监控"
           />
           <NavItem
+            active={activeTab === 'sync'}
+            onClick={() => setActiveTab('sync')}
+            icon={<ArrowLeftRight className="w-5 h-5" />}
+            label="文件同步"
+          />
+          <NavItem
+            active={activeTab === 'terminals'}
+            onClick={() => setActiveTab('terminals')}
+            icon={<SquareTerminal className="w-5 h-5" />}
+            label="多终端"
+          />
+          <NavItem
             active={activeTab === 'settings'}
             onClick={() => setActiveTab('settings')}
             icon={<Settings className="w-5 h-5" />}
@@ -1361,6 +1388,8 @@ export default function App() {
 	              {activeTab === 'history' && <History className="w-4 h-4" />}
 	              {activeTab === 'activity' && <FileText className="w-4 h-4" />}
 	              {activeTab === 'nvitop' && <Terminal className="w-4 h-4" />}
+	              {activeTab === 'sync' && <ArrowLeftRight className="w-4 h-4" />}
+	              {activeTab === 'terminals' && <SquareTerminal className="w-4 h-4" />}
 	              {activeTab === 'settings' && <Settings className="w-4 h-4" />}
             </div>
             <h2 className="text-lg font-bold text-slate-900 tracking-tight">
@@ -1369,6 +1398,8 @@ export default function App() {
 	              {activeTab === 'history' && '历史记录'}
 	              {activeTab === 'activity' && '系统日志'}
 	              {activeTab === 'nvitop' && 'GPU 监控'}
+	              {activeTab === 'sync' && '文件同步'}
+	              {activeTab === 'terminals' && '多终端'}
 	              {activeTab === 'settings' && '资源与环境'}
             </h2>
           </div>
@@ -2421,6 +2452,30 @@ export default function App() {
                     </div>
                   </form>
                   </div>
+              </motion.div>
+            )}
+
+            {activeTab === 'sync' && (
+              <motion.div
+                key="sync"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-6"
+              >
+                <SyncPage />
+              </motion.div>
+            )}
+
+            {activeTab === 'terminals' && (
+              <motion.div
+                key="terminals"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-6"
+              >
+                <MultiTerminalPage />
               </motion.div>
             )}
           </AnimatePresence>
@@ -4048,6 +4103,2931 @@ function TerminalLog({ taskName, content, isFullScreen = false }: { taskName: st
       <div className="px-6 pb-2">
         <span className="w-1.5 h-4 bg-slate-600 inline-block animate-pulse align-middle" />
       </div>
+    </div>
+  );
+}
+
+// ==================== 文件同步页（节点注册表 + 传输任务 + SSH 密钥库 + 连通性矩阵） ====================
+
+interface SyncNode {
+  id: string;
+  name: string;
+  is_local?: boolean;
+  host?: string | null;
+  ssh_port?: number;
+  username?: string | null;
+  auth_method?: 'key' | 'password' | null;
+  ssh_key_id?: string | null;
+  has_password?: boolean;
+  notes?: string | null;
+  rsync_version?: string | null;
+  has_sshpass?: boolean | null;
+  tcp_forward_ok?: boolean | null;
+  agent_forward_ok?: boolean | null;
+}
+
+interface SshKeyInfo {
+  id: string;
+  name: string;
+  kind?: string | null;
+  key_path?: string | null;
+  fingerprint?: string | null;
+  notes?: string | null;
+  created_at?: string | null;
+}
+
+interface NodeLinkInfo {
+  from_node_id: string;
+  to_node_id: string;
+  status: 'unknown' | 'ok' | 'failed';
+  latency_ms?: number | null;
+  last_probe_at?: string | null;
+  last_error?: string | null;
+  applicable?: boolean;
+}
+
+interface TransferJob {
+  id: string;
+  name?: string | null;
+  src_node_id: string;
+  src_path: string;
+  dst_node_id: string;
+  dst_path: string;
+  route?: string | null;
+  route_resolved_by?: string | null;
+  route_attempts?: unknown[];
+  rsync_args?: string[];
+  delete_extras?: boolean;
+  dry_run?: boolean;
+  status: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  phase?: string | null;
+  progress_percent?: number | null;
+  bytes_transferred?: number | null;
+  transfer_rate?: string | null;
+  eta?: string | null;
+  files_transferred?: number | null;
+  exit_code?: number | null;
+  error?: string | null;
+  error_code?: string | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+interface RouteCandidate {
+  route: string;
+  feasible: boolean;
+  reasons: string[];
+  requires_probe: string[][];
+}
+
+interface TransferPlan {
+  candidates: RouteCandidate[];
+  recommended: string | null;
+  needs_probe: boolean;
+}
+
+interface TransferFormDraft {
+  name: string;
+  src_node_id: string;
+  src_path: string;
+  dst_node_id: string;
+  dst_path: string;
+  src_contents_only: boolean;
+  compress: boolean;
+  bwlimit: string;
+  excludes: string[];
+  extraArgs: string;
+  dry_run: boolean;
+  delete_extras: boolean;
+  route: string;
+}
+
+const EMPTY_TRANSFER_DRAFT: TransferFormDraft = {
+  name: '',
+  src_node_id: 'local',
+  src_path: '',
+  dst_node_id: '',
+  dst_path: '',
+  src_contents_only: false,
+  compress: false,
+  bwlimit: '',
+  excludes: [],
+  extraArgs: '',
+  dry_run: false,
+  delete_extras: false,
+  route: 'auto',
+};
+
+function syncNodeOptionLabel(node: SyncNode) {
+  return node.is_local ? `本机(${node.name})` : node.name;
+}
+
+function transferStatusLabel(status: TransferJob['status']) {
+  switch (status) {
+    case 'pending': return '排队中';
+    case 'running': return '传输中';
+    case 'succeeded': return '成功';
+    case 'failed': return '失败';
+    case 'cancelled': return '取消';
+    case 'interrupted': return '中断';
+    default: return status;
+  }
+}
+
+function transferStatusStyle(status: TransferJob['status']) {
+  switch (status) {
+    case 'running': return 'bg-blue-50 text-blue-600 border-blue-100';
+    case 'pending': return 'bg-amber-50 text-amber-700 border-amber-100';
+    case 'succeeded': return 'bg-emerald-50 text-emerald-700 border-emerald-100';
+    case 'failed': return 'bg-rose-50 text-rose-700 border-rose-100';
+    case 'interrupted': return 'bg-amber-50 text-amber-700 border-amber-100';
+    default: return 'bg-slate-50 text-slate-500 border-slate-200';
+  }
+}
+
+function transferRouteLabel(route?: string | null) {
+  switch (route) {
+    case 'local': return '本机复制';
+    case 'direct_from_src': return '直连·源端发起';
+    case 'direct_from_dst': return '直连·目标端拉取';
+    case 'bridged_push': return '桥接·源端经主控推送';
+    case 'bridged_pull': return '桥接·目标端经主控拉取';
+    case 'auto': return '自动';
+    default: return route || '自动';
+  }
+}
+
+function transferRouteBadgeText(job: TransferJob, nodeNames: Record<string, string>) {
+  const src = nodeNames[job.src_node_id] || job.src_node_id;
+  const dst = nodeNames[job.dst_node_id] || job.dst_node_id;
+  switch (job.route) {
+    case 'local': return '本机内复制';
+    case 'bridged_push':
+    case 'bridged_pull':
+      return `${src} ⇒(经主控)⇒ ${dst}`;
+    default:
+      return `${src} ⇒ ${dst}`;
+  }
+}
+
+function transferDurationText(job: TransferJob) {
+  if (!job.started_at) return '--';
+  const start = new Date(job.started_at).getTime();
+  const end = job.finished_at ? new Date(job.finished_at).getTime() : Date.now();
+  if (Number.isNaN(start) || Number.isNaN(end)) return '--';
+  return formatDurationSeconds(Math.max(0, (end - start) / 1000));
+}
+
+function capabilityMark(value?: boolean | null) {
+  if (value === true) return <span className="text-emerald-600 font-bold">✓</span>;
+  if (value === false) return <span className="text-rose-500 font-bold">✕</span>;
+  return <span className="text-slate-300 font-bold">?</span>;
+}
+
+function SyncPage() {
+  const [nodes, setNodes] = useState<SyncNode[]>([]);
+  const [sshKeys, setSshKeys] = useState<SshKeyInfo[]>([]);
+  const [links, setLinks] = useState<NodeLinkInfo[]>([]);
+  const [linksProbing, setLinksProbing] = useState(false);
+  const [activeJobs, setActiveJobs] = useState<TransferJob[]>([]);
+  const [historyJobs, setHistoryJobs] = useState<TransferJob[]>([]);
+  const [maxConcurrent, setMaxConcurrent] = useState<number | null>(null);
+  const [showTransferForm, setShowTransferForm] = useState(false);
+  const [transferDraft, setTransferDraft] = useState<TransferFormDraft | null>(null);
+  const [logJob, setLogJob] = useState<TransferJob | null>(null);
+  const [nodeModal, setNodeModal] = useState<{ node: SyncNode | null } | null>(null);
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  const [testingNodeId, setTestingNodeId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ text: string; kind: 'info' | 'success' | 'error' } | null>(null);
+
+  const showNotice = useCallback((text: string, kind: 'info' | 'success' | 'error' = 'info') => {
+    setNotice({ text, kind });
+  }, []);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 8000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const loadNodes = useCallback(async () => {
+    const payload = await api<{ nodes: SyncNode[] }>('/api/nodes');
+    setNodes(payload.nodes || []);
+  }, []);
+
+  const loadSshKeys = useCallback(async () => {
+    const payload = await api<{ keys: SshKeyInfo[] }>('/api/ssh-keys');
+    setSshKeys(payload.keys || []);
+  }, []);
+
+  const loadLinks = useCallback(async () => {
+    const payload = await api<{ links: NodeLinkInfo[]; probing?: boolean }>('/api/nodes/links');
+    setLinks(payload.links || []);
+    setLinksProbing(Boolean(payload.probing));
+  }, []);
+
+  const loadTransfers = useCallback(async () => {
+    const payload = await api<{ active: TransferJob[]; history: TransferJob[] }>('/api/transfers');
+    setActiveJobs(payload.active || []);
+    setHistoryJobs(payload.history || []);
+  }, []);
+
+  const loadTransferSettings = useCallback(async () => {
+    const payload = await api<{ max_concurrent_transfers?: number }>('/api/transfers/settings');
+    setMaxConcurrent(payload.max_concurrent_transfers ?? null);
+  }, []);
+
+  const refreshSyncData = useCallback(async () => {
+    await Promise.all([loadNodes(), loadSshKeys(), loadLinks(), loadTransfers(), loadTransferSettings()]);
+  }, [loadNodes, loadSshKeys, loadLinks, loadTransfers, loadTransferSettings]);
+
+  useEffect(() => {
+    refreshSyncData().catch(error => showNotice((error as Error).message, 'error'));
+    const source = new EventSource('/api/events');
+    source.addEventListener('update', (event) => {
+      let parsed: { type?: string; payload?: Record<string, unknown> };
+      try {
+        parsed = JSON.parse(((event as MessageEvent).data as string) || '{}');
+      } catch {
+        return;
+      }
+      const type = String(parsed?.type || '');
+      const payload = (parsed?.payload || {}) as Record<string, unknown>;
+      if (type === 'transfer_progress') {
+        // 进度事件直接 merge 到对应活跃卡片，不触发全量刷新
+        const jobId = String(payload.job_id || '');
+        setActiveJobs(prev => prev.map(job => job.id === jobId
+          ? {
+              ...job,
+              status: 'running',
+              phase: payload.phase != null ? String(payload.phase) : job.phase,
+              progress_percent: typeof payload.percent === 'number' ? payload.percent : job.progress_percent,
+              bytes_transferred: typeof payload.bytes === 'number' ? payload.bytes : job.bytes_transferred,
+              transfer_rate: payload.rate != null ? String(payload.rate) : job.transfer_rate,
+              eta: payload.eta != null ? String(payload.eta) : job.eta,
+            }
+          : job));
+        return;
+      }
+      if (['transfer_created', 'transfer_started', 'transfer_finished', 'transfer_deleted'].includes(type)) {
+        loadTransfers().catch(() => {});
+        return;
+      }
+      if (type === 'transfer_settings_updated') {
+        loadTransferSettings().catch(() => {});
+        return;
+      }
+      if (type === 'node_link_updated') {
+        const link = payload.link as NodeLinkInfo | undefined;
+        if (link && link.from_node_id && link.to_node_id) {
+          setLinks(prev => [
+            ...prev.filter(item => !(item.from_node_id === link.from_node_id && item.to_node_id === link.to_node_id)),
+            link,
+          ]);
+        }
+        return;
+      }
+      if (type === 'node_links_probe_started') {
+        setLinksProbing(true);
+        return;
+      }
+      if (type === 'node_links_probe_finished') {
+        setLinksProbing(false);
+        loadLinks().catch(() => {});
+        return;
+      }
+      if (type === 'node_updated') {
+        loadNodes().catch(() => {});
+        loadLinks().catch(() => {});
+        return;
+      }
+      if (type === 'ssh_keys_updated') {
+        loadSshKeys().catch(() => {});
+      }
+    });
+    source.onerror = () => {};
+    // SSE 断线兜底：低频轮询传输列表
+    const timer = window.setInterval(() => {
+      loadTransfers().catch(() => {});
+    }, 15000);
+    return () => {
+      source.close();
+      window.clearInterval(timer);
+    };
+  }, [refreshSyncData, loadNodes, loadSshKeys, loadLinks, loadTransfers, loadTransferSettings, showNotice]);
+
+  const nodeNames = useMemo(() => {
+    const map: Record<string, string> = {};
+    nodes.forEach(node => {
+      map[node.id] = node.is_local ? '本机' : node.name;
+    });
+    return map;
+  }, [nodes]);
+
+  const remoteNodes = useMemo(() => nodes.filter(node => !node.is_local), [nodes]);
+  const okLinkCount = useMemo(() => links.filter(link => link.status === 'ok').length, [links]);
+  const failedLinkCount = useMemo(() => links.filter(link => link.status === 'failed').length, [links]);
+
+  const cancelJob = async (job: TransferJob) => {
+    if (!window.confirm(`确定取消传输任务「${job.name || job.id}」？`)) return;
+    try {
+      await api(`/api/transfers/${job.id}/cancel`, { method: 'POST' });
+      await loadTransfers();
+      showNotice('已请求取消传输任务', 'info');
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    }
+  };
+
+  const deleteJob = async (job: TransferJob) => {
+    if (!window.confirm(`确定删除传输记录「${job.name || job.id}」？日志文件将一并清除。`)) return;
+    try {
+      await api(`/api/transfers/${job.id}`, { method: 'DELETE' });
+      await loadTransfers();
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    }
+  };
+
+  const retryJob = (job: TransferJob) => {
+    const args = (job.rsync_args || []).map(String);
+    const excludes = args
+      .filter(arg => arg.startsWith('--exclude='))
+      .map(arg => arg.slice('--exclude='.length));
+    const bwlimitArg = args.find(arg => arg.startsWith('--bwlimit='));
+    const rest = args.filter(arg =>
+      arg !== '-z' && arg !== '--compress' && !arg.startsWith('--exclude=') && !arg.startsWith('--bwlimit=')
+    );
+    setTransferDraft({
+      name: job.name || '',
+      src_node_id: job.src_node_id,
+      src_path: job.src_path,
+      dst_node_id: job.dst_node_id,
+      dst_path: job.dst_path,
+      src_contents_only: job.src_path.length > 1 && job.src_path.endsWith('/'),
+      compress: args.includes('-z') || args.includes('--compress'),
+      bwlimit: bwlimitArg ? bwlimitArg.slice('--bwlimit='.length) : '',
+      excludes,
+      extraArgs: rest.join(' '),
+      dry_run: Boolean(job.dry_run),
+      delete_extras: Boolean(job.delete_extras),
+      route: job.route_resolved_by === 'manual' && job.route ? job.route : 'auto',
+    });
+    setShowTransferForm(true);
+  };
+
+  const testNode = async (node: SyncNode) => {
+    setTestingNodeId(node.id);
+    try {
+      const result = await api<{ ok: boolean; latency_ms?: number | null; detail?: string }>(
+        `/api/nodes/${node.id}/test`,
+        { method: 'POST' },
+      );
+      await Promise.all([loadNodes(), loadLinks()]);
+      if (result.ok) {
+        const latency = result.latency_ms != null ? `${Math.round(Number(result.latency_ms))}ms` : '延迟未知';
+        showNotice(`节点 ${node.name} 测试通过（${latency}）：${result.detail || ''}`, 'success');
+      } else {
+        showNotice(`节点 ${node.name} 测试失败：${result.detail || '未知错误'}`, 'error');
+      }
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    } finally {
+      setTestingNodeId(null);
+    }
+  };
+
+  const deleteNode = async (node: SyncNode) => {
+    if (!window.confirm(`确定删除节点「${node.name}」？相关连通性记录也会被清除。`)) return;
+    try {
+      await api(`/api/nodes/${node.id}`, { method: 'DELETE' });
+      await Promise.all([loadNodes(), loadLinks()]);
+      showNotice(`已删除节点 ${node.name}`, 'success');
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    }
+  };
+
+  const deleteSshKey = async (key: SshKeyInfo) => {
+    if (!window.confirm(`确定删除 SSH 密钥「${key.name}」？`)) return;
+    try {
+      await api(`/api/ssh-keys/${key.id}`, { method: 'DELETE' });
+      await loadSshKeys();
+      showNotice(`已删除密钥 ${key.name}`, 'success');
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    }
+  };
+
+  const probeLinks = async (pairs?: string[][]) => {
+    try {
+      await api('/api/nodes/links/probe', {
+        method: 'POST',
+        body: JSON.stringify({ pairs: pairs || null }),
+      });
+      setLinksProbing(true);
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    }
+  };
+
+  const updateMaxConcurrent = async (value: number) => {
+    try {
+      await api('/api/transfers/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ max_concurrent_transfers: value }),
+      });
+      setMaxConcurrent(value);
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    }
+  };
+
+  const noticeStyle = notice?.kind === 'error'
+    ? 'bg-rose-50 border-rose-200 text-rose-700'
+    : notice?.kind === 'success'
+      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+      : 'bg-blue-50 border-blue-200 text-blue-700';
+
+  return (
+    <div className="space-y-6">
+      {notice && (
+        <div className={`border rounded-xl px-4 py-3 text-xs font-medium shadow-sm flex items-start gap-2 ${noticeStyle}`}>
+          {notice.kind === 'error'
+            ? <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            : <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />}
+          <span className="flex-1 whitespace-pre-wrap break-all">{notice.text}</span>
+          <button onClick={() => setNotice(null)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity">
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <StatCard label="注册节点" value={String(remoteNodes.length)} type="neutral" />
+        <StatCard label="活跃传输" value={String(activeJobs.length)} type="blue" />
+        <StatCard label="连通边 OK" value={String(okLinkCount)} type="amber" />
+        <StatCard label="失败边" value={String(failedLinkCount)} type="rose" />
+      </div>
+
+      {/* ---------- 区块 1：传输任务 ---------- */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="p-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-blue-600 rounded-lg text-white">
+              <ArrowLeftRight className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-bold text-slate-800 text-base">传输任务</h3>
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">rsync transfers</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {maxConcurrent !== null && (
+              <label className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                并发上限
+                <select
+                  value={maxConcurrent}
+                  onChange={(event) => updateMaxConcurrent(Number(event.target.value))}
+                  className="bg-white border border-slate-200 rounded-lg px-2 py-1.5 text-xs text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer"
+                >
+                  {[1, 2, 3, 4, 5, 6, 7, 8].map(value => (
+                    <option key={value} value={value}>{value}</option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <button
+              onClick={() => loadTransfers().catch(error => showNotice((error as Error).message, 'error'))}
+              className="flex items-center gap-2 px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 rounded-lg text-xs font-bold transition-colors shadow-sm"
+            >
+              <RefreshCcw className="w-3.5 h-3.5" />
+              刷新
+            </button>
+            <button
+              onClick={() => { setTransferDraft(null); setShowTransferForm(true); }}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-xs font-bold shadow-md shadow-blue-600/20 hover:bg-blue-700 active:scale-95 transition-all"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              新建传输
+            </button>
+          </div>
+        </div>
+
+        <div className="p-4 space-y-3 bg-slate-50/40">
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">进行中（{activeJobs.length}）</p>
+          {activeJobs.map(job => (
+            <TransferJobCard key={job.id} job={job} nodeNames={nodeNames} onCancel={() => cancelJob(job)} />
+          ))}
+          {activeJobs.length === 0 && (
+            <div className="p-6 text-center text-slate-400 text-xs bg-white border border-dashed border-slate-200 rounded-xl">
+              暂无进行中的传输任务
+            </div>
+          )}
+        </div>
+
+        <div className="p-4 border-t border-slate-100 space-y-3">
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">历史记录（{historyJobs.length}）</p>
+          {historyJobs.length > 0 ? (
+            <div className="overflow-x-auto custom-scrollbar">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                    <th className="py-2 pr-3">状态</th>
+                    <th className="py-2 pr-3">任务</th>
+                    <th className="py-2 pr-3">路由</th>
+                    <th className="py-2 pr-3">耗时</th>
+                    <th className="py-2 pr-3">完成时间</th>
+                    <th className="py-2 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {historyJobs.map(job => (
+                    <TransferHistoryRow
+                      key={job.id}
+                      job={job}
+                      nodeNames={nodeNames}
+                      onRetry={() => retryJob(job)}
+                      onShowLog={() => setLogJob(job)}
+                      onDelete={() => deleteJob(job)}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="p-6 text-center text-slate-400 text-xs bg-slate-50/60 border border-dashed border-slate-200 rounded-xl">
+              暂无历史传输记录
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ---------- 区块 3：节点管理 ---------- */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="p-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-slate-800 rounded-lg text-white">
+              <HardDrive className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-bold text-slate-800 text-base">节点管理</h3>
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">本机作为 local 伪节点自动存在</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setNodeModal({ node: null })}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-xs font-bold shadow-md shadow-blue-600/20 hover:bg-blue-700 active:scale-95 transition-all"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            注册节点
+          </button>
+        </div>
+        <div className="p-4">
+          {remoteNodes.length > 0 ? (
+            <div className="overflow-x-auto custom-scrollbar">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                    <th className="py-2 pr-3">名称</th>
+                    <th className="py-2 pr-3">连接</th>
+                    <th className="py-2 pr-3">认证</th>
+                    <th className="py-2 pr-3">能力</th>
+                    <th className="py-2 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {remoteNodes.map(node => (
+                    <tr key={node.id} className="border-b border-slate-50 hover:bg-slate-50/60 transition-colors">
+                      <td className="py-2.5 pr-3">
+                        <span className="font-bold text-slate-800">{node.name}</span>
+                        {node.notes && <p className="text-[10px] text-slate-400 truncate max-w-[180px]" title={node.notes}>{node.notes}</p>}
+                      </td>
+                      <td className="py-2.5 pr-3 font-mono text-slate-600">
+                        {node.username}@{node.host}:{node.ssh_port}
+                      </td>
+                      <td className="py-2.5 pr-3">
+                        {node.auth_method === 'password' ? (
+                          <span className="px-2 py-0.5 rounded border text-[9px] font-bold bg-amber-50 text-amber-700 border-amber-100">密码</span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded border text-[9px] font-bold bg-emerald-50 text-emerald-700 border-emerald-100">密钥</span>
+                        )}
+                      </td>
+                      <td className="py-2.5 pr-3">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`px-2 py-0.5 rounded border text-[9px] font-bold ${node.rsync_version ? 'bg-blue-50 text-blue-600 border-blue-100' : 'bg-slate-50 text-slate-400 border-slate-100'}`}>
+                            {node.rsync_version ? `rsync ${node.rsync_version}` : 'rsync 未知'}
+                          </span>
+                          <span className="text-[10px] text-slate-500 flex items-center gap-1" title="sshd 是否允许 TCP 端口转发（桥接发起端必需）">
+                            转发 {capabilityMark(node.tcp_forward_ok)}
+                          </span>
+                          <span className="text-[10px] text-slate-500 flex items-center gap-1" title="sshd 是否允许 agent 转发（远程发起端向对端认证必需）">
+                            Agent {capabilityMark(node.agent_forward_ok)}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="py-2.5">
+                        <div className="flex items-center gap-1.5 justify-end">
+                          <button
+                            onClick={() => testNode(node)}
+                            disabled={testingNodeId === node.id}
+                            className="flex items-center gap-1 px-2.5 py-1 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 rounded text-[10px] font-bold transition-colors disabled:opacity-60"
+                          >
+                            {testingNodeId === node.id
+                              ? <Loader2 className="w-3 h-3 animate-spin" />
+                              : <Zap className="w-3 h-3" />}
+                            {testingNodeId === node.id ? '测试中' : '测试'}
+                          </button>
+                          <button
+                            onClick={() => setNodeModal({ node })}
+                            className="p-1.5 bg-white border border-slate-200 hover:bg-slate-50 text-slate-500 hover:text-blue-600 rounded transition-colors"
+                            title="编辑节点"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                          <button
+                            onClick={() => deleteNode(node)}
+                            className="p-1.5 bg-white border border-slate-200 hover:bg-rose-50 text-slate-500 hover:text-rose-600 rounded transition-colors"
+                            title="删除节点"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="p-8 text-center text-slate-400 space-y-2">
+              <Server className="w-8 h-8 mx-auto opacity-20" />
+              <p className="text-sm">尚未注册远程节点，点击右上角“注册节点”开始</p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ---------- 区块 4：SSH 密钥库 + 连通性矩阵 ---------- */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+          <div className="p-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-emerald-600 rounded-lg text-white">
+                <KeyRound className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-slate-800 text-base">SSH 密钥库</h3>
+                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">私钥仅存储于本机</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setShowKeyModal(true)}
+              className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-xs font-bold shadow-md shadow-blue-600/20 hover:bg-blue-700 active:scale-95 transition-all"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              新增密钥
+            </button>
+          </div>
+          <div className="p-4 space-y-2">
+            {sshKeys.map(key => (
+              <div key={key.id} className="flex items-center justify-between gap-3 bg-slate-50/60 border border-slate-100 rounded-lg px-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-bold text-slate-800 text-xs">{key.name}</span>
+                    {key.kind && (
+                      <span className="px-2 py-0.5 rounded border text-[9px] font-bold bg-blue-50 text-blue-600 border-blue-100 uppercase">{key.kind}</span>
+                    )}
+                  </div>
+                  {key.fingerprint && (
+                    <p className="text-[10px] text-slate-400 font-mono truncate" title={key.fingerprint}>{key.fingerprint}</p>
+                  )}
+                  {key.notes && <p className="text-[10px] text-slate-400 truncate">{key.notes}</p>}
+                </div>
+                <button
+                  onClick={() => deleteSshKey(key)}
+                  className="p-1.5 bg-white border border-slate-200 hover:bg-rose-50 text-slate-500 hover:text-rose-600 rounded transition-colors shrink-0"
+                  title="删除密钥"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+            {sshKeys.length === 0 && (
+              <div className="p-8 text-center text-slate-400 space-y-2">
+                <KeyRound className="w-8 h-8 mx-auto opacity-20" />
+                <p className="text-sm">暂无 SSH 密钥，可粘贴私钥或引用已有路径</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <LinkMatrix
+          nodes={nodes}
+          links={links}
+          probing={linksProbing}
+          onProbe={probeLinks}
+        />
+      </div>
+
+      {/* ---------- 弹窗 ---------- */}
+      {showTransferForm && (
+        <NewTransferModal
+          nodes={nodes}
+          nodeNames={nodeNames}
+          initialDraft={transferDraft}
+          onClose={() => { setShowTransferForm(false); setTransferDraft(null); }}
+          onCreated={() => {
+            setShowTransferForm(false);
+            setTransferDraft(null);
+            loadTransfers().catch(() => {});
+            showNotice('传输任务已创建', 'success');
+          }}
+        />
+      )}
+      {nodeModal && (
+        <NodeEditModal
+          node={nodeModal.node}
+          sshKeys={sshKeys}
+          onClose={() => setNodeModal(null)}
+          onSaved={(text) => {
+            setNodeModal(null);
+            loadNodes().catch(() => {});
+            loadLinks().catch(() => {});
+            showNotice(text, 'success');
+          }}
+        />
+      )}
+      {showKeyModal && (
+        <SshKeyModal
+          onClose={() => setShowKeyModal(false)}
+          onSaved={(text) => {
+            setShowKeyModal(false);
+            loadSshKeys().catch(() => {});
+            showNotice(text, 'success');
+          }}
+        />
+      )}
+      {logJob && (
+        <TransferLogModal job={logJob} onClose={() => setLogJob(null)} />
+      )}
+    </div>
+  );
+}
+
+function TransferJobCard({ job, nodeNames, onCancel }: {
+  job: TransferJob;
+  nodeNames: Record<string, string>;
+  onCancel: () => void;
+  key?: React.Key;
+}) {
+  const percent = Math.max(0, Math.min(100, Number(job.progress_percent ?? 0)));
+  const isConnecting = job.status === 'running' && job.phase === 'connecting';
+  const srcName = nodeNames[job.src_node_id] || job.src_node_id;
+  const dstName = nodeNames[job.dst_node_id] || job.dst_node_id;
+  return (
+    <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm space-y-3 hover:border-blue-200 transition-colors">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2 min-w-0 flex-wrap">
+          <span className={`px-2 py-0.5 rounded border text-[9px] font-bold ${transferStatusStyle(job.status)}`}>
+            {transferStatusLabel(job.status)}
+          </span>
+          <h4 className="font-bold text-slate-900 text-[13px] truncate">{job.name || `传输 ${job.id.slice(0, 8)}`}</h4>
+          <span
+            className="px-2 py-0.5 rounded border text-[9px] font-bold bg-slate-50 text-slate-600 border-slate-200 font-mono"
+            title={transferRouteLabel(job.route)}
+          >
+            {transferRouteBadgeText(job, nodeNames)}
+          </span>
+          {job.dry_run && (
+            <span className="px-2 py-0.5 rounded border text-[9px] font-bold bg-violet-50 text-violet-600 border-violet-100">DRY-RUN</span>
+          )}
+          {job.delete_extras && (
+            <span className="px-2 py-0.5 rounded border text-[9px] font-bold bg-rose-50 text-rose-600 border-rose-100">--delete</span>
+          )}
+        </div>
+        <button
+          onClick={onCancel}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-50 text-rose-600 border border-rose-200 hover:bg-rose-100 rounded-lg text-[10px] font-bold transition-colors"
+        >
+          <Trash2 className="w-3 h-3" />
+          取消
+        </button>
+      </div>
+
+      <p
+        className="text-[11px] text-slate-500 font-mono truncate"
+        title={`${srcName}:${job.src_path} → ${dstName}:${job.dst_path}`}
+      >
+        {srcName}:{job.src_path} → {dstName}:{job.dst_path}
+      </p>
+
+      {job.status === 'pending' ? (
+        <div className="flex items-center gap-2 text-xs text-amber-600 font-bold">
+          <Clock className="w-3.5 h-3.5" />
+          排队等待调度...
+        </div>
+      ) : isConnecting ? (
+        <div className="flex items-center gap-2 text-xs text-blue-600 font-bold">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          正在建立连接...
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-500 rounded-full transition-all"
+              style={{ width: `${percent}%` }}
+            />
+          </div>
+          <div className="flex items-center gap-4 flex-wrap text-[10px] font-bold text-slate-500 font-mono tabular-nums">
+            <span className="text-blue-600">{percent.toFixed(1)}%</span>
+            <span>{job.transfer_rate || '--'}</span>
+            <span>ETA {job.eta || '--'}</span>
+            <span>{formatBytes(job.bytes_transferred)}</span>
+            {job.files_transferred != null && <span>{job.files_transferred} 个文件</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TransferHistoryRow({ job, nodeNames, onRetry, onShowLog, onDelete }: {
+  job: TransferJob;
+  nodeNames: Record<string, string>;
+  onRetry: () => void;
+  onShowLog: () => void;
+  onDelete: () => void;
+  key?: React.Key;
+}) {
+  const srcName = nodeNames[job.src_node_id] || job.src_node_id;
+  const dstName = nodeNames[job.dst_node_id] || job.dst_node_id;
+  return (
+    <tr className="border-b border-slate-50 hover:bg-slate-50/60 transition-colors align-top">
+      <td className="py-2.5 pr-3">
+        <span className={`px-2 py-0.5 rounded border text-[9px] font-bold whitespace-nowrap ${transferStatusStyle(job.status)}`}>
+          {transferStatusLabel(job.status)}
+        </span>
+      </td>
+      <td className="py-2.5 pr-3 min-w-[200px]">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-bold text-slate-800">{job.name || `传输 ${job.id.slice(0, 8)}`}</span>
+          {job.dry_run && (
+            <span className="px-1.5 py-0.5 rounded border text-[8px] font-bold bg-violet-50 text-violet-600 border-violet-100">DRY-RUN</span>
+          )}
+          {job.delete_extras && (
+            <span className="px-1.5 py-0.5 rounded border text-[8px] font-bold bg-rose-50 text-rose-600 border-rose-100">--delete</span>
+          )}
+        </div>
+        <p
+          className="text-[10px] text-slate-400 font-mono truncate max-w-[320px]"
+          title={`${srcName}:${job.src_path} → ${dstName}:${job.dst_path}`}
+        >
+          {srcName}:{job.src_path} → {dstName}:{job.dst_path}
+        </p>
+        {job.error && (
+          <p className="text-[10px] text-rose-600 truncate max-w-[320px]" title={job.error}>
+            {job.error_code ? `[${job.error_code}] ` : ''}{job.error}
+          </p>
+        )}
+      </td>
+      <td className="py-2.5 pr-3 whitespace-nowrap">
+        <span
+          className="px-2 py-0.5 rounded border text-[9px] font-bold bg-slate-50 text-slate-600 border-slate-200 font-mono"
+          title={transferRouteLabel(job.route)}
+        >
+          {transferRouteBadgeText(job, nodeNames)}
+        </span>
+      </td>
+      <td className="py-2.5 pr-3 font-mono text-slate-600 whitespace-nowrap">{transferDurationText(job)}</td>
+      <td className="py-2.5 pr-3 text-slate-500 whitespace-nowrap">{formatTime(job.finished_at) || '--'}</td>
+      <td className="py-2.5">
+        <div className="flex items-center gap-1.5 justify-end">
+          <button
+            onClick={onRetry}
+            className="flex items-center gap-1 px-2.5 py-1 bg-white border border-slate-200 hover:bg-blue-50 text-slate-600 hover:text-blue-600 rounded text-[10px] font-bold transition-colors"
+            title="以原参数打开新建表单"
+          >
+            <RotateCw className="w-3 h-3" />
+            重试
+          </button>
+          <button
+            onClick={onShowLog}
+            className="flex items-center gap-1 px-2.5 py-1 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 rounded text-[10px] font-bold transition-colors"
+          >
+            <FileText className="w-3 h-3" />
+            日志
+          </button>
+          <button
+            onClick={onDelete}
+            className="p-1.5 bg-white border border-slate-200 hover:bg-rose-50 text-slate-500 hover:text-rose-600 rounded transition-colors"
+            title="删除记录"
+          >
+            <Trash2 className="w-3 h-3" />
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function TransferLogModal({ job, onClose }: { job: TransferJob; onClose: () => void }) {
+  const [content, setContent] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [isFull, setIsFull] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api<{ content?: string; size?: number; log_path?: string }>(`/api/transfers/${job.id}/log?full=${isFull}`)
+      .then(payload => {
+        if (cancelled) return;
+        setContent(payload.content || '');
+        setError('');
+      })
+      .catch(err => {
+        if (cancelled) return;
+        setError((err as Error).message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [job.id, isFull]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-slate-900/40 backdrop-blur-sm">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        className="relative w-full max-w-4xl bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[calc(100vh-3rem)]"
+      >
+        <div className="shrink-0 px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-base font-bold text-slate-900 tracking-tight truncate">传输日志：{job.name || job.id}</h2>
+            <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{isFull ? '完整日志' : '日志尾部'}</p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {!isFull && (
+              <button
+                onClick={() => setIsFull(true)}
+                className="px-3 py-1.5 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 rounded-lg text-[10px] font-bold transition-colors"
+              >
+                加载完整日志
+              </button>
+            )}
+            <button onClick={onClose} className="p-2 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-900 transition-colors">
+              <Plus className="w-5 h-5 rotate-45" />
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-auto p-4 bg-slate-950 custom-scrollbar min-h-[280px]">
+          {loading ? (
+            <div className="flex items-center gap-2 text-slate-400 text-xs">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              加载日志中...
+            </div>
+          ) : error ? (
+            <p className="text-rose-400 text-xs">{error}</p>
+          ) : (
+            <pre className="text-slate-200 text-[11px] leading-relaxed whitespace-pre-wrap break-all font-mono">
+              {content || '（日志为空）'}
+            </pre>
+          )}
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+function NewTransferModal({ nodes, nodeNames, initialDraft, onClose, onCreated }: {
+  nodes: SyncNode[];
+  nodeNames: Record<string, string>;
+  initialDraft: TransferFormDraft | null;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const [draft, setDraft] = useState<TransferFormDraft>(initialDraft || EMPTY_TRANSFER_DRAFT);
+  const [showAdvanced, setShowAdvanced] = useState(Boolean(
+    initialDraft && (
+      initialDraft.compress || initialDraft.bwlimit || initialDraft.excludes.length > 0 ||
+      initialDraft.extraArgs || initialDraft.dry_run || initialDraft.delete_extras
+    )
+  ));
+  const [excludeInput, setExcludeInput] = useState('');
+  const [plan, setPlan] = useState<TransferPlan | null>(null);
+  const [planning, setPlanning] = useState(false);
+  const [probing, setProbing] = useState(false);
+  const [planError, setPlanError] = useState('');
+  const [submitError, setSubmitError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const update = (patch: Partial<TransferFormDraft>) => setDraft(prev => ({ ...prev, ...patch }));
+
+  const planReady = Boolean(
+    draft.src_node_id && draft.dst_node_id && draft.src_path.trim() && draft.dst_path.trim()
+  );
+
+  // 两端节点与路径就绪后防抖请求路由方案
+  useEffect(() => {
+    if (!planReady) {
+      setPlan(null);
+      setPlanError('');
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setPlanning(true);
+      api<TransferPlan>('/api/transfers/plan', {
+        method: 'POST',
+        body: JSON.stringify({
+          src_node_id: draft.src_node_id,
+          src_path: draft.src_path.trim(),
+          dst_node_id: draft.dst_node_id,
+          dst_path: draft.dst_path.trim(),
+        }),
+      })
+        .then(payload => {
+          setPlan(payload);
+          setPlanError('');
+        })
+        .catch(error => {
+          setPlan(null);
+          setPlanError((error as Error).message);
+        })
+        .finally(() => setPlanning(false));
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [planReady, draft.src_node_id, draft.src_path, draft.dst_node_id, draft.dst_path]);
+
+  const probePlan = async () => {
+    if (!planReady || probing) return;
+    setProbing(true);
+    try {
+      const payload = await api<TransferPlan>('/api/transfers/plan?probe=true', {
+        method: 'POST',
+        body: JSON.stringify({
+          src_node_id: draft.src_node_id,
+          src_path: draft.src_path.trim(),
+          dst_node_id: draft.dst_node_id,
+          dst_path: draft.dst_path.trim(),
+        }),
+      });
+      setPlan(payload);
+      setPlanError('');
+    } catch (error) {
+      setPlanError((error as Error).message);
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  const addExclude = () => {
+    const pattern = excludeInput.trim();
+    if (!pattern) return;
+    if (!draft.excludes.includes(pattern)) {
+      update({ excludes: [...draft.excludes, pattern] });
+    }
+    setExcludeInput('');
+  };
+
+  const buildRsyncArgs = () => {
+    const args: string[] = [];
+    if (draft.compress) args.push('-z');
+    const bwlimit = draft.bwlimit.trim();
+    if (bwlimit) args.push(`--bwlimit=${bwlimit}`);
+    draft.excludes.forEach(pattern => args.push(`--exclude=${pattern}`));
+    draft.extraArgs.trim().split(/\s+/).filter(Boolean).forEach(arg => args.push(arg));
+    return args;
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!draft.src_node_id || !draft.dst_node_id) {
+      setSubmitError('请选择源节点和目标节点');
+      return;
+    }
+    if (!draft.src_path.trim() || !draft.dst_path.trim()) {
+      setSubmitError('请填写源路径和目标路径');
+      return;
+    }
+    if (draft.delete_extras && !window.confirm(
+      '高危操作确认：--delete 会删除目标目录中源端不存在的文件，可能造成数据永久丢失！\n\n建议先勾选 dry-run 试运行确认影响范围。确定继续提交？'
+    )) {
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api('/api/transfers', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: draft.name.trim() || null,
+          src_node_id: draft.src_node_id,
+          src_path: draft.src_path.trim(),
+          dst_node_id: draft.dst_node_id,
+          dst_path: draft.dst_path.trim(),
+          src_contents_only: draft.src_contents_only,
+          rsync_args: buildRsyncArgs(),
+          delete_extras: draft.delete_extras,
+          dry_run: draft.dry_run,
+          route: draft.route,
+          probe_unknown: true,
+        }),
+      });
+      onCreated();
+    } catch (error) {
+      // 409 等错误直接展示后端 detail
+      setSubmitError((error as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const inputClass = 'w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors';
+  const labelClass = 'text-[10px] font-bold text-slate-500 uppercase tracking-widest';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-slate-900/40 backdrop-blur-sm">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        className="relative w-full max-w-3xl bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[calc(100vh-3rem)]"
+      >
+        <div className="shrink-0 px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900 tracking-tight">新建传输</h2>
+            <p className="text-xs text-slate-500 font-medium">配置 rsync 传输参数并选择路由</p>
+          </div>
+          <button onClick={onClose} className="p-2 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-900 transition-colors">
+            <Plus className="w-5 h-5 rotate-45" />
+          </button>
+        </div>
+
+        <form onSubmit={submit} className="px-6 py-5 space-y-4 overflow-y-auto custom-scrollbar">
+          <div className="space-y-1.5">
+            <label className={labelClass}>任务名称</label>
+            <input
+              type="text"
+              value={draft.name}
+              onChange={(event) => update({ name: event.target.value })}
+              placeholder="例如: 同步 checkpoint 到 A100 节点（可选）"
+              className={inputClass}
+            />
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+            <div className="space-y-1.5">
+              <label className={labelClass}>源节点</label>
+              <select
+                value={draft.src_node_id}
+                onChange={(event) => update({ src_node_id: event.target.value })}
+                className={`${inputClass} cursor-pointer`}
+              >
+                <option value="">选择源节点</option>
+                {nodes.map(node => (
+                  <option key={node.id} value={node.id}>{syncNodeOptionLabel(node)}</option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelClass}>目标节点</label>
+              <select
+                value={draft.dst_node_id}
+                onChange={(event) => update({ dst_node_id: event.target.value })}
+                className={`${inputClass} cursor-pointer`}
+              >
+                <option value="">选择目标节点</option>
+                {nodes.map(node => (
+                  <option key={node.id} value={node.id}>{syncNodeOptionLabel(node)}</option>
+                ))}
+              </select>
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelClass}>源路径</label>
+              <input
+                type="text"
+                value={draft.src_path}
+                onChange={(event) => update({ src_path: event.target.value })}
+                placeholder="/data/checkpoints/llama"
+                required
+                className={`${inputClass} font-mono`}
+                spellCheck={false}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelClass}>目标路径</label>
+              <input
+                type="text"
+                value={draft.dst_path}
+                onChange={(event) => update({ dst_path: event.target.value })}
+                placeholder="/data/checkpoints/"
+                required
+                className={`${inputClass} font-mono`}
+                spellCheck={false}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className={labelClass}>源目录语义</label>
+            <div className="grid grid-cols-2 gap-1 bg-slate-100 border border-slate-200 rounded-lg p-1">
+              {([
+                [false, '复制目录本身'],
+                [true, '仅复制目录内容'],
+              ] as [boolean, string][]).map(([value, label]) => (
+                <label key={String(value)} className="cursor-pointer">
+                  <input
+                    type="radio"
+                    name="src_contents_only"
+                    checked={draft.src_contents_only === value}
+                    onChange={() => update({ src_contents_only: value })}
+                    className="peer sr-only"
+                  />
+                  <span className="block rounded-md px-2 py-1.5 text-center text-[11px] font-bold text-slate-500 transition-all peer-checked:bg-white peer-checked:text-blue-600 peer-checked:shadow-sm">
+                    {label}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* 高级选项（rsync 参数） */}
+          <div className="border border-slate-200 rounded-xl overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowAdvanced(prev => !prev)}
+              className="w-full flex items-center justify-between px-4 py-2.5 bg-slate-50/60 hover:bg-slate-50 text-left transition-colors"
+            >
+              <span className={labelClass}>高级选项（rsync 参数）</span>
+              <ChevronDown className={`w-4 h-4 text-slate-400 transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
+            </button>
+            {showAdvanced && (
+              <div className="p-4 space-y-4 border-t border-slate-100">
+                <div className="flex items-center gap-6 flex-wrap">
+                  <label className="flex items-center gap-2 text-xs font-bold text-slate-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={draft.compress}
+                      onChange={(event) => update({ compress: event.target.checked })}
+                      className="rounded border-slate-300"
+                    />
+                    压缩传输 (-z)
+                  </label>
+                  <label className="flex items-center gap-2 text-xs font-bold text-slate-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={draft.dry_run}
+                      onChange={(event) => update({ dry_run: event.target.checked })}
+                      className="rounded border-slate-300"
+                    />
+                    试运行 (dry-run)
+                  </label>
+                  <label className="flex items-center gap-2 text-xs font-bold text-rose-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={draft.delete_extras}
+                      onChange={(event) => update({ delete_extras: event.target.checked })}
+                      className="rounded border-slate-300"
+                    />
+                    删除目标端多余文件 (--delete)
+                  </label>
+                </div>
+                {draft.delete_extras && (
+                  <p className="text-[11px] text-rose-600 font-medium flex items-start gap-1.5 bg-rose-50 border border-rose-100 rounded-lg px-3 py-2">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                    --delete 会删除目标目录中源端不存在的文件，提交时需要二次确认，建议先 dry-run。
+                  </p>
+                )}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+                  <div className="space-y-1.5">
+                    <label className={labelClass}>带宽限制 --bwlimit</label>
+                    <input
+                      type="text"
+                      value={draft.bwlimit}
+                      onChange={(event) => update({ bwlimit: event.target.value })}
+                      placeholder="例如 20M（留空不限制）"
+                      className={`${inputClass} font-mono`}
+                      spellCheck={false}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className={labelClass}>其他白名单参数</label>
+                    <input
+                      type="text"
+                      value={draft.extraArgs}
+                      onChange={(event) => update({ extraArgs: event.target.value })}
+                      placeholder="例如 --checksum --update"
+                      className={`${inputClass} font-mono`}
+                      spellCheck={false}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <label className={labelClass}>排除规则 --exclude</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={excludeInput}
+                      onChange={(event) => setExcludeInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault();
+                          addExclude();
+                        }
+                      }}
+                      placeholder="例如 *.pyc 或 __pycache__/"
+                      className={`${inputClass} font-mono flex-1`}
+                      spellCheck={false}
+                    />
+                    <button
+                      type="button"
+                      onClick={addExclude}
+                      className="px-4 py-2 bg-slate-100 border border-slate-200 hover:bg-slate-200 text-slate-600 rounded-lg text-xs font-bold transition-colors shrink-0"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  {draft.excludes.length > 0 && (
+                    <div className="flex items-center gap-1.5 flex-wrap pt-1">
+                      {draft.excludes.map(pattern => (
+                        <span key={pattern} className="flex items-center gap-1 px-2 py-0.5 bg-slate-100 border border-slate-200 rounded text-[10px] font-mono text-slate-600">
+                          {pattern}
+                          <button
+                            type="button"
+                            onClick={() => update({ excludes: draft.excludes.filter(item => item !== pattern) })}
+                            className="text-slate-400 hover:text-rose-500 transition-colors"
+                          >
+                            <Plus className="w-3 h-3 rotate-45" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 路由选择 */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <label className={labelClass}>传输路由</label>
+              <div className="flex items-center gap-2">
+                {planning && (
+                  <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    解析路由中...
+                  </span>
+                )}
+                {plan?.needs_probe && (
+                  <button
+                    type="button"
+                    onClick={probePlan}
+                    disabled={probing}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 rounded-lg text-[10px] font-bold transition-colors disabled:opacity-60"
+                  >
+                    {probing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+                    {probing ? '探测中...' : '探测后确定'}
+                  </button>
+                )}
+              </div>
+            </div>
+            {planError && <p className="text-[11px] text-rose-600">{planError}</p>}
+            {!planReady && (
+              <p className="text-[11px] text-slate-400">选定源/目标节点与路径后自动解析可用路由</p>
+            )}
+            <label
+              className={`block border rounded-lg px-3 py-2.5 cursor-pointer transition-colors ${
+                draft.route === 'auto'
+                  ? 'border-blue-500 ring-1 ring-blue-200 bg-blue-50/40'
+                  : 'border-slate-200 bg-white hover:border-blue-200'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="transfer_route"
+                  checked={draft.route === 'auto'}
+                  onChange={() => update({ route: 'auto' })}
+                />
+                <span className="text-xs font-bold text-slate-800">自动选择</span>
+                {plan?.recommended && (
+                  <span className="text-[10px] text-slate-400">推荐：{transferRouteLabel(plan.recommended)}</span>
+                )}
+              </div>
+            </label>
+            {(plan?.candidates || []).map(candidate => {
+              const isBridged = candidate.route.startsWith('bridged');
+              const isRecommended = plan?.recommended === candidate.route;
+              const needsProbe = (candidate.requires_probe || []).length > 0;
+              const selected = draft.route === candidate.route;
+              return (
+                <label
+                  key={candidate.route}
+                  className={`block border rounded-lg px-3 py-2.5 transition-colors ${
+                    !candidate.feasible
+                      ? 'border-slate-200 bg-slate-50/60 opacity-60 cursor-not-allowed'
+                      : selected
+                        ? 'border-blue-500 ring-1 ring-blue-200 bg-blue-50/40 cursor-pointer'
+                        : isRecommended
+                          ? 'border-blue-300 bg-blue-50/20 cursor-pointer hover:border-blue-400'
+                          : 'border-slate-200 bg-white cursor-pointer hover:border-blue-200'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <input
+                      type="radio"
+                      name="transfer_route"
+                      disabled={!candidate.feasible}
+                      checked={selected}
+                      onChange={() => candidate.feasible && update({ route: candidate.route })}
+                    />
+                    <span className="text-xs font-bold text-slate-800">{transferRouteLabel(candidate.route)}</span>
+                    {isRecommended && (
+                      <span className="px-1.5 py-0.5 rounded border text-[9px] font-bold bg-blue-50 text-blue-600 border-blue-100">推荐</span>
+                    )}
+                    {candidate.feasible && needsProbe && (
+                      <span className="px-1.5 py-0.5 rounded border text-[9px] font-bold bg-amber-50 text-amber-700 border-amber-100">待探测</span>
+                    )}
+                    {!candidate.feasible && (
+                      <span className="px-1.5 py-0.5 rounded border text-[9px] font-bold bg-slate-100 text-slate-400 border-slate-200">不可行</span>
+                    )}
+                  </div>
+                  {isBridged && candidate.feasible && (
+                    <p className="mt-1.5 text-[11px] text-amber-600 font-medium flex items-start gap-1.5">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      数据经主控中转，速率受主控带宽限制
+                    </p>
+                  )}
+                  {candidate.feasible && needsProbe && (
+                    <p className="mt-1 text-[10px] text-slate-400">
+                      待探测链路：{(candidate.requires_probe || []).map(pair => `${nodeNames[pair[0]] || pair[0]} → ${nodeNames[pair[1]] || pair[1]}`).join('、')}
+                    </p>
+                  )}
+                  {(candidate.reasons || []).length > 0 && (
+                    <ul className="mt-1 text-[10px] text-slate-400 list-disc list-inside space-y-0.5">
+                      {candidate.reasons.map((reason, index) => (
+                        <li key={index}>{reason}</li>
+                      ))}
+                    </ul>
+                  )}
+                </label>
+              );
+            })}
+          </div>
+
+          {submitError && (
+            <p className="text-[11px] text-rose-600 font-medium bg-rose-50 border border-rose-100 rounded-lg px-3 py-2 whitespace-pre-wrap break-all">
+              {submitError}
+            </p>
+          )}
+
+          <div className="flex justify-end gap-3 pt-4 border-t border-slate-100">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-6 py-2 rounded-lg text-slate-500 font-bold hover:bg-slate-50 transition-colors text-sm"
+            >
+              取消
+            </button>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="px-10 py-2 bg-blue-600 text-white rounded-lg font-bold shadow-md shadow-blue-600/20 hover:bg-blue-700 active:scale-95 transition-all text-sm disabled:opacity-60"
+            >
+              {submitting ? '提交中...' : '创建传输任务'}
+            </button>
+          </div>
+        </form>
+      </motion.div>
+    </div>
+  );
+}
+
+function NodeEditModal({ node, sshKeys, onClose, onSaved }: {
+  node: SyncNode | null;
+  sshKeys: SshKeyInfo[];
+  onClose: () => void;
+  onSaved: (message: string) => void;
+}) {
+  const isEdit = Boolean(node);
+  const [name, setName] = useState(node?.name || '');
+  const [host, setHost] = useState(node?.host || '');
+  const [sshPort, setSshPort] = useState(String(node?.ssh_port ?? 22));
+  const [username, setUsername] = useState(node?.username || '');
+  const [authMethod, setAuthMethod] = useState<'key' | 'password'>(node?.auth_method === 'password' ? 'password' : 'key');
+  const [sshKeyId, setSshKeyId] = useState(node?.ssh_key_id || '');
+  const [password, setPassword] = useState('');
+  const [notes, setNotes] = useState(node?.notes || '');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const keepOldPassword = isEdit && node?.auth_method === 'password' && Boolean(node?.has_password);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (authMethod === 'key' && !sshKeyId) {
+      setError('密钥认证方式必须选择一个 SSH 密钥');
+      return;
+    }
+    if (authMethod === 'password' && !password && !keepOldPassword) {
+      setError('密码认证方式必须填写密码');
+      return;
+    }
+    const body = {
+      name: name.trim(),
+      host: host.trim(),
+      ssh_port: Number(sshPort) || 22,
+      username: username.trim(),
+      auth_method: authMethod,
+      ssh_key_id: authMethod === 'key' ? sshKeyId : null,
+      // 编辑时密码留空 → null 表示沿用旧密码
+      password: authMethod === 'password' ? (password || null) : null,
+      notes: notes.trim() || null,
+    };
+    setSubmitting(true);
+    try {
+      if (isEdit && node) {
+        await api(`/api/nodes/${node.id}`, { method: 'PUT', body: JSON.stringify(body) });
+      } else {
+        await api('/api/nodes', { method: 'POST', body: JSON.stringify(body) });
+      }
+      onSaved(isEdit ? `已更新节点 ${name.trim()}` : `已注册节点 ${name.trim()}`);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const inputClass = 'w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors';
+  const labelClass = 'text-[10px] font-bold text-slate-500 uppercase tracking-widest';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-slate-900/40 backdrop-blur-sm">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        className="relative w-full max-w-xl bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[calc(100vh-3rem)]"
+      >
+        <div className="shrink-0 px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900 tracking-tight">{isEdit ? '编辑节点' : '注册节点'}</h2>
+            <p className="text-xs text-slate-500 font-medium">{isEdit ? `修改节点 ${node?.name} 的连接参数` : '注册一台可通过 SSH 访问的服务器'}</p>
+          </div>
+          <button onClick={onClose} className="p-2 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-900 transition-colors">
+            <Plus className="w-5 h-5 rotate-45" />
+          </button>
+        </div>
+
+        <form onSubmit={submit} className="px-6 py-5 space-y-4 overflow-y-auto custom-scrollbar">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+            <div className="space-y-1.5">
+              <label className={labelClass}>节点名称</label>
+              <input
+                type="text"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="例如: a100-01"
+                required
+                className={inputClass}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelClass}>主机地址</label>
+              <input
+                type="text"
+                value={host}
+                onChange={(event) => setHost(event.target.value)}
+                placeholder="IP 或域名"
+                required
+                className={`${inputClass} font-mono`}
+                spellCheck={false}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelClass}>SSH 端口</label>
+              <input
+                type="number"
+                min="1"
+                max="65535"
+                value={sshPort}
+                onChange={(event) => setSshPort(event.target.value)}
+                required
+                className={`${inputClass} font-mono`}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelClass}>用户名</label>
+              <input
+                type="text"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                placeholder="例如: root"
+                required
+                className={`${inputClass} font-mono`}
+                spellCheck={false}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className={labelClass}>认证方式</label>
+            <div className="grid grid-cols-2 gap-1 bg-slate-100 border border-slate-200 rounded-lg p-1">
+              {([
+                ['key', 'SSH 密钥'],
+                ['password', '密码'],
+              ] as ['key' | 'password', string][]).map(([value, label]) => (
+                <label key={value} className="cursor-pointer">
+                  <input
+                    type="radio"
+                    name="auth_method"
+                    checked={authMethod === value}
+                    onChange={() => setAuthMethod(value)}
+                    className="peer sr-only"
+                  />
+                  <span className="block rounded-md px-2 py-1.5 text-center text-[11px] font-bold text-slate-500 transition-all peer-checked:bg-white peer-checked:text-blue-600 peer-checked:shadow-sm">
+                    {label}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {authMethod === 'key' ? (
+            <div className="space-y-1.5">
+              <label className={labelClass}>SSH 密钥</label>
+              <select
+                value={sshKeyId}
+                onChange={(event) => setSshKeyId(event.target.value)}
+                className={`${inputClass} cursor-pointer`}
+              >
+                <option value="">选择密钥库中的密钥</option>
+                {sshKeys.map(key => (
+                  <option key={key.id} value={key.id}>{key.name}{key.kind ? `（${key.kind}）` : ''}</option>
+                ))}
+              </select>
+              {sshKeys.length === 0 && (
+                <p className="text-[11px] text-amber-600">密钥库为空，请先在“SSH 密钥库”中添加密钥</p>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              <label className={labelClass}>登录密码</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder={keepOldPassword ? '留空则保持原密码' : '输入 SSH 登录密码'}
+                className={`${inputClass} font-mono`}
+                autoComplete="new-password"
+              />
+              <p className="text-[11px] text-rose-600 font-medium flex items-start gap-1.5">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                密码将以明文存储于本机数据库，建议优先使用 SSH 密钥认证
+              </p>
+            </div>
+          )}
+
+          <div className="space-y-1.5">
+            <label className={labelClass}>备注</label>
+            <input
+              type="text"
+              value={notes}
+              onChange={(event) => setNotes(event.target.value)}
+              placeholder="可选备注说明"
+              className={inputClass}
+            />
+          </div>
+
+          {error && (
+            <p className="text-[11px] text-rose-600 font-medium bg-rose-50 border border-rose-100 rounded-lg px-3 py-2 whitespace-pre-wrap break-all">
+              {error}
+            </p>
+          )}
+
+          <div className="flex justify-end gap-3 pt-4 border-t border-slate-100">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-6 py-2 rounded-lg text-slate-500 font-bold hover:bg-slate-50 transition-colors text-sm"
+            >
+              取消
+            </button>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="px-10 py-2 bg-blue-600 text-white rounded-lg font-bold shadow-md shadow-blue-600/20 hover:bg-blue-700 active:scale-95 transition-all text-sm disabled:opacity-60"
+            >
+              {submitting ? '保存中...' : isEdit ? '保存修改' : '注册节点'}
+            </button>
+          </div>
+        </form>
+      </motion.div>
+    </div>
+  );
+}
+
+function SshKeyModal({ onClose, onSaved }: { onClose: () => void; onSaved: (message: string) => void }) {
+  const [mode, setMode] = useState<'paste' | 'path'>('paste');
+  const [name, setName] = useState('');
+  const [privateKey, setPrivateKey] = useState('');
+  const [keyPath, setKeyPath] = useState('');
+  const [notes, setNotes] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (mode === 'paste' && !privateKey.trim()) {
+      setError('请粘贴私钥内容');
+      return;
+    }
+    if (mode === 'path' && !keyPath.trim()) {
+      setError('请填写私钥文件路径');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api('/api/ssh-keys', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: name.trim(),
+          private_key: mode === 'paste' ? privateKey : null,
+          private_key_path: mode === 'path' ? keyPath.trim() : null,
+          notes: notes.trim() || null,
+        }),
+      });
+      onSaved(`已添加 SSH 密钥 ${name.trim()}`);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const inputClass = 'w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors';
+  const labelClass = 'text-[10px] font-bold text-slate-500 uppercase tracking-widest';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-slate-900/40 backdrop-blur-sm">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        className="relative w-full max-w-xl bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[calc(100vh-3rem)]"
+      >
+        <div className="shrink-0 px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
+          <div>
+            <h2 className="text-lg font-bold text-slate-900 tracking-tight">新增 SSH 密钥</h2>
+            <p className="text-xs text-slate-500 font-medium">粘贴私钥内容或引用本机已有的私钥文件</p>
+          </div>
+          <button onClick={onClose} className="p-2 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-900 transition-colors">
+            <Plus className="w-5 h-5 rotate-45" />
+          </button>
+        </div>
+
+        <form onSubmit={submit} className="px-6 py-5 space-y-4 overflow-y-auto custom-scrollbar">
+          <div className="space-y-1.5">
+            <label className={labelClass}>密钥名称</label>
+            <input
+              type="text"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="例如: cluster-ed25519"
+              required
+              className={inputClass}
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className={labelClass}>来源</label>
+            <div className="grid grid-cols-2 gap-1 bg-slate-100 border border-slate-200 rounded-lg p-1">
+              {([
+                ['paste', '粘贴私钥'],
+                ['path', '引用已有路径'],
+              ] as ['paste' | 'path', string][]).map(([value, label]) => (
+                <label key={value} className="cursor-pointer">
+                  <input
+                    type="radio"
+                    name="ssh_key_mode"
+                    checked={mode === value}
+                    onChange={() => setMode(value)}
+                    className="peer sr-only"
+                  />
+                  <span className="block rounded-md px-2 py-1.5 text-center text-[11px] font-bold text-slate-500 transition-all peer-checked:bg-white peer-checked:text-blue-600 peer-checked:shadow-sm">
+                    {label}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {mode === 'paste' ? (
+            <div className="space-y-1.5">
+              <label className={labelClass}>私钥内容</label>
+              <textarea
+                rows={8}
+                value={privateKey}
+                onChange={(event) => setPrivateKey(event.target.value)}
+                placeholder={'-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----'}
+                className={`${inputClass} font-mono text-[11px] resize-y`}
+                spellCheck={false}
+              />
+              <p className="text-[11px] text-slate-400">私钥会以 0600 权限保存到本机数据目录，不会出现在任何 API 响应或日志中</p>
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              <label className={labelClass}>私钥文件路径</label>
+              <input
+                type="text"
+                value={keyPath}
+                onChange={(event) => setKeyPath(event.target.value)}
+                placeholder="/root/.ssh/id_ed25519"
+                className={`${inputClass} font-mono`}
+                spellCheck={false}
+              />
+              <p className="text-[11px] text-slate-400">引用主控本机上已存在的私钥文件，不复制内容</p>
+            </div>
+          )}
+
+          <div className="space-y-1.5">
+            <label className={labelClass}>备注</label>
+            <input
+              type="text"
+              value={notes}
+              onChange={(event) => setNotes(event.target.value)}
+              placeholder="可选备注说明"
+              className={inputClass}
+            />
+          </div>
+
+          {error && (
+            <p className="text-[11px] text-rose-600 font-medium bg-rose-50 border border-rose-100 rounded-lg px-3 py-2 whitespace-pre-wrap break-all">
+              {error}
+            </p>
+          )}
+
+          <div className="flex justify-end gap-3 pt-4 border-t border-slate-100">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-6 py-2 rounded-lg text-slate-500 font-bold hover:bg-slate-50 transition-colors text-sm"
+            >
+              取消
+            </button>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="px-10 py-2 bg-blue-600 text-white rounded-lg font-bold shadow-md shadow-blue-600/20 hover:bg-blue-700 active:scale-95 transition-all text-sm disabled:opacity-60"
+            >
+              {submitting ? '保存中...' : '添加密钥'}
+            </button>
+          </div>
+        </form>
+      </motion.div>
+    </div>
+  );
+}
+
+function LinkMatrix({ nodes, links, probing, onProbe }: {
+  nodes: SyncNode[];
+  links: NodeLinkInfo[];
+  probing: boolean;
+  onProbe: (pairs?: string[][]) => void;
+}) {
+  const remoteNodes = nodes.filter(node => !node.is_local);
+
+  const findLink = (fromId: string, toId: string) =>
+    links.find(link => link.from_node_id === fromId && link.to_node_id === toId);
+
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+      <div className="p-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="p-2 bg-violet-600 rounded-lg text-white">
+            <Network className="w-5 h-5" />
+          </div>
+          <div>
+            <h3 className="font-bold text-slate-800 text-base">连通性矩阵</h3>
+            <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">行=发起端 / 列=目标节点</p>
+          </div>
+        </div>
+        <button
+          onClick={() => onProbe()}
+          disabled={probing}
+          className="flex items-center gap-2 px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 rounded-lg text-xs font-bold transition-colors shadow-sm disabled:opacity-60"
+        >
+          {probing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCcw className="w-3.5 h-3.5" />}
+          {probing ? '探测中...' : '全矩阵探测'}
+        </button>
+      </div>
+      <div className="p-4">
+        {remoteNodes.length > 0 ? (
+          <>
+            <div className="overflow-x-auto custom-scrollbar">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-[10px] font-bold text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                    <th className="py-2 pr-3 text-left">发起端 \ 目标</th>
+                    {remoteNodes.map(node => (
+                      <th key={node.id} className="py-2 px-2 text-center max-w-[100px] truncate" title={node.name}>{node.name}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {nodes.map(fromNode => (
+                    <tr key={fromNode.id} className="border-b border-slate-50">
+                      <td className="py-2 pr-3 font-bold text-slate-700 whitespace-nowrap">
+                        {fromNode.is_local ? '本机' : fromNode.name}
+                      </td>
+                      {remoteNodes.map(toNode => {
+                        if (fromNode.id === toNode.id) {
+                          return (
+                            <td key={toNode.id} className="py-2 px-2 text-center text-slate-200 font-bold">—</td>
+                          );
+                        }
+                        const link = findLink(fromNode.id, toNode.id);
+                        const applicable = link?.applicable ?? (Boolean(fromNode.is_local) || toNode.auth_method !== 'password');
+                        if (!applicable) {
+                          return (
+                            <td
+                              key={toNode.id}
+                              className="py-2 px-2 text-center text-slate-200 font-bold"
+                              title="目标节点为密码认证，不能由远端连入（不适用）"
+                            >
+                              —
+                            </td>
+                          );
+                        }
+                        const status = link?.status || 'unknown';
+                        return (
+                          <td key={toNode.id} className="py-2 px-2 text-center">
+                            <button
+                              onClick={() => onProbe([[fromNode.id, toNode.id]])}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-slate-50 transition-colors"
+                              title={
+                                status === 'failed'
+                                  ? `失败：${link?.last_error || '未知错误'}（点击重测）`
+                                  : status === 'ok'
+                                    ? `连通 ${link?.latency_ms != null ? `${Math.round(Number(link.latency_ms))}ms` : ''}，上次探测 ${formatTime(link?.last_probe_at) || '未知'}（点击重测）`
+                                    : '未探测（点击探测）'
+                              }
+                            >
+                              {status === 'ok' && (
+                                <>
+                                  <span className="text-emerald-500 font-bold">●</span>
+                                  {link?.latency_ms != null && (
+                                    <span className="text-[10px] text-slate-500 font-mono tabular-nums">{Math.round(Number(link.latency_ms))}ms</span>
+                                  )}
+                                </>
+                              )}
+                              {status === 'failed' && <span className="text-rose-500 font-bold">✕</span>}
+                              {status === 'unknown' && <span className="text-slate-300 font-bold">?</span>}
+                            </button>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3 flex items-center gap-4 flex-wrap text-[10px] text-slate-400 font-medium px-1">
+              <span><span className="text-emerald-500 font-bold">●</span> 连通（含延迟）</span>
+              <span><span className="text-rose-500 font-bold">✕</span> 失败（悬停看原因）</span>
+              <span><span className="text-slate-300 font-bold">?</span> 未探测</span>
+              <span><span className="text-slate-200 font-bold">—</span> 不适用</span>
+              <span>点击单元格可单边重测</span>
+            </div>
+          </>
+        ) : (
+          <div className="p-8 text-center text-slate-400 space-y-2">
+            <Network className="w-8 h-8 mx-auto opacity-20" />
+            <p className="text-sm">注册远程节点后这里会展示连通性矩阵</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ==================== 多终端页（多节点交互终端 + 广播输入 + conda 环境对比） ====================
+
+interface TerminalSessionInfo {
+  session_id: string;
+  node_id: string;
+  node_name: string;
+  is_local?: boolean;
+  alive?: boolean;
+  created_at?: string | null;
+  last_activity_at?: string | null;
+  exit_code?: number | null;
+  subscriber_count?: number;
+  cols?: number;
+  rows?: number;
+}
+
+type InteractiveTerminalStreamPayload = {
+  session_id?: string;
+  data?: string;
+  status?: string;
+  exit_code?: number | null;
+  reason?: string;
+};
+
+interface CondaNodeInventory {
+  node_id: string;
+  node_name: string;
+  status: 'ok' | 'no_conda' | 'timeout' | 'error';
+  conda_version?: string | null;
+  envs?: string[];
+  error?: string | null;
+  fetched_at?: string | null;
+}
+
+/** 单次 POST 终端输入的最大原始字节数（后端上限 64KB，留余量取 32KB） */
+const TERMINAL_INPUT_CHUNK_BYTES = 32768;
+
+/** 字节数组 → base64（分块拼接，避免大输入超出调用栈） */
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = '';
+  const chunkSize = 0x2000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...Array.from(bytes.subarray(index, index + chunkSize)));
+  }
+  return window.btoa(binary);
+}
+
+/** UTF-8 安全的 base64 编码 */
+function encodeBase64Utf8(value: string) {
+  return bytesToBase64(new TextEncoder().encode(value));
+}
+
+/** 把 UTF-8 字节流切成 ≤maxBytes 的片段，且不从多字节字符中间切断（回退跳过 10xxxxxx 续字节） */
+function splitUtf8Chunks(bytes: Uint8Array, maxBytes: number): Uint8Array[] {
+  const chunks: Uint8Array[] = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    let end = Math.min(offset + maxBytes, bytes.length);
+    if (end < bytes.length) {
+      while (end > offset && (bytes[end] & 0xc0) === 0x80) {
+        end -= 1;
+      }
+      if (end === offset) {
+        // 兜底防死循环：maxBytes 远大于单字符 4 字节，理论上不可达
+        end = Math.min(offset + maxBytes, bytes.length);
+      }
+    }
+    chunks.push(bytes.subarray(offset, end));
+    offset = end;
+  }
+  return chunks;
+}
+
+function isXtermNearBottom(terminal: XTerm) {
+  const buffer = terminal.buffer.active;
+  return buffer.baseY - buffer.viewportY <= 1;
+}
+
+function InteractiveTerminal({
+  sessionId,
+  title,
+  streamUrl,
+  resizeUrl,
+  inputUrl,
+  statusSuffix,
+  onData,
+  onReconnect,
+}: {
+  sessionId: string;
+  title: string;
+  streamUrl: string;
+  resizeUrl: string;
+  inputUrl: string;
+  statusSuffix: string;
+  onData?: (data: string) => void;
+  onReconnect?: () => void;
+}) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<XTerm | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const resizeTimerRef = useRef<number | null>(null);
+  const lastSizeKeyRef = useRef('');
+  const autoFollowRef = useRef(true);
+  const onDataRef = useRef(onData);
+  const [connectionStatus, setConnectionStatus] = useState('连接中');
+  const [exitInfo, setExitInfo] = useState<InteractiveTerminalStreamPayload | null>(null);
+
+  useEffect(() => {
+    onDataRef.current = onData;
+  }, [onData]);
+
+  const sendResize = useCallback(async () => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    const cols = Math.max(2, terminal.cols || 0);
+    const rows = Math.max(1, terminal.rows || 0);
+    if (!cols || !rows) return;
+    const sizeKey = `${sessionId}:${cols}x${rows}`;
+    if (lastSizeKeyRef.current === sizeKey) return;
+    try {
+      await api(resizeUrl, {
+        method: 'POST',
+        body: JSON.stringify({ cols, rows }),
+      });
+      lastSizeKeyRef.current = sizeKey;
+    } catch {
+      // resize 尽力而为，失败不影响数据流
+    }
+  }, [resizeUrl, sessionId]);
+
+  const fitAndResize = useCallback(() => {
+    try {
+      fitAddonRef.current?.fit();
+    } catch {
+      return;
+    }
+    if (resizeTimerRef.current !== null) {
+      window.clearTimeout(resizeTimerRef.current);
+    }
+    resizeTimerRef.current = window.setTimeout(() => {
+      resizeTimerRef.current = null;
+      void sendResize();
+    }, 120);
+  }, [sendResize]);
+
+  const streamUrlWithCurrentSize = useCallback(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return streamUrl;
+    try {
+      fitAddonRef.current?.fit();
+    } catch {
+      // 拿不到尺寸时由后端默认尺寸兜底
+    }
+    const cols = Math.max(2, terminal.cols || 0);
+    const rows = Math.max(1, terminal.rows || 0);
+    if (!cols || !rows) return streamUrl;
+    const separator = streamUrl.includes('?') ? '&' : '?';
+    return `${streamUrl}${separator}cols=${cols}&rows=${rows}`;
+  }, [streamUrl]);
+
+  const writePayload = useCallback((data?: string, options: { reset?: boolean } = {}) => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    if (options.reset) {
+      terminal.reset();
+      autoFollowRef.current = true;
+    }
+    if (!data) return;
+    const shouldFollow = Boolean(options.reset || autoFollowRef.current || isXtermNearBottom(terminal));
+    try {
+      // 交互式 TUI（vim/htop/conda 进度条）必须原始直写，不能做 CR 折叠归一化
+      terminal.write(decodeBase64Bytes(data), () => {
+        if (shouldFollow) {
+          terminal.scrollToBottom();
+        }
+      });
+    } catch {
+      terminal.writeln('\r\n[exp-scheduler] 终端数据解析失败');
+    }
+  }, []);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+
+    const terminal = new XTerm({
+      allowProposedApi: false,
+      convertEol: false,
+      cursorBlink: true,
+      disableStdin: false,
+      fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
+      fontSize: 13,
+      lineHeight: 1.1,
+      scrollback: 10000,
+      theme: {
+        background: '#0f172a',
+        foreground: '#e2e8f0',
+        cursor: '#f8fafc',
+        selectionBackground: 'rgba(255,255,255,0.14)',
+      },
+    });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(host);
+    terminal.onScroll(() => {
+      autoFollowRef.current = isXtermNearBottom(terminal);
+    });
+    const dataListener = terminal.onData((data) => {
+      const handler = onDataRef.current;
+      if (handler) {
+        handler(data);
+        return;
+      }
+      // 无父层路由时退化为直接单发到本会话输入接口
+      void api(inputUrl, {
+        method: 'POST',
+        body: JSON.stringify({ data: encodeBase64Utf8(data) }),
+      }).catch(() => {});
+    });
+    terminalRef.current = terminal;
+    fitAddonRef.current = fitAddon;
+
+    const resizeObserver = new ResizeObserver(() => {
+      window.requestAnimationFrame(fitAndResize);
+    });
+    resizeObserver.observe(host);
+    if (document.fonts?.ready) {
+      document.fonts.ready.then(() => window.requestAnimationFrame(fitAndResize)).catch(() => {});
+    }
+    window.requestAnimationFrame(fitAndResize);
+
+    return () => {
+      if (resizeTimerRef.current !== null) {
+        window.clearTimeout(resizeTimerRef.current);
+        resizeTimerRef.current = null;
+      }
+      resizeObserver.disconnect();
+      dataListener.dispose();
+      terminal.dispose();
+      terminalRef.current = null;
+      fitAddonRef.current = null;
+      lastSizeKeyRef.current = '';
+    };
+  }, [fitAndResize, inputUrl]);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+
+    setConnectionStatus('连接中');
+    setExitInfo(null);
+    terminal.reset();
+    terminal.writeln(`[exp-scheduler] connecting interactive terminal ${sessionId}`);
+
+    const source = new EventSource(streamUrlWithCurrentSize());
+
+    source.addEventListener('snapshot', (event) => {
+      const payload = JSON.parse(event.data) as InteractiveTerminalStreamPayload;
+      setConnectionStatus('交互终端');
+      writePayload(payload.data, { reset: true });
+      window.requestAnimationFrame(fitAndResize);
+    });
+
+    source.addEventListener('chunk', (event) => {
+      const payload = JSON.parse(event.data) as InteractiveTerminalStreamPayload;
+      setConnectionStatus('交互终端');
+      writePayload(payload.data);
+    });
+
+    source.addEventListener('exit', (event) => {
+      const payload = JSON.parse(event.data || '{}') as InteractiveTerminalStreamPayload;
+      setExitInfo(payload);
+      setConnectionStatus(payload.reason === 'connection_lost' ? '连接已断开' : '会话已结束');
+      source.close();
+    });
+
+    source.onerror = () => {
+      if (source.readyState === EventSource.CLOSED) {
+        setConnectionStatus('连接已关闭');
+      } else {
+        setConnectionStatus('正在重连');
+      }
+    };
+
+    return () => {
+      source.close();
+    };
+  }, [fitAndResize, sessionId, streamUrlWithCurrentSize, writePayload]);
+
+  return (
+    <div className="relative h-full w-full">
+      <div className="absolute right-0 top-0 z-10 rounded-bl-lg bg-slate-800/90 px-2 py-1 text-[10px] font-bold text-slate-300">
+        {connectionStatus} / {statusSuffix}
+      </div>
+      <div className="mb-2 flex gap-2 pr-28 text-[10px] font-bold uppercase tracking-widest text-slate-500">
+        <Terminal className="h-3.5 w-3.5 text-emerald-500" />
+        <span className="truncate">{title}</span>
+      </div>
+      <div ref={hostRef} className="xterm-host h-[calc(100%-1.5rem)] w-full" />
+      {exitInfo && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center rounded bg-slate-900/85 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-3 px-4 text-center">
+            <AlertCircle className={`h-6 w-6 ${exitInfo.reason === 'connection_lost' ? 'text-amber-400' : 'text-slate-400'}`} />
+            <p className="text-sm font-bold text-slate-200">
+              {exitInfo.reason === 'connection_lost'
+                ? '连接已断开'
+                : `会话已结束${exitInfo.exit_code !== null && exitInfo.exit_code !== undefined ? ` (exit ${exitInfo.exit_code})` : ''}`}
+            </p>
+            {exitInfo.reason === 'connection_lost' && onReconnect && (
+              <button
+                onClick={onReconnect}
+                className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold transition-colors"
+              >
+                <RotateCw className="h-3.5 w-3.5" />
+                重连
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function condaStatusLabel(status: CondaNodeInventory['status']) {
+  switch (status) {
+    case 'ok': return '正常';
+    case 'no_conda': return '无 conda';
+    case 'timeout': return '超时';
+    default: return '错误';
+  }
+}
+
+function condaStatusBadgeStyle(status: CondaNodeInventory['status']) {
+  switch (status) {
+    case 'ok': return 'bg-emerald-50 text-emerald-700 border-emerald-100';
+    case 'no_conda': return 'bg-slate-50 text-slate-500 border-slate-200';
+    case 'timeout': return 'bg-amber-50 text-amber-700 border-amber-100';
+    default: return 'bg-rose-50 text-rose-700 border-rose-100';
+  }
+}
+
+function CondaComparePanel({ onNotice }: { onNotice: (text: string, kind?: 'info' | 'success' | 'error') => void }) {
+  const [open, setOpen] = useState(false);
+  const [inventory, setInventory] = useState<CondaNodeInventory[] | null>(null);
+  const [fetchedAt, setFetchedAt] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const loadInventory = useCallback(async (refresh: boolean) => {
+    if (refresh) {
+      setRefreshing(true);
+    } else {
+      setLoading(true);
+    }
+    try {
+      const payload = await api<{ nodes?: CondaNodeInventory[]; fetched_at?: string; refreshing?: boolean }>(
+        refresh ? '/api/conda/inventory/refresh' : '/api/conda/inventory',
+        refresh ? { method: 'POST' } : {},
+      );
+      setInventory(payload.nodes || []);
+      setFetchedAt(payload.fetched_at || null);
+    } catch (error) {
+      onNotice((error as Error).message, 'error');
+    } finally {
+      if (refresh) {
+        setRefreshing(false);
+      } else {
+        setLoading(false);
+      }
+    }
+  }, [onNotice]);
+
+  useEffect(() => {
+    if (open && inventory === null && !loading) {
+      void loadInventory(false);
+    }
+  }, [open, inventory, loading, loadInventory]);
+
+  const envNames = useMemo(() => {
+    const names = new Set<string>();
+    (inventory || []).forEach(node => (node.envs || []).forEach(env => names.add(env)));
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [inventory]);
+
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+      <div className="p-4 bg-slate-50/50 flex items-center justify-between gap-3 flex-wrap">
+        <button
+          onClick={() => setOpen(prev => !prev)}
+          className="flex items-center gap-3 text-left"
+        >
+          <div className="p-2 bg-emerald-600 rounded-lg text-white">
+            <HardDrive className="w-5 h-5" />
+          </div>
+          <div>
+            <h3 className="font-bold text-slate-800 text-base flex items-center gap-2">
+              conda 环境对比
+              <ChevronDown className={`w-4 h-4 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+            </h3>
+            <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">conda environments matrix</p>
+          </div>
+        </button>
+        <div className="flex items-center gap-3">
+          {fetchedAt && (
+            <span className="text-[10px] text-slate-400 font-mono">{formatTime(fetchedAt)}</span>
+          )}
+          {open && (
+            <button
+              onClick={() => void loadInventory(true)}
+              disabled={refreshing}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-bold border transition-all shadow-sm ${
+                refreshing
+                  ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                  : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              {refreshing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCcw className="w-3.5 h-3.5" />}
+              刷新
+            </button>
+          )}
+        </div>
+      </div>
+      {open && (
+        <div className="border-t border-slate-100">
+          {loading && (
+            <div className="p-8 flex items-center justify-center gap-3 text-slate-400">
+              <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
+              <span className="text-sm font-bold">正在采集各节点 conda 环境...</span>
+            </div>
+          )}
+          {!loading && inventory !== null && (
+            inventory.length === 0 ? (
+              <div className="p-8 text-center text-slate-400 text-sm">暂无节点数据</div>
+            ) : (
+              <div className="overflow-x-auto custom-scrollbar">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-100 bg-slate-50/30">
+                      <th className="text-left px-4 py-2 text-[10px] font-bold text-slate-400 uppercase tracking-widest whitespace-nowrap">conda 环境</th>
+                      {inventory.map(node => (
+                        <th key={node.node_id} className="px-3 py-2 text-center align-top">
+                          <div className="font-bold text-slate-700 truncate max-w-[160px] mx-auto">{node.node_name}</div>
+                          <span className={`inline-block mt-1 px-1.5 py-0.5 rounded border text-[9px] font-bold ${condaStatusBadgeStyle(node.status)}`}>
+                            {condaStatusLabel(node.status)}
+                          </span>
+                          {node.conda_version && (
+                            <div className="mt-0.5 text-[9px] text-slate-400 font-mono">{node.conda_version}</div>
+                          )}
+                          {(node.status === 'timeout' || node.status === 'error') && node.error && (
+                            <div className="mt-0.5 text-[9px] text-rose-400 max-w-[160px] truncate mx-auto" title={node.error}>
+                              {node.error}
+                            </div>
+                          )}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {envNames.length === 0 ? (
+                      <tr>
+                        <td colSpan={1 + inventory.length} className="px-4 py-6 text-center text-slate-400">
+                          所有节点均未发现 conda 环境
+                        </td>
+                      </tr>
+                    ) : (
+                      envNames.map(env => (
+                        <tr key={env} className="border-b border-slate-50 hover:bg-slate-50/40 transition-colors">
+                          <td className="px-4 py-1.5 font-mono text-slate-600 whitespace-nowrap">{env}</td>
+                          {inventory.map(node => {
+                            if (node.status !== 'ok') {
+                              return (
+                                <td key={node.node_id} className="px-3 py-1.5 text-center text-slate-300 font-bold">—</td>
+                              );
+                            }
+                            const has = (node.envs || []).includes(env);
+                            return (
+                              <td key={node.node_id} className={`px-3 py-1.5 text-center ${has ? '' : 'bg-rose-50'}`}>
+                                {has
+                                  ? <span className="text-emerald-600 font-bold">✓</span>
+                                  : <span className="text-rose-500 font-bold">✗</span>}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MultiTerminalPage() {
+  const [nodes, setNodes] = useState<SyncNode[]>([]);
+  const [sessions, setSessions] = useState<TerminalSessionInfo[]>([]);
+  const [disconnectedIds, setDisconnectedIds] = useState<Set<string>>(new Set());
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
+  const [broadcastOn, setBroadcastOn] = useState(false);
+  const [selectedNodeId, setSelectedNodeId] = useState('local');
+  const [creating, setCreating] = useState(false);
+  const [notice, setNotice] = useState<{ text: string; kind: 'info' | 'success' | 'error' } | null>(null);
+
+  // 广播路由从 ref 读取，保证 onData 回调引用稳定（不随开关切换重建终端）
+  const broadcastOnRef = useRef(false);
+  const checkedIdsRef = useRef<Set<string>>(new Set());
+  const disconnectedIdsRef = useRef<Set<string>>(new Set());
+  const inputQueuesRef = useRef(new Map<string, { pending: string; inflight: boolean }>());
+  const inputErrorToastRef = useRef(false);
+
+  useEffect(() => {
+    broadcastOnRef.current = broadcastOn;
+  }, [broadcastOn]);
+
+  useEffect(() => {
+    checkedIdsRef.current = checkedIds;
+  }, [checkedIds]);
+
+  useEffect(() => {
+    disconnectedIdsRef.current = disconnectedIds;
+  }, [disconnectedIds]);
+
+  const showNotice = useCallback((text: string, kind: 'info' | 'success' | 'error' = 'info') => {
+    setNotice({ text, kind });
+  }, []);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 8000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const loadNodes = useCallback(async () => {
+    const payload = await api<{ nodes: SyncNode[] }>('/api/nodes');
+    setNodes(payload.nodes || []);
+  }, []);
+
+  const loadSessions = useCallback(async () => {
+    const payload = await api<{ sessions: TerminalSessionInfo[] }>('/api/terminals');
+    setSessions(payload.sessions || []);
+  }, []);
+
+  const mergeSessions = useCallback(async () => {
+    const payload = await api<{ sessions: TerminalSessionInfo[] }>('/api/terminals');
+    const fetched = payload.sessions || [];
+    setSessions(prev => {
+      const known = new Set(prev.map(item => item.session_id));
+      const added = fetched.filter(item => !known.has(item.session_id));
+      return added.length ? [...prev, ...added] : prev;
+    });
+  }, []);
+
+  const removeSessionLocally = useCallback((sessionId: string) => {
+    setSessions(prev => prev.filter(item => item.session_id !== sessionId));
+    setCheckedIds(prev => {
+      if (!prev.has(sessionId)) return prev;
+      const next = new Set(prev);
+      next.delete(sessionId);
+      return next;
+    });
+    setDisconnectedIds(prev => {
+      if (!prev.has(sessionId)) return prev;
+      const next = new Set(prev);
+      next.delete(sessionId);
+      return next;
+    });
+    inputQueuesRef.current.delete(sessionId);
+  }, []);
+
+  useEffect(() => {
+    loadNodes().catch(error => showNotice((error as Error).message, 'error'));
+    loadSessions().catch(error => showNotice((error as Error).message, 'error'));
+
+    const source = new EventSource('/api/events');
+    source.addEventListener('update', (event) => {
+      let parsed: { type?: string; payload?: Record<string, unknown> };
+      try {
+        parsed = JSON.parse(((event as MessageEvent).data as string) || '{}');
+      } catch {
+        return;
+      }
+      const type = String(parsed?.type || '');
+      const payload = (parsed?.payload || {}) as Record<string, unknown>;
+      if (type === 'terminal_session_closed') {
+        const sessionId = String(payload.session_id || '');
+        if (!sessionId) return;
+        if (String(payload.reason || '') === 'connection_lost') {
+          // 连接断开的会话保留卡片，由覆盖层提供重连入口；同步更新 ref 让广播路由立即生效
+          disconnectedIdsRef.current = new Set(disconnectedIdsRef.current).add(sessionId);
+          setDisconnectedIds(prev => {
+            if (prev.has(sessionId)) return prev;
+            const next = new Set(prev);
+            next.add(sessionId);
+            return next;
+          });
+          // 从广播勾选集合移除，避免后续输入持续发往已断开会话（卡片保留，勾选取消）
+          setCheckedIds(prev => {
+            if (!prev.has(sessionId)) return prev;
+            const next = new Set(prev);
+            next.delete(sessionId);
+            return next;
+          });
+        } else {
+          removeSessionLocally(sessionId);
+        }
+      } else if (type === 'terminal_session_created') {
+        // 其他页面/标签创建的会话也纳入布局（合并去重）
+        void mergeSessions().catch(() => {});
+      }
+    });
+    return () => {
+      source.close();
+    };
+  }, [loadNodes, loadSessions, mergeSessions, removeSessionLocally, showNotice]);
+
+  // ---------- 输入发送队列：每会话串行 POST，inflight 期间累积 pending ----------
+
+  const pumpInput = useCallback(async (sessionId: string) => {
+    const queue = inputQueuesRef.current.get(sessionId);
+    if (!queue || queue.inflight) return;
+    queue.inflight = true;
+    try {
+      while (queue.pending) {
+        const data = queue.pending;
+        queue.pending = '';
+        // 大段粘贴按原始字节 ≤32KB 切片（UTF-8 边界对齐）串行发送，避免触发后端单次输入上限
+        const chunks = splitUtf8Chunks(new TextEncoder().encode(data), TERMINAL_INPUT_CHUNK_BYTES);
+        for (let index = 0; index < chunks.length; index += 1) {
+          try {
+            await api(`/api/terminals/${sessionId}/input`, {
+              method: 'POST',
+              body: JSON.stringify({ data: bytesToBase64(chunks[index]) }),
+            });
+          } catch (error) {
+            // 失败时保留未发送部分（含失败的这一片），随下次输入重试，不整体丢弃
+            const decoder = new TextDecoder();
+            const unsent = chunks.slice(index).map(chunk => decoder.decode(chunk)).join('');
+            queue.pending = unsent + queue.pending;
+            throw error;
+          }
+        }
+      }
+    } catch (error) {
+      if (!inputErrorToastRef.current) {
+        inputErrorToastRef.current = true;
+        showNotice(`终端输入发送失败（未发送内容已保留，将随下次输入重试）: ${(error as Error).message}`, 'error');
+        window.setTimeout(() => {
+          inputErrorToastRef.current = false;
+        }, 5000);
+      }
+    } finally {
+      queue.inflight = false;
+    }
+  }, [showNotice]);
+
+  const enqueueInput = useCallback((sessionId: string, data: string) => {
+    let queue = inputQueuesRef.current.get(sessionId);
+    if (!queue) {
+      queue = { pending: '', inflight: false };
+      inputQueuesRef.current.set(sessionId, queue);
+    }
+    queue.pending += data;
+    if (!queue.inflight) {
+      void pumpInput(sessionId);
+    }
+  }, [pumpInput]);
+
+  const handleTerminalData = useCallback((sessionId: string, data: string) => {
+    const checked = checkedIdsRef.current;
+    const disconnected = disconnectedIdsRef.current;
+    // 广播目标剔除已断开会话，避免向已不存在的会话反复 POST 触发 404
+    const targets = broadcastOnRef.current && checked.has(sessionId)
+      ? [...checked].filter(id => !disconnected.has(id))
+      : [sessionId];
+    targets.forEach(id => enqueueInput(id, data));
+  }, [enqueueInput]);
+
+  // ---------- 会话生命周期 ----------
+
+  const createTerminal = useCallback(async (nodeId: string) => {
+    const payload = await api<{ session: TerminalSessionInfo }>('/api/terminals', {
+      method: 'POST',
+      body: JSON.stringify({ node_id: nodeId, cols: 120, rows: 30 }),
+    });
+    return payload.session;
+  }, []);
+
+  const handleCreate = async () => {
+    setCreating(true);
+    try {
+      const session = await createTerminal(selectedNodeId);
+      setSessions(prev => (prev.some(item => item.session_id === session.session_id) ? prev : [...prev, session]));
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const handleReconnect = async (oldSession: TerminalSessionInfo) => {
+    try {
+      const session = await createTerminal(oldSession.node_id);
+      setSessions(prev => {
+        // 新会话可能已被 SSE merge 追加，先去掉再原位替换
+        const withoutNew = prev.filter(item => item.session_id !== session.session_id);
+        if (!withoutNew.some(item => item.session_id === oldSession.session_id)) {
+          return [...withoutNew, session];
+        }
+        return withoutNew.map(item => (item.session_id === oldSession.session_id ? session : item));
+      });
+      setCheckedIds(prev => {
+        if (!prev.has(oldSession.session_id)) return prev;
+        const next = new Set(prev);
+        next.delete(oldSession.session_id);
+        next.add(session.session_id);
+        return next;
+      });
+      setDisconnectedIds(prev => {
+        if (!prev.has(oldSession.session_id)) return prev;
+        const next = new Set(prev);
+        next.delete(oldSession.session_id);
+        return next;
+      });
+      inputQueuesRef.current.delete(oldSession.session_id);
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    }
+  };
+
+  const handleClose = async (session: TerminalSessionInfo) => {
+    const isDisconnected = disconnectedIds.has(session.session_id);
+    if (!isDisconnected) {
+      const confirmed = window.confirm(
+        `确认关闭 ${session.node_name} 的终端会话吗？\n\n会话中正在运行的命令会被终止。`
+      );
+      if (!confirmed) return;
+      try {
+        await api(`/api/terminals/${session.session_id}`, { method: 'DELETE' });
+      } catch (error) {
+        const text = (error as Error).message || '';
+        // 会话可能已在服务端结束，仅对其他错误提示
+        if (!text.includes('不存在')) {
+          showNotice(text, 'error');
+        }
+      }
+    }
+    removeSessionLocally(session.session_id);
+  };
+
+  const toggleChecked = (sessionId: string) => {
+    setCheckedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) {
+        next.delete(sessionId);
+      } else {
+        next.add(sessionId);
+      }
+      return next;
+    });
+  };
+
+  const columnCount = sessions.length <= 1 ? 1 : sessions.length <= 4 ? 2 : 3;
+  const noticeStyle = notice?.kind === 'error'
+    ? 'bg-rose-50 border-rose-200 text-rose-700'
+    : notice?.kind === 'success'
+      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+      : 'bg-blue-50 border-blue-200 text-blue-700';
+
+  return (
+    <div className="space-y-6">
+      {notice && (
+        <div className={`border rounded-xl px-4 py-3 text-xs font-medium shadow-sm flex items-start gap-2 ${noticeStyle}`}>
+          {notice.kind === 'error'
+            ? <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            : <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />}
+          <span className="flex-1 whitespace-pre-wrap break-all">{notice.text}</span>
+          <button onClick={() => setNotice(null)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity">
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+      )}
+
+      {/* ---------- 工具栏 ---------- */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
+        <div className="p-4 flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-blue-600 rounded-lg text-white">
+              <SquareTerminal className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-bold text-slate-800 text-base">多节点交互终端</h3>
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">interactive terminals</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 flex-wrap">
+            <select
+              value={selectedNodeId}
+              onChange={(event) => setSelectedNodeId(event.target.value)}
+              className="bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer"
+            >
+              {nodes.map(node => (
+                <option key={node.id} value={node.id}>{syncNodeOptionLabel(node)}</option>
+              ))}
+            </select>
+            <button
+              onClick={() => void handleCreate()}
+              disabled={creating}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-bold border transition-all shadow-sm ${
+                creating
+                  ? 'bg-blue-100 text-blue-300 border-blue-100 cursor-not-allowed'
+                  : 'bg-blue-600 text-white border-blue-700 hover:bg-blue-500'
+              }`}
+            >
+              {creating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+              新建终端
+            </button>
+            <div className="flex items-center gap-2 pl-3 border-l border-slate-100">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={broadcastOn}
+                onClick={() => setBroadcastOn(prev => !prev)}
+                className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                  broadcastOn ? 'bg-blue-600' : 'bg-slate-300'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                    broadcastOn ? 'translate-x-[18px]' : 'translate-x-[2px]'
+                  }`}
+                />
+              </button>
+              <span className={`text-xs font-bold ${broadcastOn ? 'text-blue-600' : 'text-slate-500'}`}>广播输入</span>
+            </div>
+          </div>
+        </div>
+        <div className="px-4 pb-3 text-[11px] text-slate-400">
+          广播开启时，键盘输入将同步发送到所有勾选的终端
+        </div>
+      </div>
+
+      {/* ---------- 终端网格 ---------- */}
+      {sessions.length === 0 ? (
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center text-slate-400 space-y-2">
+          <SquareTerminal className="w-8 h-8 mx-auto opacity-20" />
+          <p className="text-sm">暂无终端会话，选择节点后点击「新建终端」开始</p>
+        </div>
+      ) : (
+        <div
+          className="grid gap-4"
+          style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }}
+        >
+          {sessions.map(session => {
+            const disconnected = disconnectedIds.has(session.session_id);
+            return (
+              <div
+                key={session.session_id}
+                className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col"
+              >
+                <div className="px-3 py-2 border-b border-slate-100 bg-slate-50/50 flex items-center gap-2">
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${disconnected ? 'bg-rose-500' : 'bg-emerald-500'}`}
+                    title={disconnected ? '连接已断开' : '会话存活'}
+                  />
+                  <span className="text-xs font-bold text-slate-700 truncate">{session.node_name}</span>
+                  {session.is_local && (
+                    <span className="text-[9px] font-bold text-slate-400 uppercase border border-slate-200 rounded px-1 shrink-0">本机</span>
+                  )}
+                  <label
+                    className="ml-auto flex items-center gap-1 text-[10px] font-bold text-slate-400 uppercase tracking-widest cursor-pointer select-none shrink-0"
+                    title="勾选后该终端参与广播输入"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checkedIds.has(session.session_id)}
+                      onChange={() => toggleChecked(session.session_id)}
+                      className="accent-blue-600"
+                    />
+                    广播
+                  </label>
+                  <button
+                    onClick={() => void handleClose(session)}
+                    title="关闭终端"
+                    className="p-1 rounded text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-colors shrink-0"
+                  >
+                    <Plus className="w-3.5 h-3.5 rotate-45" />
+                  </button>
+                </div>
+                <div className="bg-slate-900 p-3 h-[380px]">
+                  <InteractiveTerminal
+                    sessionId={session.session_id}
+                    title={session.node_name}
+                    streamUrl={`/api/terminals/${session.session_id}/stream`}
+                    resizeUrl={`/api/terminals/${session.session_id}/resize`}
+                    inputUrl={`/api/terminals/${session.session_id}/input`}
+                    statusSuffix={session.session_id.slice(0, 6)}
+                    onData={(data) => handleTerminalData(session.session_id, data)}
+                    onReconnect={() => void handleReconnect(session)}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ---------- conda 环境对比 ---------- */}
+      <CondaComparePanel onNotice={showNotice} />
     </div>
   );
 }
