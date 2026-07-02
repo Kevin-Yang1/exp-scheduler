@@ -280,6 +280,36 @@ def test_task_environment_strips_scheduler_virtualenv(tmp_path):
     assert "_OLD_VIRTUAL_PATH" not in env
 
 
+def test_task_environment_strips_scheduler_virtualenv_path_without_virtual_env(tmp_path):
+    config = make_config(tmp_path)
+    database = Database(config.db_path)
+    service = SchedulerService(config=config, database=database, gpu_provider=lambda: [])
+    venv_dir = tmp_path / ".venv"
+    venv_bin = venv_dir / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    task = {
+        "env": {},
+    }
+    original_env = {
+        "PATH": f"{venv_bin}:/home/zjx/miniconda3/bin:/usr/local/bin:/usr/bin",
+    }
+
+    import os
+    import sys
+    from unittest.mock import patch
+
+    with patch.dict("os.environ", original_env, clear=True), patch.object(
+        sys,
+        "executable",
+        str(venv_bin / "python"),
+    ):
+        env = service._build_task_environment(task=task, gpu_id=1, next_attempt=2)
+
+    assert env["PATH"] == "/home/zjx/miniconda3/bin:/usr/local/bin:/usr/bin"
+
+
 def test_running_task_receives_default_terminal_size(tmp_path):
     provider = FakeGPUProvider([gpu(0, idle=True)])
     with build_client(tmp_path, provider) as client:
@@ -399,6 +429,55 @@ def test_two_free_gpus_can_run_two_tasks_in_parallel(tmp_path):
         assert assignments[first_id] in {0, 1}
         assert assignments[second_id] in {0, 1}
         assert assignments[first_id] != assignments[second_id]
+
+
+def test_budgeted_tasks_can_share_scheduler_occupied_gpu(tmp_path):
+    provider = FakeGPUProvider([
+        gpu(0, idle=True, memory_total_mb=49152, memory_used_mb=500),
+    ])
+    with build_client(tmp_path, provider) as client:
+        first_id = create_task(
+            client,
+            command("import time; time.sleep(1.5)"),
+            name="first",
+            requested_gpu=0,
+            gpu_memory_budget_mb=8 * 1024,
+        )
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == first_id
+            ),
+            timeout=4,
+        )
+        provider.set_gpus([
+            gpu(
+                0,
+                idle=False,
+                has_processes=True,
+                memory_total_mb=49152,
+                memory_used_mb=10 * 1024,
+            ),
+        ])
+        second_id = create_task(
+            client,
+            command("print('second-shared')"),
+            name="second",
+            requested_gpu=0,
+            gpu_memory_budget_mb=8 * 1024,
+        )
+
+        second_history = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["history"]
+                if task["id"] == second_id and task["status"] == "succeeded"
+            ),
+            timeout=4,
+        )
+        assert second_history["assigned_gpu"] == 0
 
 
 def test_memory_budget_allows_scheduling_when_default_idle_threshold_would_wait(tmp_path):
@@ -759,6 +838,34 @@ def test_cancel_running_task_transitions_to_cancelled(tmp_path):
         )
         assert history_task["status"] == "cancelled"
         assert client.app.state.scheduler._terminal_sessions == {}
+
+
+def test_interrupt_running_task_moves_to_staged_queue(tmp_path):
+    provider = FakeGPUProvider([gpu(0, idle=True)])
+    with build_client(tmp_path, provider) as client:
+        task_id = create_task(client, command("import time; time.sleep(30)"))
+
+        wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["running"]
+                if task["id"] == task_id
+            ),
+            timeout=3,
+        )
+        response = client.post(f"/api/tasks/{task_id}/interrupt")
+        response.raise_for_status()
+
+        staged_task = wait_for(
+            lambda: next(
+                task
+                for task in client.get("/api/tasks").json()["staged"]
+                if task["id"] == task_id
+            ),
+            timeout=8,
+        )
+        assert staged_task["status"] == "staged"
+        assert staged_task["queue_name"] == "staged"
 
 
 def test_cancel_running_task_sends_sigint_before_escalation(tmp_path):

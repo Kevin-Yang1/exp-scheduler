@@ -18,6 +18,7 @@ STAGED_QUEUE = "staged"
 VALID_QUEUE_NAMES = {NORMAL_QUEUE, URGENT_QUEUE, STAGED_QUEUE}
 SCHEDULER_SETTINGS_META_KEY = "scheduler_settings"
 TRANSFER_SETTINGS_META_KEY = "transfer_settings"
+TERMINAL_LOG_DIR_META_KEY = "terminal_log_dir"
 
 # 主控自身的隐含伪节点 id（不入 nodes 表）
 LOCAL_NODE_ID = "local"
@@ -97,6 +98,7 @@ class Database:
                     "next_retry_at": "TEXT",
                     "requested_gpu": "INTEGER",
                     "gpu_memory_budget_mb": "INTEGER",
+                    "gpu_memory_reservation_mb": "INTEGER",
                     "queue_name": "TEXT",
                 },
             )
@@ -310,6 +312,82 @@ class Database:
                 """
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS terminals (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    node_name TEXT NOT NULL,
+                    is_local INTEGER NOT NULL,
+                    tmux_session TEXT NOT NULL,
+                    log_path TEXT NOT NULL,
+                    remote_log_path TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    exit_code INTEGER,
+                    exit_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL,
+                    closed_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_terminals_status
+                ON terminals(status, created_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backup_jobs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    src_node_id TEXT NOT NULL,
+                    src_path TEXT NOT NULL,
+                    dst_node_id TEXT NOT NULL,
+                    dst_path TEXT NOT NULL,
+                    schedule_type TEXT NOT NULL DEFAULT 'manual',
+                    schedule_hour INTEGER NOT NULL DEFAULT 2,
+                    schedule_minute INTEGER NOT NULL DEFAULT 0,
+                    schedule_day_of_week INTEGER,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    delete_extras INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_run_at TEXT,
+                    next_run_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_backup_jobs_enabled
+                ON backup_jobs(enabled, next_run_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backup_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    bytes_transferred INTEGER,
+                    files_transferred INTEGER,
+                    exit_code INTEGER,
+                    error TEXT,
+                    log_path TEXT,
+                    FOREIGN KEY (job_id) REFERENCES backup_jobs(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_backup_runs_job
+                ON backup_runs(job_id, started_at DESC)
+                """
+            )
+            conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('queue_paused', '0')"
             )
             conn.commit()
@@ -329,6 +407,7 @@ class Database:
         notes: str | None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
+        gpu_memory_reservation_mb: int | None = None,
         queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
@@ -346,8 +425,8 @@ class Database:
                     name, command, cwd, env, status, queue_rank, assigned_gpu, pid,
                     exit_code, created_at, started_at, finished_at, log_path, notes,
                     profile_id, profile_name, shell_setup, attempt_count, next_retry_at,
-                    requested_gpu, gpu_memory_budget_mb, queue_name
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
+                    requested_gpu, gpu_memory_budget_mb, gpu_memory_reservation_mb, queue_name
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -363,6 +442,7 @@ class Database:
                     shell_setup,
                     requested_gpu,
                     gpu_memory_budget_mb,
+                    gpu_memory_reservation_mb,
                     normalized_queue_name,
                 ),
             )
@@ -589,6 +669,425 @@ class Database:
             cursor = conn.execute("DELETE FROM operation_logs")
             conn.commit()
             return cursor.rowcount
+
+    # ---------- terminals ----------
+
+    def create_terminal(
+        self,
+        *,
+        terminal_id: str,
+        name: str,
+        node_id: str,
+        node_name: str,
+        is_local: bool,
+        tmux_session: str,
+        log_path: str,
+        remote_log_path: str | None = None,
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO terminals(
+                    id, name, node_id, node_name, is_local, tmux_session,
+                    log_path, remote_log_path, status, created_at, last_activity_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (
+                    terminal_id,
+                    name,
+                    node_id,
+                    node_name,
+                    1 if is_local else 0,
+                    tmux_session,
+                    log_path,
+                    remote_log_path,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        result = self.get_terminal(terminal_id)
+        if result is None:
+            raise ValueError("终端记录写入失败")
+        return result
+
+    def get_terminal(self, terminal_id: str) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM terminals WHERE id = ?",
+                (terminal_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_terminal(row)
+
+    def list_terminals(self, *, status: str | None = None) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            if status is not None:
+                rows = conn.execute(
+                    "SELECT * FROM terminals WHERE status = ? ORDER BY created_at ASC",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM terminals ORDER BY created_at ASC"
+                ).fetchall()
+        return [self._row_to_terminal(row) for row in rows]
+
+    def rename_terminal(self, terminal_id: str, name: str) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE terminals SET name = ? WHERE id = ?",
+                (name, terminal_id),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                return None
+        return self.get_terminal(terminal_id)
+
+    def touch_terminal(self, terminal_id: str) -> None:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE terminals SET last_activity_at = ? WHERE id = ?",
+                (now, terminal_id),
+            )
+            conn.commit()
+
+    def close_terminal(
+        self,
+        terminal_id: str,
+        *,
+        exit_code: int | None = None,
+        exit_reason: str | None = None,
+    ) -> dict[str, object] | None:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE terminals
+                SET status = 'closed', exit_code = ?, exit_reason = ?, closed_at = ?
+                WHERE id = ?
+                """,
+                (exit_code, exit_reason, now, terminal_id),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                return None
+        return self.get_terminal(terminal_id)
+
+    def get_terminal_log_dir(self) -> str | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (TERMINAL_LOG_DIR_META_KEY,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["value"])
+
+    def set_terminal_log_dir(self, value: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (TERMINAL_LOG_DIR_META_KEY, value),
+            )
+            conn.commit()
+
+    def _row_to_terminal(self, row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "node_id": row["node_id"],
+            "node_name": row["node_name"],
+            "is_local": bool(row["is_local"]),
+            "tmux_session": row["tmux_session"],
+            "log_path": row["log_path"],
+            "remote_log_path": row["remote_log_path"],
+            "status": row["status"],
+            "exit_code": row["exit_code"],
+            "exit_reason": row["exit_reason"],
+            "created_at": row["created_at"],
+            "last_activity_at": row["last_activity_at"],
+            "closed_at": row["closed_at"],
+        }
+
+    # ---------- backup jobs ----------
+
+    def create_backup_job(
+        self,
+        *,
+        job_id: str,
+        name: str,
+        src_node_id: str,
+        src_path: str,
+        dst_node_id: str,
+        dst_path: str,
+        schedule_type: str = "manual",
+        schedule_hour: int = 2,
+        schedule_minute: int = 0,
+        schedule_day_of_week: int | None = None,
+        enabled: bool = True,
+        delete_extras: bool = False,
+        next_run_at: str | None = None,
+    ) -> dict[str, object]:
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO backup_jobs(
+                    id, name, src_node_id, src_path, dst_node_id, dst_path,
+                    schedule_type, schedule_hour, schedule_minute, schedule_day_of_week,
+                    enabled, delete_extras, created_at, last_run_at, next_run_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    job_id, name, src_node_id, src_path, dst_node_id, dst_path,
+                    schedule_type, schedule_hour, schedule_minute, schedule_day_of_week,
+                    1 if enabled else 0, 1 if delete_extras else 0,
+                    now, next_run_at,
+                ),
+            )
+            conn.commit()
+        result = self.get_backup_job(job_id)
+        if result is None:
+            raise ValueError("备份任务写入失败")
+        return result
+
+    def get_backup_job(self, job_id: str) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM backup_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_backup_job(row)
+
+    def list_backup_jobs(self, *, enabled: bool | None = None) -> list[dict[str, object]]:
+        with self._lock, self._connect() as conn:
+            if enabled is not None:
+                rows = conn.execute(
+                    "SELECT * FROM backup_jobs WHERE enabled = ? ORDER BY created_at ASC",
+                    (1 if enabled else 0,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM backup_jobs ORDER BY created_at ASC"
+                ).fetchall()
+        return [self._row_to_backup_job(row) for row in rows]
+
+    def list_enabled_backup_jobs(self) -> list[dict[str, object]]:
+        return self.list_backup_jobs(enabled=True)
+
+    def update_backup_job(
+        self,
+        job_id: str,
+        *,
+        name: str | None = None,
+        enabled: bool | None = None,
+        schedule_type: str | None = None,
+        schedule_hour: int | None = None,
+        schedule_minute: int | None = None,
+        schedule_day_of_week: int | None = None,
+        delete_extras: bool | None = None,
+        last_run_at: str | None = None,
+        next_run_at: str | None = None,
+    ) -> dict[str, object] | None:
+        sets: list[str] = []
+        params: list[object] = []
+        if name is not None:
+            sets.append("name = ?")
+            params.append(name)
+        if enabled is not None:
+            sets.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        if schedule_type is not None:
+            sets.append("schedule_type = ?")
+            params.append(schedule_type)
+        if schedule_hour is not None:
+            sets.append("schedule_hour = ?")
+            params.append(schedule_hour)
+        if schedule_minute is not None:
+            sets.append("schedule_minute = ?")
+            params.append(schedule_minute)
+        if schedule_day_of_week is not None:
+            sets.append("schedule_day_of_week = ?")
+            params.append(schedule_day_of_week)
+        if delete_extras is not None:
+            sets.append("delete_extras = ?")
+            params.append(1 if delete_extras else 0)
+        if last_run_at is not None:
+            sets.append("last_run_at = ?")
+            params.append(last_run_at)
+        if next_run_at is not None:
+            sets.append("next_run_at = ?")
+            params.append(next_run_at)
+        if not sets:
+            return self.get_backup_job(job_id)
+        params.append(job_id)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE backup_jobs SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                return None
+        return self.get_backup_job(job_id)
+
+    def delete_backup_job(self, job_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM backup_runs WHERE job_id = ?", (job_id,))
+            cursor = conn.execute("DELETE FROM backup_jobs WHERE id = ?", (job_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ---------- backup runs ----------
+
+    def create_backup_run(
+        self,
+        *,
+        job_id: str,
+        started_at: str,
+        log_path: str | None = None,
+    ) -> dict[str, object]:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO backup_runs(job_id, status, started_at, log_path)
+                VALUES (?, 'running', ?, ?)
+                """,
+                (job_id, started_at, log_path),
+            )
+            conn.commit()
+            run_id = int(cursor.lastrowid)
+        row = self._get_backup_run(conn=None, run_id=run_id)
+        if row is None:
+            raise ValueError("备份运行记录写入失败")
+        return row
+
+    def _get_backup_run(self, *, conn: sqlite3.Connection | None, run_id: int) -> dict[str, object] | None:
+        ctx = conn if conn is not None else self._connect()
+        try:
+            row = ctx.execute(
+                "SELECT * FROM backup_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        finally:
+            if conn is None:
+                ctx.close()
+        if row is None:
+            return None
+        return self._row_to_backup_run(row)
+
+    def get_backup_run(self, run_id: int) -> dict[str, object] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM backup_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_backup_run(row)
+
+    def list_backup_runs(
+        self,
+        *,
+        job_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, object]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        with self._lock, self._connect() as conn:
+            if job_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM backup_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT ?",
+                    (job_id, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM backup_runs ORDER BY started_at DESC LIMIT ?",
+                    (safe_limit,),
+                ).fetchall()
+        return [self._row_to_backup_run(row) for row in rows]
+
+    def update_backup_run(
+        self,
+        run_id: int,
+        *,
+        status: str | None = None,
+        finished_at: str | None = None,
+        bytes_transferred: int | None = None,
+        files_transferred: int | None = None,
+        exit_code: int | None = None,
+        error: str | None = None,
+    ) -> dict[str, object] | None:
+        sets: list[str] = []
+        params: list[object] = []
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if finished_at is not None:
+            sets.append("finished_at = ?")
+            params.append(finished_at)
+        if bytes_transferred is not None:
+            sets.append("bytes_transferred = ?")
+            params.append(bytes_transferred)
+        if files_transferred is not None:
+            sets.append("files_transferred = ?")
+            params.append(files_transferred)
+        if exit_code is not None:
+            sets.append("exit_code = ?")
+            params.append(exit_code)
+        if error is not None:
+            sets.append("error = ?")
+            params.append(error)
+        if not sets:
+            return self.get_backup_run(run_id)
+        params.append(run_id)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE backup_runs SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                return None
+        return self.get_backup_run(run_id)
+
+    def _row_to_backup_job(self, row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "src_node_id": row["src_node_id"],
+            "src_path": row["src_path"],
+            "dst_node_id": row["dst_node_id"],
+            "dst_path": row["dst_path"],
+            "schedule_type": row["schedule_type"],
+            "schedule_hour": row["schedule_hour"],
+            "schedule_minute": row["schedule_minute"],
+            "schedule_day_of_week": row["schedule_day_of_week"],
+            "enabled": bool(row["enabled"]),
+            "delete_extras": bool(row["delete_extras"]),
+            "created_at": row["created_at"],
+            "last_run_at": row["last_run_at"],
+            "next_run_at": row["next_run_at"],
+        }
+
+    def _row_to_backup_run(self, row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "id": row["id"],
+            "job_id": row["job_id"],
+            "status": row["status"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "bytes_transferred": row["bytes_transferred"],
+            "files_transferred": row["files_transferred"],
+            "exit_code": row["exit_code"],
+            "error": row["error"],
+            "log_path": row["log_path"],
+        }
 
     def get_task(self, task_id: int) -> dict[str, object] | None:
         with self._lock, self._connect() as conn:
@@ -828,6 +1327,7 @@ class Database:
         notes: str | None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
+        gpu_memory_reservation_mb: int | None = None,
         queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
@@ -868,6 +1368,7 @@ class Database:
                     notes = ?,
                     requested_gpu = ?,
                     gpu_memory_budget_mb = ?,
+                    gpu_memory_reservation_mb = ?,
                     queue_name = ?,
                     queue_rank = ?,
                     profile_id = ?,
@@ -887,6 +1388,7 @@ class Database:
                     notes,
                     requested_gpu,
                     gpu_memory_budget_mb,
+                    gpu_memory_reservation_mb,
                     normalized_queue_name,
                     queue_rank,
                     profile_id,
@@ -2107,6 +2609,7 @@ class Database:
         task_id: int,
         *,
         exit_code: int | None,
+        queue_name: str | None = None,
     ) -> dict[str, object]:
         finished_at = utc_now_iso()
         with self._lock, self._connect() as conn:
@@ -2118,22 +2621,28 @@ class Database:
                 """,
                 (task_id,),
             ).fetchone()
-            queue_name = self._queue_name_for_task(conn, task_id)
-            queue_rank = self._head_queue_rank(conn, queue_name)
+            normalized_queue_name = (
+                self._normalize_queue_name(queue_name)
+                if queue_name is not None
+                else self._queue_name_for_task(conn, task_id)
+            )
+            task_status = self._status_for_queue(normalized_queue_name)
+            queue_rank = self._head_queue_rank(conn, normalized_queue_name)
             cursor = conn.execute(
                 """
                 UPDATE tasks
-                SET status = 'queued',
+                SET status = ?,
                     queue_rank = ?,
                     assigned_gpu = NULL,
                     pid = NULL,
                     exit_code = ?,
                     started_at = NULL,
                     finished_at = NULL,
-                    next_retry_at = NULL
+                    next_retry_at = NULL,
+                    queue_name = ?
                 WHERE id = ? AND status = 'running'
                 """,
-                (queue_rank, exit_code, task_id),
+                (task_status, queue_rank, exit_code, normalized_queue_name, task_id),
             )
             if row is not None:
                 self._upsert_task_attempt(
@@ -2230,6 +2739,9 @@ class Database:
             else None,
             gpu_memory_budget_mb=task["gpu_memory_budget_mb"]
             if isinstance(task.get("gpu_memory_budget_mb"), int)
+            else None,
+            gpu_memory_reservation_mb=task["gpu_memory_reservation_mb"]
+            if isinstance(task.get("gpu_memory_reservation_mb"), int)
             else None,
             queue_name=str(task.get("queue_name") or NORMAL_QUEUE),
             profile_id=task["profile_id"] if isinstance(task["profile_id"], int) else None,
@@ -2371,6 +2883,11 @@ class Database:
             "gpu_memory_budget_mb": (
                 row["gpu_memory_budget_mb"]
                 if "gpu_memory_budget_mb" in keys and row["gpu_memory_budget_mb"] is not None
+                else None
+            ),
+            "gpu_memory_reservation_mb": (
+                row["gpu_memory_reservation_mb"]
+                if "gpu_memory_reservation_mb" in keys and row["gpu_memory_reservation_mb"] is not None
                 else None
             ),
             "queue_name": (

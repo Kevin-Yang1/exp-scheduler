@@ -38,7 +38,13 @@ import {
 	  Network,
 	  HardDrive,
 	  ChevronDown,
-	  SquareTerminal
+	  SquareTerminal,
+	  Code2,
+	  Bot,
+	  FolderOpen,
+	  Folder,
+	  PlayCircle,
+	  Pencil
 	} from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import React, { useCallback, useEffect, useMemo, useRef, useState, ReactNode, FormEvent } from 'react';
@@ -91,6 +97,7 @@ interface Task {
   env?: Record<string, string>;
   requestedGpu?: number | null;
   gpuMemoryBudgetMb?: number | null;
+  gpuMemoryReservationMb?: number | null;
   profileId?: number | null;
   queueName?: QueueName;
   dependsOn?: number[];
@@ -115,6 +122,7 @@ interface BackendTask {
   assigned_gpu?: number | null;
   requested_gpu?: number | null;
   gpu_memory_budget_mb?: number | null;
+  gpu_memory_reservation_mb?: number | null;
   profile_id?: number | null;
   profile_name?: string | null;
   started_at?: string | null;
@@ -399,6 +407,7 @@ function mapTask(task: BackendTask): Task {
     env: task.env || {},
     requestedGpu: task.requested_gpu ?? null,
     gpuMemoryBudgetMb: task.gpu_memory_budget_mb ?? null,
+    gpuMemoryReservationMb: task.gpu_memory_reservation_mb ?? null,
     profileId: task.profile_id ?? null,
     queueName,
     dependsOn: task.depends_on || [],
@@ -443,7 +452,7 @@ function haveSameGpuIds(left: number[], right: number[]) {
     normalizedLeft.every((id, index) => id === normalizedRight[index]);
 }
 
-type AppTab = 'dashboard' | 'queue' | 'history' | 'activity' | 'nvitop' | 'sync' | 'terminals' | 'settings';
+type AppTab = 'dashboard' | 'queue' | 'history' | 'activity' | 'nvitop' | 'sync' | 'terminals' | 'conda' | 'backup' | 'settings';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('dashboard');
@@ -530,8 +539,8 @@ export default function App() {
 
   const runningTasks = useMemo(() => tasks.filter(t => t.status === 'running'), [tasks]);
   const historyTasks = useMemo(() => tasks.filter(t => !['running', 'pending', 'staged'].includes(t.status)), [tasks]);
-  const urgentQueueTasks = useMemo(() => tasks.filter(t => t.isUrgent && (t.status === 'pending' || t.status === 'running')), [tasks]);
-  const standardQueueTasks = useMemo(() => tasks.filter(t => !t.isUrgent && (t.status === 'pending' || t.status === 'running')), [tasks]);
+  const urgentQueueTasks = useMemo(() => tasks.filter(t => t.isUrgent && t.status === 'pending'), [tasks]);
+  const standardQueueTasks = useMemo(() => tasks.filter(t => !t.isUrgent && t.status === 'pending'), [tasks]);
   const stagedQueueTasks = useMemo(() => tasks.filter(t => t.status === 'staged'), [tasks]);
   const selectedTask = useMemo(() => tasks.find(t => t.id === selectedTaskId) || null, [tasks, selectedTaskId]);
   const enabledGpuSet = useMemo(() => new Set(enabledGpus), [enabledGpus]);
@@ -988,6 +997,7 @@ export default function App() {
         queue_name,
         requested_gpu: formData.get('requested_gpu') ? Number(formData.get('requested_gpu')) : null,
         gpu_memory_budget_mb: formData.get('gpu_memory_budget_gb') ? Math.round(Number(formData.get('gpu_memory_budget_gb')) * 1024) : null,
+        gpu_memory_reservation_mb: formData.get('gpu_memory_reservation_gb') ? Math.round(Number(formData.get('gpu_memory_reservation_gb')) * 1024) : null,
         profile_id: formData.get('profile_id') ? Number(formData.get('profile_id')) : null,
         depends_on,
       };
@@ -1018,6 +1028,19 @@ export default function App() {
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '任务取消失败');
+    }
+  };
+
+  const interruptTaskToStaged = async (task: Task) => {
+    if (!window.confirm(`确认中断任务 #${task.id} 吗？\n\n当前任务会被停止并移入暂存队列，不会继续自动调度。`)) {
+      return;
+    }
+    try {
+      await api(`/api/tasks/${task.id}/interrupt`, { method: 'POST' });
+      setMessage(`任务 #${task.id} 正在中断，完成后会移入暂存队列。`);
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '任务中断失败');
     }
   };
 
@@ -1322,6 +1345,18 @@ export default function App() {
             label="多终端"
           />
           <NavItem
+            active={activeTab === 'conda'}
+            onClick={() => setActiveTab('conda')}
+            icon={<HardDrive className="w-5 h-5" />}
+            label="Conda环境"
+          />
+          <NavItem
+            active={activeTab === 'backup'}
+            onClick={() => setActiveTab('backup')}
+            icon={<Archive className="w-5 h-5" />}
+            label="定时备份"
+          />
+          <NavItem
             active={activeTab === 'settings'}
             onClick={() => setActiveTab('settings')}
             icon={<Settings className="w-5 h-5" />}
@@ -1390,6 +1425,8 @@ export default function App() {
 	              {activeTab === 'nvitop' && <Terminal className="w-4 h-4" />}
 	              {activeTab === 'sync' && <ArrowLeftRight className="w-4 h-4" />}
 	              {activeTab === 'terminals' && <SquareTerminal className="w-4 h-4" />}
+	              {activeTab === 'conda' && <HardDrive className="w-4 h-4" />}
+	              {activeTab === 'backup' && <Archive className="w-4 h-4" />}
 	              {activeTab === 'settings' && <Settings className="w-4 h-4" />}
             </div>
             <h2 className="text-lg font-bold text-slate-900 tracking-tight">
@@ -1400,6 +1437,8 @@ export default function App() {
 	              {activeTab === 'nvitop' && 'GPU 监控'}
 	              {activeTab === 'sync' && '文件同步'}
 	              {activeTab === 'terminals' && '多终端'}
+	              {activeTab === 'conda' && 'Conda 环境对比'}
+	              {activeTab === 'backup' && '定时备份'}
 	              {activeTab === 'settings' && '资源与环境'}
             </h2>
           </div>
@@ -1523,6 +1562,7 @@ export default function App() {
                               setSelectedTaskId(task.id);
                             }}
                             onCancel={() => cancelTask(task.id)}
+                            onInterrupt={() => interruptTaskToStaged(task)}
                             onPreempt={() => preemptTask(task)}
                             canPreempt={hasWaitingUrgentTask}
                             onDuplicate={() => duplicateTask(task)}
@@ -1902,13 +1942,13 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Execution Queue */}
+                {/* Waiting Queue */}
                 <div className="space-y-4 bg-slate-50/50 p-5 rounded-2xl border border-slate-200">
                   <div className="flex items-center justify-between px-1">
                     <div className="flex items-center gap-2">
-                       <h3 className="text-sm font-bold text-slate-800">执行队列 (Standard)</h3>
+                       <h3 className="text-sm font-bold text-slate-800">等待队列 (Waiting)</h3>
                     </div>
-                    <span className="text-[10px] font-bold text-slate-400 bg-slate-50 px-2 py-0.5 rounded border border-slate-100 uppercase">普通任务</span>
+                    <span className="text-[10px] font-bold text-slate-400 bg-slate-50 px-2 py-0.5 rounded border border-slate-100 uppercase">等待执行</span>
                   </div>
                   <div className="min-h-[120px] flex flex-col">
                     {standardQueueTasks.length > 0 ? (
@@ -2478,6 +2518,30 @@ export default function App() {
                 <MultiTerminalPage />
               </motion.div>
             )}
+
+            {activeTab === 'conda' && (
+              <motion.div
+                key="conda"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-6"
+              >
+                <CondaPage />
+              </motion.div>
+            )}
+
+            {activeTab === 'backup' && (
+              <motion.div
+                key="backup"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="space-y-6"
+              >
+                <BackupPage />
+              </motion.div>
+            )}
           </AnimatePresence>
         </div>
       </main>
@@ -2601,6 +2665,19 @@ export default function App() {
                           name="gpu_memory_budget_gb"
                           defaultValue={taskDraft?.gpuMemoryBudgetMb ? taskDraft.gpuMemoryBudgetMb / 1024 : ''}
                           placeholder="不填写则使用默认空闲阈值"
+                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">显存预留 (GB)</label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="any"
+                          name="gpu_memory_reservation_gb"
+                          defaultValue={taskDraft?.gpuMemoryReservationMb ? taskDraft.gpuMemoryReservationMb / 1024 : ''}
+                          placeholder="可选，启动前临时占用"
                           className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
                         />
                       </div>
@@ -2879,7 +2956,7 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
   );
 }
 
-  const TaskCardInner = ({ task, isSelected, onSelect, onCancel, onPreempt, canPreempt, onDuplicate, onEdit, isMarked, toggleMark }: { task: Task; isSelected?: boolean; onSelect?: () => void; onCancel?: () => void; onPreempt?: () => void; canPreempt?: boolean; onDuplicate?: () => void; onEdit?: () => void; isMarked?: boolean; toggleMark?: (e: React.MouseEvent) => void; key?: React.Key }) => {
+  const TaskCardInner = ({ task, isSelected, onSelect, onCancel, onInterrupt, onPreempt, canPreempt, onDuplicate, onEdit, isMarked, toggleMark }: { task: Task; isSelected?: boolean; onSelect?: () => void; onCancel?: () => void; onInterrupt?: () => void; onPreempt?: () => void; canPreempt?: boolean; onDuplicate?: () => void; onEdit?: () => void; isMarked?: boolean; toggleMark?: (e: React.MouseEvent) => void; key?: React.Key }) => {
   const canEdit = Boolean(onEdit);
   const editTitle = task.status === 'pending' || task.status === 'staged' ? '编辑任务' : '编辑记录信息';
 
@@ -2912,6 +2989,12 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
                 <>
                   <span>•</span>
                   <span>{(task.gpuMemoryBudgetMb / 1024).toFixed(1)}G</span>
+                </>
+              )}
+              {task.gpuMemoryReservationMb && (
+                <>
+                  <span>•</span>
+                  <span>预留 {(task.gpuMemoryReservationMb / 1024).toFixed(1)}G</span>
                 </>
               )}
               {task.workingDir && (
@@ -2973,6 +3056,16 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
                 <AlertCircle className="w-3.5 h-3.5" />
               </button>
               <button
+                title="中断到暂存队列"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onInterrupt?.();
+                }}
+                className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-all active:scale-90"
+              >
+                <Pause className="w-3.5 h-3.5" />
+              </button>
+              <button
                 title={isMarked ? "取消标记" : "标记任务"}
                 onClick={toggleMark}
                 className={`p-1.5 rounded-lg transition-all active:scale-90 ${
@@ -2984,7 +3077,7 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
                 <Bookmark className={`w-3.5 h-3.5 ${isMarked ? 'fill-current' : ''}`} />
               </button>
               <button
-                title="中断/取消任务"
+                title="取消任务"
                 onClick={(e) => {
                     e.stopPropagation();
                     onCancel?.();
@@ -3288,6 +3381,12 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
                <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm whitespace-nowrap">
                  <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px]">预算</span>
                  <span className="font-medium text-slate-700">{(task.gpuMemoryBudgetMb / 1024).toFixed(1)}G</span>
+               </div>
+             )}
+             {task.gpuMemoryReservationMb && (
+               <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm whitespace-nowrap">
+                 <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px]">预留</span>
+                 <span className="font-medium text-slate-700">{(task.gpuMemoryReservationMb / 1024).toFixed(1)}G</span>
                </div>
              )}
              <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm w-full max-w-[150px] sm:max-w-xs xl:max-w-md flex-1">
@@ -5125,6 +5224,7 @@ function NewTransferModal({ nodes, nodeNames, initialDraft, onClose, onCreated }
   const [probing, setProbing] = useState(false);
   const [planError, setPlanError] = useState('');
   const [submitError, setSubmitError] = useState('');
+  const [browsing, setBrowsing] = useState<'src' | 'dst' | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const update = (patch: Partial<TransferFormDraft>) => setDraft(prev => ({ ...prev, ...patch }));
@@ -5308,27 +5408,45 @@ function NewTransferModal({ nodes, nodeNames, initialDraft, onClose, onCreated }
             </div>
             <div className="space-y-1.5">
               <label className={labelClass}>源路径</label>
-              <input
-                type="text"
-                value={draft.src_path}
-                onChange={(event) => update({ src_path: event.target.value })}
-                placeholder="/data/checkpoints/llama"
-                required
-                className={`${inputClass} font-mono`}
-                spellCheck={false}
-              />
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={draft.src_path}
+                  onChange={(event) => update({ src_path: event.target.value })}
+                  placeholder="/data/checkpoints/llama"
+                  required
+                  className={`${inputClass} font-mono flex-1`}
+                  spellCheck={false}
+                />
+                <button
+                  type="button"
+                  onClick={() => setBrowsing('src')}
+                  className="px-3 py-2 rounded-lg text-xs font-bold text-blue-600 border border-blue-200 hover:bg-blue-50 transition-colors shrink-0"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
             <div className="space-y-1.5">
               <label className={labelClass}>目标路径</label>
-              <input
-                type="text"
-                value={draft.dst_path}
-                onChange={(event) => update({ dst_path: event.target.value })}
-                placeholder="/data/checkpoints/"
-                required
-                className={`${inputClass} font-mono`}
-                spellCheck={false}
-              />
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={draft.dst_path}
+                  onChange={(event) => update({ dst_path: event.target.value })}
+                  placeholder="/data/checkpoints/"
+                  required
+                  className={`${inputClass} font-mono flex-1`}
+                  spellCheck={false}
+                />
+                <button
+                  type="button"
+                  onClick={() => setBrowsing('dst')}
+                  className="px-3 py-2 rounded-lg text-xs font-bold text-blue-600 border border-blue-200 hover:bg-blue-50 transition-colors shrink-0"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
           </div>
 
@@ -5604,6 +5722,17 @@ function NewTransferModal({ nodes, nodeNames, initialDraft, onClose, onCreated }
           </div>
         </form>
       </motion.div>
+      {browsing && (
+        <DirectoryBrowser
+          nodeId={browsing === 'src' ? draft.src_node_id : draft.dst_node_id}
+          onSelect={(path) => {
+            if (browsing === 'src') update({ src_path: path });
+            else update({ dst_path: path });
+            setBrowsing(null);
+          }}
+          onClose={() => setBrowsing(null)}
+        />
+      )}
     </div>
   );
 }
@@ -6119,6 +6248,7 @@ function LinkMatrix({ nodes, links, probing, onProbe }: {
 
 interface TerminalSessionInfo {
   session_id: string;
+  name: string;
   node_id: string;
   node_name: string;
   is_local?: boolean;
@@ -6126,9 +6256,26 @@ interface TerminalSessionInfo {
   created_at?: string | null;
   last_activity_at?: string | null;
   exit_code?: number | null;
+  exit_reason?: string | null;
   subscriber_count?: number;
   cols?: number;
   rows?: number;
+}
+
+interface ArchivedTerminalInfo {
+  id: string;
+  name: string;
+  node_id: string;
+  node_name: string;
+  is_local: boolean;
+  tmux_session: string;
+  log_path: string;
+  status: string;
+  exit_code: number | null;
+  exit_reason: string | null;
+  created_at: string;
+  last_activity_at: string;
+  closed_at: string | null;
 }
 
 type InteractiveTerminalStreamPayload = {
@@ -6138,6 +6285,26 @@ type InteractiveTerminalStreamPayload = {
   exit_code?: number | null;
   reason?: string;
 };
+
+type AiTerminalKind = 'codex' | 'opencode';
+
+const AI_TERMINAL_WORKDIR = '/home/zjx/GPU/exp-scheduler';
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function isAiTerminalName(name: string) {
+  return /^(Codex|OpenCode) AI\b/.test(name);
+}
+
+function buildAiTerminalCommand(kind: AiTerminalKind) {
+  const cwd = shellQuote(AI_TERMINAL_WORKDIR);
+  if (kind === 'codex') {
+    return `codex --no-alt-screen -C ${cwd}\n`;
+  }
+  return `opencode ${cwd}\n`;
+}
 
 interface CondaNodeInventory {
   node_id: string;
@@ -6202,6 +6369,9 @@ function InteractiveTerminal({
   statusSuffix,
   onData,
   onReconnect,
+  onRename,
+  onClose,
+  onViewLog,
 }: {
   sessionId: string;
   title: string;
@@ -6211,16 +6381,23 @@ function InteractiveTerminal({
   statusSuffix: string;
   onData?: (data: string) => void;
   onReconnect?: () => void;
+  onRename?: () => void;
+  onClose?: () => void;
+  onViewLog?: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<XTerm | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const resizeTimerRef = useRef<number | null>(null);
+  const streamResyncTimerRef = useRef<number | null>(null);
   const lastSizeKeyRef = useRef('');
   const autoFollowRef = useRef(true);
   const onDataRef = useRef(onData);
+  const hasOpenedStreamRef = useRef(false);
+  const [streamRevision, setStreamRevision] = useState(0);
   const [connectionStatus, setConnectionStatus] = useState('连接中');
   const [exitInfo, setExitInfo] = useState<InteractiveTerminalStreamPayload | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     onDataRef.current = onData;
@@ -6232,6 +6409,7 @@ function InteractiveTerminal({
     const cols = Math.max(2, terminal.cols || 0);
     const rows = Math.max(1, terminal.rows || 0);
     if (!cols || !rows) return;
+    const previousSizeKey = lastSizeKeyRef.current;
     const sizeKey = `${sessionId}:${cols}x${rows}`;
     if (lastSizeKeyRef.current === sizeKey) return;
     try {
@@ -6240,6 +6418,15 @@ function InteractiveTerminal({
         body: JSON.stringify({ cols, rows }),
       });
       lastSizeKeyRef.current = sizeKey;
+      if (hasOpenedStreamRef.current && previousSizeKey && previousSizeKey !== sizeKey) {
+        if (streamResyncTimerRef.current !== null) {
+          window.clearTimeout(streamResyncTimerRef.current);
+        }
+        streamResyncTimerRef.current = window.setTimeout(() => {
+          streamResyncTimerRef.current = null;
+          setStreamRevision(value => value + 1);
+        }, 180);
+      }
     } catch {
       // resize 尽力而为，失败不影响数据流
     }
@@ -6351,12 +6538,17 @@ function InteractiveTerminal({
         window.clearTimeout(resizeTimerRef.current);
         resizeTimerRef.current = null;
       }
+      if (streamResyncTimerRef.current !== null) {
+        window.clearTimeout(streamResyncTimerRef.current);
+        streamResyncTimerRef.current = null;
+      }
       resizeObserver.disconnect();
       dataListener.dispose();
       terminal.dispose();
       terminalRef.current = null;
       fitAddonRef.current = null;
       lastSizeKeyRef.current = '';
+      hasOpenedStreamRef.current = false;
     };
   }, [fitAndResize, inputUrl]);
 
@@ -6370,11 +6562,25 @@ function InteractiveTerminal({
     terminal.writeln(`[exp-scheduler] connecting interactive terminal ${sessionId}`);
 
     const source = new EventSource(streamUrlWithCurrentSize());
+    hasOpenedStreamRef.current = true;
+    let snapshotBuffer = '';
 
-    source.addEventListener('snapshot', (event) => {
+    source.addEventListener('snapshot_start', () => {
+      snapshotBuffer = '';
+      setConnectionStatus('加载历史...');
+    });
+
+    source.addEventListener('snapshot_chunk', (event) => {
       const payload = JSON.parse(event.data) as InteractiveTerminalStreamPayload;
+      if (payload.data) {
+        snapshotBuffer += payload.data;
+      }
+    });
+
+    source.addEventListener('snapshot_done', () => {
       setConnectionStatus('交互终端');
-      writePayload(payload.data, { reset: true });
+      writePayload(snapshotBuffer, { reset: true });
+      snapshotBuffer = '';
       window.requestAnimationFrame(fitAndResize);
     });
 
@@ -6402,10 +6608,59 @@ function InteractiveTerminal({
     return () => {
       source.close();
     };
-  }, [fitAndResize, sessionId, streamUrlWithCurrentSize, writePayload]);
+  }, [fitAndResize, sessionId, streamRevision, streamUrlWithCurrentSize, writePayload]);
+
+  const handleCopy = useCallback(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    const selection = terminal.getSelection();
+    if (selection) {
+      navigator.clipboard.writeText(selection).catch(() => {});
+    }
+    setContextMenu(null);
+  }, []);
+
+  const handlePaste = useCallback(async () => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        const handler = onDataRef.current;
+        if (handler) {
+          handler(text);
+        } else {
+          void api(inputUrl, {
+            method: 'POST',
+            body: JSON.stringify({ data: encodeBase64Utf8(text) }),
+          }).catch(() => {});
+        }
+      }
+    } catch {
+      // clipboard 读取可能被浏览器拒绝
+    }
+    setContextMenu(null);
+  }, [inputUrl]);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY });
+  }, []);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [contextMenu]);
 
   return (
-    <div className="relative h-full w-full">
+    <div className="relative h-full w-full" onContextMenu={handleContextMenu}>
       <div className="absolute right-0 top-0 z-10 rounded-bl-lg bg-slate-800/90 px-2 py-1 text-[10px] font-bold text-slate-300">
         {connectionStatus} / {statusSuffix}
       </div>
@@ -6414,6 +6669,35 @@ function InteractiveTerminal({
         <span className="truncate">{title}</span>
       </div>
       <div ref={hostRef} className="xterm-host h-[calc(100%-1.5rem)] w-full" />
+      {contextMenu && (
+        <div
+          className="fixed z-50 bg-slate-800 border border-slate-600 rounded-lg shadow-xl py-1 text-xs text-slate-200 min-w-[120px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button onClick={handleCopy} className="w-full text-left px-3 py-1.5 hover:bg-slate-700 transition-colors">
+            复制选区
+          </button>
+          <button onClick={handlePaste} className="w-full text-left px-3 py-1.5 hover:bg-slate-700 transition-colors">
+            粘贴
+          </button>
+          {onRename && (
+            <button onClick={() => { onRename(); setContextMenu(null); }} className="w-full text-left px-3 py-1.5 hover:bg-slate-700 transition-colors">
+              重命名
+            </button>
+          )}
+          {onViewLog && (
+            <button onClick={() => { onViewLog(); setContextMenu(null); }} className="w-full text-left px-3 py-1.5 hover:bg-slate-700 transition-colors">
+              查看完整日志
+            </button>
+          )}
+          {onClose && (
+            <button onClick={() => { onClose(); setContextMenu(null); }} className="w-full text-left px-3 py-1.5 text-rose-400 hover:bg-rose-950/50 transition-colors">
+              关闭终端
+            </button>
+          )}
+        </div>
+      )}
       {exitInfo && (
         <div className="absolute inset-0 z-20 flex items-center justify-center rounded bg-slate-900/85 backdrop-blur-sm">
           <div className="flex flex-col items-center gap-3 px-4 text-center">
@@ -6455,6 +6739,32 @@ function condaStatusBadgeStyle(status: CondaNodeInventory['status']) {
     case 'timeout': return 'bg-amber-50 text-amber-700 border-amber-100';
     default: return 'bg-rose-50 text-rose-700 border-rose-100';
   }
+}
+
+function CondaPage() {
+  const [notice, setNotice] = useState<{ text: string; kind: 'info' | 'success' | 'error' } | null>(null);
+  return (
+    <div className="space-y-6">
+      {notice && (
+        <div className={`border rounded-xl px-4 py-3 text-xs font-medium shadow-sm flex items-start gap-2 ${
+          notice.kind === 'error'
+            ? 'bg-rose-50 border-rose-200 text-rose-700'
+            : notice.kind === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+              : 'bg-blue-50 border-blue-200 text-blue-700'
+        }`}>
+          {notice.kind === 'error'
+            ? <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            : <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />}
+          <span className="flex-1 whitespace-pre-wrap break-all">{notice.text}</span>
+          <button onClick={() => setNotice(null)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity">
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+      )}
+      <CondaComparePanel onNotice={(text, kind) => setNotice({ text, kind: kind || 'info' })} />
+    </div>
+  );
 }
 
 function CondaComparePanel({ onNotice }: { onNotice: (text: string, kind?: 'info' | 'success' | 'error') => void }) {
@@ -6622,11 +6932,19 @@ function MultiTerminalPage() {
   const [selectedNodeId, setSelectedNodeId] = useState('local');
   const [creating, setCreating] = useState(false);
   const [notice, setNotice] = useState<{ text: string; kind: 'info' | 'success' | 'error' } | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState('');
+  const [archivedTerminals, setArchivedTerminals] = useState<ArchivedTerminalInfo[]>([]);
+  const [viewingLog, setViewingLog] = useState<{ sessionId: string; name: string; isArchived?: boolean } | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [minimizedIds, setMinimizedIds] = useState<Set<string>>(new Set());
+  const [aiSessionIds, setAiSessionIds] = useState<Set<string>>(new Set());
 
   // 广播路由从 ref 读取，保证 onData 回调引用稳定（不随开关切换重建终端）
   const broadcastOnRef = useRef(false);
   const checkedIdsRef = useRef<Set<string>>(new Set());
   const disconnectedIdsRef = useRef<Set<string>>(new Set());
+  const aiSessionIdsRef = useRef<Set<string>>(new Set());
   const inputQueuesRef = useRef(new Map<string, { pending: string; inflight: boolean }>());
   const inputErrorToastRef = useRef(false);
 
@@ -6641,6 +6959,24 @@ function MultiTerminalPage() {
   useEffect(() => {
     disconnectedIdsRef.current = disconnectedIds;
   }, [disconnectedIds]);
+
+  useEffect(() => {
+    const inferred = new Set(aiSessionIds);
+    sessions.forEach(session => {
+      if (isAiTerminalName(session.name)) {
+        inferred.add(session.session_id);
+      }
+    });
+    aiSessionIdsRef.current = inferred;
+  }, [aiSessionIds, sessions]);
+
+  useEffect(() => {
+    const visibleSessions = sessions.filter(session => !minimizedIds.has(session.session_id));
+    const activeVisible = Boolean(activeSessionId && visibleSessions.some(session => session.session_id === activeSessionId));
+    if (!activeVisible) {
+      setActiveSessionId(visibleSessions[0]?.session_id || null);
+    }
+  }, [activeSessionId, minimizedIds, sessions]);
 
   const showNotice = useCallback((text: string, kind: 'info' | 'success' | 'error' = 'info') => {
     setNotice({ text, kind });
@@ -6672,8 +7008,27 @@ function MultiTerminalPage() {
     });
   }, []);
 
+  const loadArchived = useCallback(async () => {
+    try {
+      const payload = await api<{ archives: ArchivedTerminalInfo[] }>('/api/terminals/logs');
+      const archives = payload.archives || [];
+      setArchivedTerminals(archives);
+      return archives;
+    } catch {
+      // 忽略
+      return [];
+    }
+  }, []);
+
   const removeSessionLocally = useCallback((sessionId: string) => {
     setSessions(prev => prev.filter(item => item.session_id !== sessionId));
+    setActiveSessionId(prev => (prev === sessionId ? null : prev));
+    setMinimizedIds(prev => {
+      if (!prev.has(sessionId)) return prev;
+      const next = new Set(prev);
+      next.delete(sessionId);
+      return next;
+    });
     setCheckedIds(prev => {
       if (!prev.has(sessionId)) return prev;
       const next = new Set(prev);
@@ -6686,12 +7041,19 @@ function MultiTerminalPage() {
       next.delete(sessionId);
       return next;
     });
+    setAiSessionIds(prev => {
+      if (!prev.has(sessionId)) return prev;
+      const next = new Set(prev);
+      next.delete(sessionId);
+      return next;
+    });
     inputQueuesRef.current.delete(sessionId);
   }, []);
 
   useEffect(() => {
     loadNodes().catch(error => showNotice((error as Error).message, 'error'));
     loadSessions().catch(error => showNotice((error as Error).message, 'error'));
+    loadArchived().catch(() => {});
 
     const source = new EventSource('/api/events');
     source.addEventListener('update', (event) => {
@@ -6733,7 +7095,7 @@ function MultiTerminalPage() {
     return () => {
       source.close();
     };
-  }, [loadNodes, loadSessions, mergeSessions, removeSessionLocally, showNotice]);
+  }, [loadNodes, loadSessions, loadArchived, mergeSessions, removeSessionLocally, showNotice]);
 
   // ---------- 输入发送队列：每会话串行 POST，inflight 期间累积 pending ----------
 
@@ -6790,19 +7152,21 @@ function MultiTerminalPage() {
   const handleTerminalData = useCallback((sessionId: string, data: string) => {
     const checked = checkedIdsRef.current;
     const disconnected = disconnectedIdsRef.current;
+    const aiIds = aiSessionIdsRef.current;
     // 广播目标剔除已断开会话，避免向已不存在的会话反复 POST 触发 404
-    const targets = broadcastOnRef.current && checked.has(sessionId)
-      ? [...checked].filter(id => !disconnected.has(id))
+    // AI coding TUI 对输入上下文敏感，不参与广播输入。
+    const targets = broadcastOnRef.current && checked.has(sessionId) && !aiIds.has(sessionId)
+      ? [...checked].filter(id => !disconnected.has(id) && !aiIds.has(id))
       : [sessionId];
     targets.forEach(id => enqueueInput(id, data));
   }, [enqueueInput]);
 
   // ---------- 会话生命周期 ----------
 
-  const createTerminal = useCallback(async (nodeId: string) => {
+  const createTerminal = useCallback(async (nodeId: string, name?: string, startupCommand?: string) => {
     const payload = await api<{ session: TerminalSessionInfo }>('/api/terminals', {
       method: 'POST',
-      body: JSON.stringify({ node_id: nodeId, cols: 120, rows: 30 }),
+      body: JSON.stringify({ node_id: nodeId, cols: 120, rows: 30, name, startup_command: startupCommand }),
     });
     return payload.session;
   }, []);
@@ -6812,6 +7176,40 @@ function MultiTerminalPage() {
     try {
       const session = await createTerminal(selectedNodeId);
       setSessions(prev => (prev.some(item => item.session_id === session.session_id) ? prev : [...prev, session]));
+      setMinimizedIds(prev => {
+        if (!prev.has(session.session_id)) return prev;
+        const next = new Set(prev);
+        next.delete(session.session_id);
+        return next;
+      });
+      setActiveSessionId(session.session_id);
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const handleCreateAiTerminal = async (kind: AiTerminalKind) => {
+    setCreating(true);
+    try {
+      const label = kind === 'codex' ? 'Codex AI' : 'OpenCode AI';
+      const session = await createTerminal(selectedNodeId, label, buildAiTerminalCommand(kind));
+      setSessions(prev => (prev.some(item => item.session_id === session.session_id) ? prev : [...prev, session]));
+      setAiSessionIds(prev => new Set(prev).add(session.session_id));
+      setMinimizedIds(prev => {
+        if (!prev.has(session.session_id)) return prev;
+        const next = new Set(prev);
+        next.delete(session.session_id);
+        return next;
+      });
+      setCheckedIds(prev => {
+        if (!prev.has(session.session_id)) return prev;
+        const next = new Set(prev);
+        next.delete(session.session_id);
+        return next;
+      });
+      setActiveSessionId(session.session_id);
     } catch (error) {
       showNotice((error as Error).message, 'error');
     } finally {
@@ -6843,6 +7241,13 @@ function MultiTerminalPage() {
         next.delete(oldSession.session_id);
         return next;
       });
+      setMinimizedIds(prev => {
+        const next = new Set(prev);
+        next.delete(oldSession.session_id);
+        next.delete(session.session_id);
+        return next;
+      });
+      setActiveSessionId(session.session_id);
       inputQueuesRef.current.delete(oldSession.session_id);
     } catch (error) {
       showNotice((error as Error).message, 'error');
@@ -6853,23 +7258,56 @@ function MultiTerminalPage() {
     const isDisconnected = disconnectedIds.has(session.session_id);
     if (!isDisconnected) {
       const confirmed = window.confirm(
-        `确认关闭 ${session.node_name} 的终端会话吗？\n\n会话中正在运行的命令会被终止。`
+        `确认关闭 ${session.name} 的终端会话吗？\n\n会话中正在运行的命令会被终止，日志将归档保存。`
       );
       if (!confirmed) return;
       try {
         await api(`/api/terminals/${session.session_id}`, { method: 'DELETE' });
       } catch (error) {
         const text = (error as Error).message || '';
-        // 会话可能已在服务端结束，仅对其他错误提示
         if (!text.includes('不存在')) {
           showNotice(text, 'error');
         }
       }
     }
     removeSessionLocally(session.session_id);
+    const archives = await loadArchived();
+    if (archives.some(archive => archive.id === session.session_id)) {
+      setViewingLog(prev => (
+        prev?.sessionId === session.session_id
+          ? { sessionId: session.session_id, name: session.name, isArchived: true }
+          : prev
+      ));
+    }
+  };
+
+  const handleRename = async (sessionId: string, name: string) => {
+    try {
+      const payload = await api<{ session: TerminalSessionInfo }>(`/api/terminals/${sessionId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+      });
+      setSessions(prev => prev.map(s => s.session_id === sessionId ? { ...s, name: payload.session.name } : s));
+    } catch (error) {
+      showNotice((error as Error).message, 'error');
+    }
+  };
+
+  const startEditing = (session: TerminalSessionInfo) => {
+    setEditingId(session.session_id);
+    setEditingName(session.name);
+  };
+
+  const commitEditing = () => {
+    if (editingId && editingName.trim()) {
+      void handleRename(editingId, editingName.trim());
+    }
+    setEditingId(null);
+    setEditingName('');
   };
 
   const toggleChecked = (sessionId: string) => {
+    if (aiSessionIdsRef.current.has(sessionId)) return;
     setCheckedIds(prev => {
       const next = new Set(prev);
       if (next.has(sessionId)) {
@@ -6881,12 +7319,130 @@ function MultiTerminalPage() {
     });
   };
 
-  const columnCount = sessions.length <= 1 ? 1 : sessions.length <= 4 ? 2 : 3;
+  const minimizeSession = (sessionId: string) => {
+    setMinimizedIds(prev => new Set(prev).add(sessionId));
+    setActiveSessionId(prev => (prev === sessionId ? null : prev));
+  };
+
+  const restoreSession = (sessionId: string) => {
+    setMinimizedIds(prev => {
+      if (!prev.has(sessionId)) return prev;
+      const next = new Set(prev);
+      next.delete(sessionId);
+      return next;
+    });
+    setActiveSessionId(sessionId);
+  };
+
+  const visibleSessions = sessions.filter(session => !minimizedIds.has(session.session_id));
+  const minimizedSessions = sessions.filter(session => minimizedIds.has(session.session_id));
+  const activeSession = visibleSessions.find(session => session.session_id === activeSessionId) || visibleSessions[0] || null;
   const noticeStyle = notice?.kind === 'error'
     ? 'bg-rose-50 border-rose-200 text-rose-700'
     : notice?.kind === 'success'
       ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
       : 'bg-blue-50 border-blue-200 text-blue-700';
+
+  const renderSessionPanel = (session: TerminalSessionInfo, variant: 'page' | 'grid') => {
+    const disconnected = disconnectedIds.has(session.session_id);
+    const isActive = activeSession?.session_id === session.session_id;
+    const isAiSession = aiSessionIds.has(session.session_id) || isAiTerminalName(session.name);
+    return (
+      <div
+        key={session.session_id}
+        className={`bg-white rounded-xl border shadow-sm overflow-hidden flex flex-col ${
+          isActive ? 'border-blue-200 ring-1 ring-blue-100' : 'border-slate-200'
+        }`}
+      >
+        <div className="px-3 py-2 border-b border-slate-100 bg-slate-50/50 flex items-center gap-2 min-w-0">
+          <span
+            className={`w-2 h-2 rounded-full shrink-0 ${disconnected ? 'bg-rose-500' : 'bg-emerald-500'}`}
+            title={disconnected ? '连接已断开' : '会话存活'}
+          />
+          {editingId === session.session_id ? (
+            <input
+              autoFocus
+              value={editingName}
+              onChange={(e) => setEditingName(e.target.value)}
+              onBlur={commitEditing}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commitEditing();
+                if (e.key === 'Escape') { setEditingId(null); setEditingName(''); }
+              }}
+              className="text-xs font-bold text-slate-700 bg-white border border-blue-400 rounded px-1 py-0.5 outline-none flex-1 min-w-0"
+            />
+          ) : (
+            <button
+              type="button"
+              className="text-left text-xs font-bold text-slate-700 truncate hover:text-blue-600 flex-1 min-w-0"
+              title="点击重命名"
+              onClick={() => startEditing(session)}
+            >
+              {session.name}
+            </button>
+          )}
+          <span className="text-[9px] text-slate-400 truncate shrink-0 max-w-[120px]">{session.node_name}</span>
+          {session.is_local && (
+            <span className="text-[9px] font-bold text-slate-400 uppercase border border-slate-200 rounded px-1 shrink-0">本机</span>
+          )}
+          {isAiSession && (
+            <span className="text-[9px] font-bold text-violet-600 uppercase border border-violet-100 bg-violet-50 rounded px-1 shrink-0">AI</span>
+          )}
+          <label
+            className={`ml-auto flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest select-none shrink-0 ${
+              isAiSession ? 'text-slate-300 cursor-not-allowed' : 'text-slate-400 cursor-pointer'
+            }`}
+            title={isAiSession ? 'AI 终端不参与广播输入' : '勾选后该终端参与广播输入'}
+          >
+            <input
+              type="checkbox"
+              checked={!isAiSession && checkedIds.has(session.session_id)}
+              onChange={() => toggleChecked(session.session_id)}
+              disabled={isAiSession}
+              className="accent-blue-600"
+            />
+            广播
+          </label>
+          <button
+            onClick={() => minimizeSession(session.session_id)}
+            title="最小化终端"
+            className="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors shrink-0"
+          >
+            <Minimize2 className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => setViewingLog({ sessionId: session.session_id, name: session.name })}
+            title="查看完整日志"
+            className="p-1 rounded text-slate-400 hover:text-blue-500 hover:bg-blue-50 transition-colors shrink-0"
+          >
+            <FileText className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => void handleClose(session)}
+            title="关闭终端（日志归档保存）"
+            className="p-1 rounded text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-colors shrink-0"
+          >
+            <Plus className="w-3.5 h-3.5 rotate-45" />
+          </button>
+        </div>
+        <div className={`bg-slate-900 p-3 ${variant === 'page' ? 'h-[min(78vh,920px)] min-h-[560px]' : 'h-[min(52vh,500px)] min-h-[340px]'}`}>
+          <InteractiveTerminal
+            sessionId={session.session_id}
+            title={session.name}
+            streamUrl={`/api/terminals/${session.session_id}/stream`}
+            resizeUrl={`/api/terminals/${session.session_id}/resize`}
+            inputUrl={`/api/terminals/${session.session_id}/input`}
+            statusSuffix={session.session_id.slice(0, 6)}
+            onData={(data) => handleTerminalData(session.session_id, data)}
+            onReconnect={() => void handleReconnect(session)}
+            onRename={() => startEditing(session)}
+            onClose={() => void handleClose(session)}
+            onViewLog={() => setViewingLog({ sessionId: session.session_id, name: session.name })}
+          />
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-6">
@@ -6936,6 +7492,34 @@ function MultiTerminalPage() {
               {creating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
               新建终端
             </button>
+            <div className="flex items-center gap-1 bg-slate-100 border border-slate-200 rounded-lg p-1">
+              <button
+                onClick={() => void handleCreateAiTerminal('codex')}
+                disabled={creating}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[10px] font-bold transition-colors ${
+                  creating
+                    ? 'text-slate-300 cursor-not-allowed'
+                    : 'bg-white text-violet-700 hover:text-violet-600 shadow-sm'
+                }`}
+                title="启动 Codex AI 终端"
+              >
+                <Bot className="w-3.5 h-3.5" />
+                Codex
+              </button>
+              <button
+                onClick={() => void handleCreateAiTerminal('opencode')}
+                disabled={creating}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[10px] font-bold transition-colors ${
+                  creating
+                    ? 'text-slate-300 cursor-not-allowed'
+                    : 'text-slate-600 hover:text-blue-600'
+                }`}
+                title="启动 OpenCode AI 终端"
+              >
+                <Code2 className="w-3.5 h-3.5" />
+                OpenCode
+              </button>
+            </div>
             <div className="flex items-center gap-2 pl-3 border-l border-slate-100">
               <button
                 type="button"
@@ -6961,73 +7545,1112 @@ function MultiTerminalPage() {
         </div>
       </div>
 
-      {/* ---------- 终端网格 ---------- */}
+      {/* ---------- 终端区域 ---------- */}
       {sessions.length === 0 ? (
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center text-slate-400 space-y-2">
           <SquareTerminal className="w-8 h-8 mx-auto opacity-20" />
           <p className="text-sm">暂无终端会话，选择节点后点击「新建终端」开始</p>
         </div>
       ) : (
-        <div
-          className="grid gap-4"
-          style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }}
-        >
-          {sessions.map(session => {
-            const disconnected = disconnectedIds.has(session.session_id);
-            return (
-              <div
-                key={session.session_id}
-                className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col"
-              >
-                <div className="px-3 py-2 border-b border-slate-100 bg-slate-50/50 flex items-center gap-2">
-                  <span
-                    className={`w-2 h-2 rounded-full shrink-0 ${disconnected ? 'bg-rose-500' : 'bg-emerald-500'}`}
-                    title={disconnected ? '连接已断开' : '会话存活'}
-                  />
-                  <span className="text-xs font-bold text-slate-700 truncate">{session.node_name}</span>
-                  {session.is_local && (
-                    <span className="text-[9px] font-bold text-slate-400 uppercase border border-slate-200 rounded px-1 shrink-0">本机</span>
-                  )}
-                  <label
-                    className="ml-auto flex items-center gap-1 text-[10px] font-bold text-slate-400 uppercase tracking-widest cursor-pointer select-none shrink-0"
-                    title="勾选后该终端参与广播输入"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checkedIds.has(session.session_id)}
-                      onChange={() => toggleChecked(session.session_id)}
-                      className="accent-blue-600"
-                    />
-                    广播
-                  </label>
+        <div className="space-y-3">
+          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-2 overflow-x-auto custom-scrollbar min-w-0">
+                {visibleSessions.map(session => {
+                  const active = activeSession?.session_id === session.session_id;
+                  const disconnected = disconnectedIds.has(session.session_id);
+                  return (
+                    <button
+                      key={session.session_id}
+                      type="button"
+                      onClick={() => setActiveSessionId(session.session_id)}
+                      className={`flex items-center gap-2 max-w-[220px] px-3 py-1.5 rounded-lg border text-xs font-bold transition-colors shrink-0 ${
+                        active
+                          ? 'bg-blue-50 border-blue-200 text-blue-700'
+                          : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${disconnected ? 'bg-rose-500' : 'bg-emerald-500'}`} />
+                      <span className="truncate">{session.name}</span>
+                      <span className="text-[9px] text-slate-400 font-mono">{session.session_id.slice(0, 4)}</span>
+                    </button>
+                  );
+                })}
+                {visibleSessions.length === 0 && (
+                  <span className="text-xs text-slate-400 px-2">所有终端已最小化</span>
+                )}
+              </div>
+            </div>
+            {minimizedSessions.length > 0 && (
+              <div className="px-3 py-2 bg-slate-50/60 flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">已最小化</span>
+                {minimizedSessions.map(session => (
                   <button
-                    onClick={() => void handleClose(session)}
-                    title="关闭终端"
-                    className="p-1 rounded text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-colors shrink-0"
+                    key={session.session_id}
+                    type="button"
+                    onClick={() => restoreSession(session.session_id)}
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-lg border border-slate-200 bg-white text-[10px] font-bold text-slate-600 hover:text-blue-600 hover:border-blue-200 transition-colors"
+                  >
+                    <Maximize2 className="w-3 h-3" />
+                    <span className="max-w-[160px] truncate">{session.name}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {visibleSessions.length === 0 ? (
+            <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-8 text-center text-slate-400">
+              <Minimize2 className="w-6 h-6 mx-auto mb-2 opacity-30" />
+              <p className="text-sm">终端已最小化，从上方恢复指定终端</p>
+            </div>
+          ) : (
+            <div className="grid">
+              {activeSession && (
+                <div key={activeSession.session_id} className="min-w-0">
+                  {renderSessionPanel(activeSession, 'page')}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------- 历史归档日志 ---------- */}
+      {archivedTerminals.length > 0 && (
+        <ArchivedTerminalsPanel
+          archives={archivedTerminals}
+          onRefresh={() => void loadArchived()}
+        />
+      )}
+
+      {/* ---------- 完整日志查看弹层 ---------- */}
+      {viewingLog && (
+        <TerminalLogViewer
+          sessionId={viewingLog.sessionId}
+          name={viewingLog.name}
+          isArchived={viewingLog.isArchived}
+          onClose={() => setViewingLog(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ArchivedTerminalsPanel({
+  archives,
+  onRefresh,
+}: {
+  archives: ArchivedTerminalInfo[];
+  onRefresh: () => void;
+}) {
+  const [viewingArchive, setViewingArchive] = useState<ArchivedTerminalInfo | null>(null);
+
+  return (
+    <>
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="p-4 bg-slate-50/50 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-slate-600 rounded-lg text-white">
+              <Archive className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-bold text-slate-800 text-base">历史终端日志</h3>
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">archived terminal logs</p>
+            </div>
+          </div>
+          <button
+            onClick={onRefresh}
+            className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-bold border bg-white text-slate-600 border-slate-200 hover:bg-slate-50 transition-all shadow-sm"
+          >
+            <RefreshCcw className="w-3.5 h-3.5" />
+            刷新
+          </button>
+        </div>
+        <div className="border-t border-slate-100 divide-y divide-slate-50">
+          {archives.map(terminal => (
+            <div
+              key={terminal.id}
+              className="px-4 py-3 flex items-center gap-3 hover:bg-slate-50/40 transition-colors"
+            >
+              <Archive className="w-4 h-4 text-slate-400 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <div className="text-xs font-bold text-slate-700 truncate">{terminal.name}</div>
+                <div className="text-[10px] text-slate-400 flex items-center gap-2">
+                  <span>{terminal.node_name}</span>
+                  {terminal.is_local && <span className="uppercase">本机</span>}
+                  {terminal.closed_at && <span>{formatTime(terminal.closed_at)}</span>}
+                </div>
+              </div>
+              <button
+                onClick={() => setViewingArchive(terminal)}
+                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold text-blue-600 hover:bg-blue-50 transition-colors shrink-0"
+              >
+                <FileText className="w-3 h-3" />
+                查看日志
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+      {viewingArchive && (
+        <TerminalLogViewer
+          sessionId={viewingArchive.id}
+          name={viewingArchive.name}
+          isArchived
+          onClose={() => setViewingArchive(null)}
+        />
+      )}
+    </>
+  );
+}
+
+function TerminalLogViewer({
+  sessionId,
+  name,
+  isArchived = false,
+  onClose,
+}: {
+  sessionId: string;
+  name: string;
+  isArchived?: boolean;
+  onClose: () => void;
+}) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const terminalRef = useRef<XTerm | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [logSize, setLogSize] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [resolvedArchived, setResolvedArchived] = useState(isArchived);
+  const tailSize = 262144; // 256KB initial tail
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+
+    const terminal = new XTerm({
+      allowProposedApi: false,
+      convertEol: false,
+      cursorBlink: false,
+      disableStdin: true,
+      fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
+      fontSize: 13,
+      lineHeight: 1.1,
+      scrollback: 50000,
+      theme: {
+        background: '#0f172a',
+        foreground: '#e2e8f0',
+        cursor: '#f8fafc',
+        selectionBackground: 'rgba(255,255,255,0.14)',
+      },
+    });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(host);
+    terminalRef.current = terminal;
+    fitAddonRef.current = fitAddon;
+    window.requestAnimationFrame(() => {
+      try { fitAddon.fit(); } catch { /* */ }
+    });
+
+    return () => {
+      terminal.dispose();
+      terminalRef.current = null;
+      fitAddonRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+
+    setLoading(true);
+    setError(null);
+    setResolvedArchived(isArchived);
+    terminal.reset();
+    terminal.writeln(`[exp-scheduler] loading log for ${name}...`);
+
+    const url = isArchived
+      ? `/api/terminals/logs/${sessionId}?tail=${tailSize}`
+      : `/api/terminals/${sessionId}/log?tail=${tailSize}`;
+
+    api<{ data: string; size: number }>(url)
+      .then(async payload => {
+        let effectivePayload = payload;
+        let effectiveArchived = isArchived;
+        if (!isArchived && payload.size === 0) {
+          try {
+            const archivedPayload = await api<{ data: string; size: number }>(
+              `/api/terminals/logs/${sessionId}?tail=${tailSize}`,
+            );
+            if (archivedPayload.size > 0) {
+              effectivePayload = archivedPayload;
+              effectiveArchived = true;
+            }
+          } catch {
+            // live 日志为空时归档兜底尽力而为
+          }
+        }
+        terminal.reset();
+        const bytes = decodeBase64Bytes(effectivePayload.data);
+        setLogSize(effectivePayload.size);
+        setResolvedArchived(effectiveArchived);
+        try {
+          terminal.write(bytes);
+        } catch {
+          terminal.writeln('\r\n[exp-scheduler] 日志数据解析失败');
+        }
+        if (effectivePayload.size < tailSize) {
+          terminal.writeln(`\r\n[exp-scheduler] 日志已全部加载 (${effectivePayload.size} bytes)`);
+        } else {
+          terminal.writeln(`\r\n[exp-scheduler] 已加载最近 ${effectivePayload.size} bytes（可能还有更早的日志）`);
+        }
+        setLoading(false);
+      })
+      .catch(err => {
+        setError((err as Error).message);
+        setLoading(false);
+      });
+  }, [sessionId, name, isArchived]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4">
+      <div className="bg-slate-900 rounded-xl border border-slate-700 shadow-2xl w-full max-w-5xl h-[80vh] flex flex-col overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-700 bg-slate-800/80 flex items-center gap-3">
+          <FileText className="w-4 h-4 text-blue-400 shrink-0" />
+          <span className="text-sm font-bold text-slate-200 truncate">{name}</span>
+          <span className="text-[10px] text-slate-500 font-mono shrink-0">
+            {resolvedArchived ? '已归档' : '实时日志'} {logSize > 0 && `/ ${logSize} bytes`}
+          </span>
+          <button
+            onClick={onClose}
+            className="ml-auto p-1 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-950/50 transition-colors shrink-0"
+          >
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+        <div className="flex-1 p-3 overflow-hidden">
+          {error ? (
+            <div className="h-full flex items-center justify-center text-rose-400 text-sm">{error}</div>
+          ) : (
+            <div ref={hostRef} className="h-full w-full" />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==================== 目录浏览器 ====================
+
+interface DirEntry {
+  name: string;
+  type: 'dir' | 'file';
+  size: number;
+  modified: number;
+}
+
+function DirectoryBrowser({
+  nodeId,
+  initialPath = '~',
+  onSelect,
+  onClose,
+}: {
+  nodeId: string;
+  initialPath?: string;
+  onSelect: (path: string) => void;
+  onClose: () => void;
+}) {
+  const [currentPath, setCurrentPath] = useState(initialPath);
+  const [entries, setEntries] = useState<DirEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+
+  const loadDir = useCallback(async (path: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const payload = await api<{ path: string; entries: DirEntry[] }>(
+        `/api/files/browse?node_id=${encodeURIComponent(nodeId)}&path=${encodeURIComponent(path)}`
+      );
+      setCurrentPath(payload.path);
+      setEntries(payload.entries || []);
+      setSelectedPath(null);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }, [nodeId]);
+
+  useEffect(() => {
+    void loadDir(initialPath);
+  }, [loadDir, initialPath]);
+
+  const handleEntryClick = (entry: DirEntry) => {
+    if (entry.type === 'dir') {
+      const newPath = currentPath.endsWith('/') ? currentPath + entry.name : currentPath + '/' + entry.name;
+      void loadDir(newPath);
+    } else {
+      setSelectedPath(currentPath + '/' + entry.name);
+    }
+  };
+
+  const breadcrumb = currentPath.split('/').filter(Boolean);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4">
+      <div className="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-2xl h-[70vh] flex flex-col overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-100 bg-slate-50/50 flex items-center gap-3">
+          <FolderOpen className="w-4 h-4 text-blue-500 shrink-0" />
+          <span className="text-sm font-bold text-slate-700">选择目录</span>
+          <button
+            onClick={() => void loadDir('~')}
+            title="回到用户根目录"
+            className="ml-auto px-2 py-1 rounded-lg text-[10px] font-bold text-slate-500 hover:bg-slate-100 transition-colors shrink-0"
+          >
+            ~
+          </button>
+          <button
+            onClick={onClose}
+            className="p-1 rounded text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-colors shrink-0"
+          >
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+        {/* 面包屑 */}
+        <div className="px-4 py-2 border-b border-slate-50 flex items-center gap-1 text-xs text-slate-500 overflow-x-auto">
+          <button
+            onClick={() => void loadDir('/')}
+            className="hover:text-blue-600 transition-colors shrink-0"
+          >root</button>
+          {breadcrumb.map((part, i) => {
+            const path = '/' + breadcrumb.slice(0, i + 1).join('/');
+            return (
+              <span key={i} className="flex items-center gap-1 shrink-0">
+                <span className="text-slate-300">/</span>
+                <button
+                  onClick={() => void loadDir(path)}
+                  className="hover:text-blue-600 transition-colors"
+                >{part}</button>
+              </span>
+            );
+          })}
+        </div>
+        {/* 当前路径输入 */}
+        <div className="px-4 py-2 border-b border-slate-50">
+          <input
+            value={currentPath}
+            onChange={(e) => setCurrentPath(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void loadDir(currentPath);
+            }}
+            className="w-full text-xs font-mono bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 outline-none focus:border-blue-400"
+            spellCheck={false}
+          />
+        </div>
+        {/* 目录列表 */}
+        <div className="flex-1 overflow-y-auto custom-scrollbar">
+          {loading ? (
+            <div className="p-8 flex items-center justify-center text-slate-400">
+              <Loader2 className="w-5 h-5 animate-spin mr-2" /> 加载中...
+            </div>
+          ) : error ? (
+            <div className="p-8 text-center text-rose-500 text-sm">{error}</div>
+          ) : entries.length === 0 ? (
+            <div className="p-8 text-center text-slate-400 text-sm">空目录</div>
+          ) : (
+            <div className="divide-y divide-slate-50">
+              {entries.map((entry) => (
+                <button
+                  key={entry.name}
+                  onClick={() => handleEntryClick(entry)}
+                  className={`w-full text-left px-4 py-2 flex items-center gap-3 hover:bg-blue-50/50 transition-colors ${
+                    selectedPath === currentPath + '/' + entry.name ? 'bg-blue-50' : ''
+                  }`}
+                >
+                  {entry.type === 'dir' ? (
+                    <Folder className="w-4 h-4 text-amber-500 shrink-0" />
+                  ) : (
+                    <FileText className="w-4 h-4 text-slate-400 shrink-0" />
+                  )}
+                  <span className="text-sm text-slate-700 truncate flex-1">{entry.name}</span>
+                  {entry.type === 'file' && (
+                    <span className="text-[10px] text-slate-400 font-mono shrink-0">
+                      {entry.size > 1024 ? `${(entry.size / 1024).toFixed(1)}KB` : `${entry.size}B`}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        {/* 底栏 */}
+        <div className="px-4 py-3 border-t border-slate-100 flex items-center justify-between">
+          <span className="text-xs text-slate-500 font-mono truncate">{currentPath}</span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => void loadDir(currentPath)}
+              className="px-3 py-1.5 rounded-lg text-xs font-bold text-slate-600 border border-slate-200 hover:bg-slate-50 transition-colors"
+            >
+              刷新
+            </button>
+            <button
+              onClick={() => onSelect(currentPath)}
+              disabled={!currentPath}
+              className="px-3 py-1.5 rounded-lg text-xs font-bold text-white bg-blue-600 hover:bg-blue-500 disabled:bg-slate-300 disabled:cursor-not-allowed transition-colors"
+            >
+              确认选择
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==================== 定时备份页 ====================
+
+interface BackupJob {
+  id: string;
+  name: string;
+  src_node_id: string;
+  src_path: string;
+  dst_node_id: string;
+  dst_path: string;
+  schedule_type: string;
+  schedule_hour: number;
+  schedule_minute: number;
+  schedule_day_of_week: number | null;
+  enabled: boolean;
+  delete_extras: boolean;
+  created_at: string;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  last_run?: BackupRun | null;
+}
+
+interface BackupRun {
+  id: number;
+  job_id: string;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  bytes_transferred: number | null;
+  files_transferred: number | null;
+  exit_code: number | null;
+  error: string | null;
+  log_path: string | null;
+}
+
+function scheduleLabel(job: BackupJob): string {
+  const h = String(job.schedule_hour).padStart(2, '0');
+  const m = String(job.schedule_minute).padStart(2, '0');
+  if (job.schedule_type === 'manual') return '手动';
+  if (job.schedule_type === 'daily') return `每天 ${h}:${m}`;
+  if (job.schedule_type === 'weekly') {
+    const days = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+    return `${days[job.schedule_day_of_week || 0]} ${h}:${m}`;
+  }
+  return job.schedule_type;
+}
+
+function BackupPage() {
+  const [nodes, setNodes] = useState<SyncNode[]>([]);
+  const [jobs, setJobs] = useState<BackupJob[]>([]);
+  const [showForm, setShowForm] = useState(false);
+  const [editingJob, setEditingJob] = useState<BackupJob | null>(null);
+  const [viewingRuns, setViewingRuns] = useState<BackupJob | null>(null);
+  const [viewingLog, setViewingLog] = useState<number | null>(null);
+  const [notice, setNotice] = useState<{ text: string; kind: 'info' | 'success' | 'error' } | null>(null);
+
+  const showNotice = useCallback((text: string, kind: 'info' | 'success' | 'error' = 'info') => {
+    setNotice({ text, kind });
+  }, []);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const loadNodes = useCallback(async () => {
+    const payload = await api<{ nodes: SyncNode[] }>('/api/nodes');
+    setNodes(payload.nodes || []);
+  }, []);
+
+  const loadJobs = useCallback(async () => {
+    try {
+      const payload = await api<{ jobs: BackupJob[] }>('/api/backups');
+      setJobs(payload.jobs || []);
+    } catch (err) {
+      showNotice((err as Error).message, 'error');
+    }
+  }, [showNotice]);
+
+  useEffect(() => {
+    void loadNodes().catch(() => {});
+    void loadJobs().catch(() => {});
+    const source = new EventSource('/api/events');
+    source.addEventListener('update', (event) => {
+      let parsed: { type?: string; payload?: Record<string, unknown> };
+      try {
+        parsed = JSON.parse(((event as MessageEvent).data as string) || '{}');
+      } catch {
+        return;
+      }
+      const type = String(parsed?.type || '');
+      if (type === 'backup_job_created' || type === 'backup_job_updated' || type === 'backup_job_deleted' || type === 'backup_run_finished') {
+        void loadJobs().catch(() => {});
+      }
+    });
+    return () => { source.close(); };
+  }, [loadJobs, loadNodes]);
+
+  const handleToggle = async (job: BackupJob) => {
+    try {
+      await api(`/api/backups/${job.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: !job.enabled }),
+      });
+    } catch (err) {
+      showNotice((err as Error).message, 'error');
+    }
+  };
+
+  const handleRunNow = async (job: BackupJob) => {
+    try {
+      await api(`/api/backups/${job.id}/run`, { method: 'POST' });
+      showNotice(`备份任务「${job.name}」已触发`, 'success');
+    } catch (err) {
+      showNotice((err as Error).message, 'error');
+    }
+  };
+
+  const handleDelete = async (job: BackupJob) => {
+    if (!window.confirm(`确认删除备份任务「${job.name}」吗？\n\n任务历史记录也会一并删除。`)) return;
+    try {
+      await api(`/api/backups/${job.id}`, { method: 'DELETE' });
+    } catch (err) {
+      showNotice((err as Error).message, 'error');
+    }
+  };
+
+  const noticeStyle = notice?.kind === 'error'
+    ? 'bg-rose-50 border-rose-200 text-rose-700'
+    : notice?.kind === 'success'
+      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+      : 'bg-blue-50 border-blue-200 text-blue-700';
+
+  return (
+    <div className="space-y-6">
+      {notice && (
+        <div className={`border rounded-xl px-4 py-3 text-xs font-medium shadow-sm flex items-start gap-2 ${noticeStyle}`}>
+          {notice.kind === 'error'
+            ? <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            : <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />}
+          <span className="flex-1 whitespace-pre-wrap break-all">{notice.text}</span>
+          <button onClick={() => setNotice(null)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity">
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
+        <div className="p-4 flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-emerald-600 rounded-lg text-white">
+              <Archive className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-bold text-slate-800 text-base">定时备份</h3>
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">scheduled incremental backup</p>
+            </div>
+          </div>
+          <button
+            onClick={() => { setEditingJob(null); setShowForm(true); }}
+            className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-bold bg-emerald-600 text-white border border-emerald-700 hover:bg-emerald-500 transition-all shadow-sm"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            新建备份任务
+          </button>
+        </div>
+      </div>
+
+      {jobs.length === 0 ? (
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center text-slate-400 space-y-2">
+          <Archive className="w-8 h-8 mx-auto opacity-20" />
+          <p className="text-sm">暂无备份任务，点击「新建备份任务」开始</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {jobs.map(job => (
+            <div key={job.id} className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+              <div className="p-4 flex items-start gap-4">
+                <div className={`p-2 rounded-lg shrink-0 ${job.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-50 text-slate-400'}`}>
+                  <Archive className="w-5 h-5" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-sm font-bold text-slate-800">{job.name}</span>
+                    <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${
+                      job.enabled
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-100'
+                        : 'bg-slate-50 text-slate-400 border-slate-200'
+                    }`}>
+                      {job.enabled ? '启用' : '已禁用'}
+                    </span>
+                    <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border bg-blue-50 text-blue-700 border-blue-100">
+                      {scheduleLabel(job)}
+                    </span>
+                    {job.delete_extras && (
+                      <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border bg-amber-50 text-amber-700 border-amber-100">
+                        --delete
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1.5 text-xs text-slate-500 font-mono break-all">
+                    {job.src_path} → {job.dst_path}
+                  </div>
+                  {job.last_run && (
+                    <div className="mt-1 text-[10px] text-slate-400">
+                      上次运行: {formatTime(job.last_run.started_at)} ·
+                      <span className={job.last_run.status === 'succeeded' ? 'text-emerald-600 font-bold' : 'text-rose-500 font-bold'}>
+                        {' '}{job.last_run.status === 'succeeded' ? '成功' : '失败'}
+                      </span>
+                      {job.last_run.error && <span className="text-rose-400 ml-1">({job.last_run.error})</span>}
+                    </div>
+                  )}
+                  {job.next_run_at && job.enabled && job.schedule_type !== 'manual' && (
+                    <div className="mt-0.5 text-[10px] text-blue-400">
+                      下次运行: {formatTime(job.next_run_at)}
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={() => void handleRunNow(job)}
+                    title="立即执行"
+                    className="px-2 py-1.5 rounded-lg text-[10px] font-bold text-blue-600 hover:bg-blue-50 transition-colors"
+                  >
+                    <PlayCircle className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => { setEditingJob(job); setShowForm(true); }}
+                    title="编辑"
+                    className="px-2 py-1.5 rounded-lg text-[10px] font-bold text-slate-500 hover:bg-slate-100 transition-colors"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => void handleToggle(job)}
+                    title={job.enabled ? '禁用' : '启用'}
+                    className={`px-2 py-1.5 rounded-lg text-[10px] font-bold transition-colors ${
+                      job.enabled ? 'text-amber-600 hover:bg-amber-50' : 'text-emerald-600 hover:bg-emerald-50'
+                    }`}
+                  >
+                    {job.enabled ? <Pause className="w-3.5 h-3.5" /> : <PlayCircle className="w-3.5 h-3.5" />}
+                  </button>
+                  <button
+                    onClick={() => setViewingRuns(job)}
+                    title="运行历史"
+                    className="px-2 py-1.5 rounded-lg text-[10px] font-bold text-slate-500 hover:bg-slate-100 transition-colors"
+                  >
+                    <History className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={() => void handleDelete(job)}
+                    title="删除"
+                    className="px-2 py-1.5 rounded-lg text-[10px] font-bold text-rose-500 hover:bg-rose-50 transition-colors"
                   >
                     <Plus className="w-3.5 h-3.5 rotate-45" />
                   </button>
                 </div>
-                <div className="bg-slate-900 p-3 h-[380px]">
-                  <InteractiveTerminal
-                    sessionId={session.session_id}
-                    title={session.node_name}
-                    streamUrl={`/api/terminals/${session.session_id}/stream`}
-                    resizeUrl={`/api/terminals/${session.session_id}/resize`}
-                    inputUrl={`/api/terminals/${session.session_id}/input`}
-                    statusSuffix={session.session_id.slice(0, 6)}
-                    onData={(data) => handleTerminalData(session.session_id, data)}
-                    onReconnect={() => void handleReconnect(session)}
-                  />
-                </div>
               </div>
-            );
-          })}
+            </div>
+          ))}
         </div>
       )}
 
-      {/* ---------- conda 环境对比 ---------- */}
-      <CondaComparePanel onNotice={showNotice} />
+      {showForm && (
+        <BackupForm
+          nodes={nodes}
+          editingJob={editingJob}
+          onClose={() => { setShowForm(false); setEditingJob(null); }}
+          onSaved={() => { setShowForm(false); setEditingJob(null); void loadJobs(); }}
+          onNotice={showNotice}
+        />
+      )}
+
+      {viewingRuns && (
+        <BackupRunsModal
+          job={viewingRuns}
+          onClose={() => setViewingRuns(null)}
+          onViewLog={(runId) => setViewingLog(runId)}
+        />
+      )}
+
+      {viewingLog !== null && (
+        <BackupLogModal runId={viewingLog} onClose={() => setViewingLog(null)} />
+      )}
+    </div>
+  );
+}
+
+function BackupForm({
+  nodes,
+  editingJob,
+  onClose,
+  onSaved,
+  onNotice,
+}: {
+  nodes: SyncNode[];
+  editingJob: BackupJob | null;
+  onClose: () => void;
+  onSaved: () => void;
+  onNotice: (text: string, kind?: 'info' | 'success' | 'error') => void;
+}) {
+  const [name, setName] = useState(editingJob?.name || '');
+  const [srcNodeId, setSrcNodeId] = useState(editingJob?.src_node_id || 'local');
+  const [srcPath, setSrcPath] = useState(editingJob?.src_path || '');
+  const [dstNodeId, setDstNodeId] = useState(editingJob?.dst_node_id || 'local');
+  const [dstPath, setDstPath] = useState(editingJob?.dst_path || '');
+  const [scheduleType, setScheduleType] = useState(editingJob?.schedule_type || 'manual');
+  const [scheduleHour, setScheduleHour] = useState(editingJob?.schedule_hour ?? 2);
+  const [scheduleMinute, setScheduleMinute] = useState(editingJob?.schedule_minute ?? 0);
+  const [scheduleDow, setScheduleDow] = useState(editingJob?.schedule_day_of_week ?? 0);
+  const [deleteExtras, setDeleteExtras] = useState(editingJob?.delete_extras || false);
+  const [enabled, setEnabled] = useState(editingJob?.enabled ?? true);
+  const [browsing, setBrowsing] = useState<'src' | 'dst' | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleBrowse = (which: 'src' | 'dst') => {
+    setBrowsing(which);
+  };
+
+  const handleBrowseSelect = (path: string) => {
+    if (browsing === 'src') setSrcPath(path);
+    else if (browsing === 'dst') setDstPath(path);
+    setBrowsing(null);
+  };
+
+  const handleSubmit = async () => {
+    if (!name.trim()) { onNotice('请输入任务名称', 'error'); return; }
+    if (!srcPath.trim()) { onNotice('请选择源目录', 'error'); return; }
+    if (!dstPath.trim()) { onNotice('请选择目标目录', 'error'); return; }
+    setSubmitting(true);
+    try {
+      const body = {
+        name: name.trim(),
+        src_node_id: srcNodeId,
+        src_path: srcPath.trim(),
+        dst_node_id: dstNodeId,
+        dst_path: dstPath.trim(),
+        schedule_type: scheduleType,
+        schedule_hour: scheduleHour,
+        schedule_minute: scheduleMinute,
+        schedule_day_of_week: scheduleType === 'weekly' ? scheduleDow : null,
+        enabled,
+        delete_extras: deleteExtras,
+      };
+      if (editingJob) {
+        await api(`/api/backups/${editingJob.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+        onNotice('备份任务已更新', 'success');
+      } else {
+        await api('/api/backups', { method: 'POST', body: JSON.stringify(body) });
+        onNotice('备份任务已创建', 'success');
+      }
+      onSaved();
+    } catch (err) {
+      onNotice((err as Error).message, 'error');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
+      <div className="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto custom-scrollbar">
+        <div className="p-4 border-b border-slate-100 flex items-center gap-3">
+          <Archive className="w-4 h-4 text-emerald-500" />
+          <span className="text-sm font-bold text-slate-700">{editingJob ? '编辑备份任务' : '新建备份任务'}</span>
+          <button onClick={onClose} className="ml-auto p-1 rounded text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-colors">
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+        <div className="p-4 space-y-4">
+          <div>
+            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">任务名称</label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="例如：实验数据每日备份"
+              className="mt-1 w-full text-sm bg-white border border-slate-200 rounded-lg px-3 py-2 outline-none focus:border-emerald-400"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">源节点</label>
+              <select
+                value={srcNodeId}
+                onChange={(e) => setSrcNodeId(e.target.value)}
+                className="mt-1 w-full text-sm bg-white border border-slate-200 rounded-lg px-3 py-2 outline-none focus:border-emerald-400"
+              >
+                {nodes.map(n => <option key={n.id} value={n.id}>{syncNodeOptionLabel(n)}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">目标节点</label>
+              <select
+                value={dstNodeId}
+                onChange={(e) => setDstNodeId(e.target.value)}
+                className="mt-1 w-full text-sm bg-white border border-slate-200 rounded-lg px-3 py-2 outline-none focus:border-emerald-400"
+              >
+                {nodes.map(n => <option key={n.id} value={n.id}>{syncNodeOptionLabel(n)}</option>)}
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">源目录</label>
+            <div className="mt-1 flex gap-2">
+              <input
+                value={srcPath}
+                onChange={(e) => setSrcPath(e.target.value)}
+                placeholder="/path/to/source"
+                className="flex-1 text-sm font-mono bg-white border border-slate-200 rounded-lg px-3 py-2 outline-none focus:border-emerald-400"
+                spellCheck={false}
+              />
+              <button
+                onClick={() => handleBrowse('src')}
+                className="px-3 py-2 rounded-lg text-xs font-bold text-emerald-600 border border-emerald-200 hover:bg-emerald-50 transition-colors shrink-0"
+              >
+                <FolderOpen className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">目标目录</label>
+            <div className="mt-1 flex gap-2">
+              <input
+                value={dstPath}
+                onChange={(e) => setDstPath(e.target.value)}
+                placeholder="/path/to/destination"
+                className="flex-1 text-sm font-mono bg-white border border-slate-200 rounded-lg px-3 py-2 outline-none focus:border-emerald-400"
+                spellCheck={false}
+              />
+              <button
+                onClick={() => handleBrowse('dst')}
+                className="px-3 py-2 rounded-lg text-xs font-bold text-emerald-600 border border-emerald-200 hover:bg-emerald-50 transition-colors shrink-0"
+              >
+                <FolderOpen className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">调度方式</label>
+            <div className="mt-1 flex gap-3">
+              {['manual', 'daily', 'weekly'].map(type => (
+                <button
+                  key={type}
+                  onClick={() => setScheduleType(type)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
+                    scheduleType === type
+                      ? 'bg-emerald-600 text-white border-emerald-700'
+                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                  }`}
+                >
+                  {type === 'manual' ? '手动' : type === 'daily' ? '每天' : '每周'}
+                </button>
+              ))}
+            </div>
+          </div>
+          {scheduleType !== 'manual' && (
+            <div className="flex items-center gap-2">
+              {scheduleType === 'weekly' && (
+                <select
+                  value={scheduleDow}
+                  onChange={(e) => setScheduleDow(Number(e.target.value))}
+                  className="text-sm bg-white border border-slate-200 rounded-lg px-3 py-2 outline-none focus:border-emerald-400"
+                >
+                  {['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((d, i) => (
+                    <option key={i} value={i}>{d}</option>
+                  ))}
+                </select>
+              )}
+              <input
+                type="number"
+                value={scheduleHour}
+                onChange={(e) => setScheduleHour(Math.max(0, Math.min(23, Number(e.target.value))))}
+                min={0} max={23}
+                className="w-16 text-sm bg-white border border-slate-200 rounded-lg px-3 py-2 outline-none focus:border-emerald-400 text-center"
+              />
+              <span className="text-sm text-slate-400">:</span>
+              <input
+                type="number"
+                value={scheduleMinute}
+                onChange={(e) => setScheduleMinute(Math.max(0, Math.min(59, Number(e.target.value))))}
+                min={0} max={59}
+                className="w-16 text-sm bg-white border border-slate-200 rounded-lg px-3 py-2 outline-none focus:border-emerald-400 text-center"
+              />
+              <span className="text-xs text-slate-400">（24小时制）</span>
+            </div>
+          )}
+          <div className="flex items-center gap-4">
+            <label className="flex items-center gap-2 text-xs font-bold text-slate-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={deleteExtras}
+                onChange={(e) => setDeleteExtras(e.target.checked)}
+                className="accent-emerald-600"
+              />
+              --delete（删除目标端多余文件）
+            </label>
+            <label className="flex items-center gap-2 text-xs font-bold text-slate-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={enabled}
+                onChange={(e) => setEnabled(e.target.checked)}
+                className="accent-emerald-600"
+              />
+              启用
+            </label>
+          </div>
+        </div>
+        <div className="p-4 border-t border-slate-100 flex justify-end gap-2">
+          <button onClick={onClose} className="px-4 py-2 rounded-lg text-xs font-bold text-slate-600 border border-slate-200 hover:bg-slate-50 transition-colors">
+            取消
+          </button>
+          <button
+            onClick={() => void handleSubmit()}
+            disabled={submitting}
+            className="px-4 py-2 rounded-lg text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-300 transition-colors"
+          >
+            {submitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : editingJob ? '保存' : '创建'}
+          </button>
+        </div>
+      </div>
+      {browsing && (
+        <DirectoryBrowser
+          nodeId={browsing === 'src' ? srcNodeId : dstNodeId}
+          onSelect={handleBrowseSelect}
+          onClose={() => setBrowsing(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function BackupRunsModal({
+  job,
+  onClose,
+  onViewLog,
+}: {
+  job: BackupJob;
+  onClose: () => void;
+  onViewLog: (runId: number) => void;
+}) {
+  const [runs, setRuns] = useState<BackupRun[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api<{ runs: BackupRun[] }>(`/api/backups/${job.id}/runs?limit=50`)
+      .then(payload => { setRuns(payload.runs || []); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [job.id]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4">
+      <div className="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-100 bg-slate-50/50 flex items-center gap-3">
+          <History className="w-4 h-4 text-slate-500" />
+          <span className="text-sm font-bold text-slate-700 truncate">运行历史 - {job.name}</span>
+          <button onClick={onClose} className="ml-auto p-1 rounded text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-colors shrink-0">
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto custom-scrollbar">
+          {loading ? (
+            <div className="p-8 flex items-center justify-center text-slate-400">
+              <Loader2 className="w-5 h-5 animate-spin mr-2" /> 加载中...
+            </div>
+          ) : runs.length === 0 ? (
+            <div className="p-8 text-center text-slate-400 text-sm">暂无运行记录</div>
+          ) : (
+            <div className="divide-y divide-slate-50">
+              {runs.map(run => (
+                <div key={run.id} className="px-4 py-3 flex items-center gap-3 hover:bg-slate-50/40 transition-colors">
+                  <div className={`w-2 h-2 rounded-full shrink-0 ${
+                    run.status === 'succeeded' ? 'bg-emerald-500' :
+                    run.status === 'failed' ? 'bg-rose-500' :
+                    run.status === 'running' ? 'bg-blue-500 animate-pulse' : 'bg-slate-300'
+                  }`} />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-bold text-slate-700">
+                      {run.status === 'succeeded' ? '成功' : run.status === 'failed' ? '失败' : run.status === 'running' ? '运行中' : run.status}
+                      {run.exit_code !== null && run.exit_code !== 0 && <span className="text-rose-400 ml-2">exit={run.exit_code}</span>}
+                    </div>
+                    <div className="text-[10px] text-slate-400">
+                      {formatTime(run.started_at)}
+                      {run.finished_at && ` → ${formatTime(run.finished_at)}`}
+                      {run.error && <span className="text-rose-400 ml-2 truncate">{run.error}</span>}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => onViewLog(run.id)}
+                    className="px-2 py-1 rounded-lg text-[10px] font-bold text-blue-600 hover:bg-blue-50 transition-colors shrink-0"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BackupLogModal({ runId, onClose }: { runId: number; onClose: () => void }) {
+  const [content, setContent] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [isFull, setIsFull] = useState(false);
+
+  useEffect(() => {
+    setLoading(true);
+    api<{ content: string; log_path: string; size: number }>(
+      `/api/backups/runs/${runId}/log?full=${isFull ? 'true' : 'false'}`
+    )
+      .then(payload => { setContent(payload.content || '(日志为空)'); setLoading(false); })
+      .catch(err => { setContent((err as Error).message); setLoading(false); });
+  }, [runId, isFull]);
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4">
+      <div className="bg-slate-900 rounded-xl border border-slate-700 shadow-2xl w-full max-w-3xl h-[80vh] flex flex-col overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-700 bg-slate-800/80 flex items-center gap-3">
+          <FileText className="w-4 h-4 text-blue-400" />
+          <span className="text-sm font-bold text-slate-200">备份日志 (run #{runId})</span>
+          <button
+            onClick={() => setIsFull(prev => !prev)}
+            className="ml-auto px-2 py-1 rounded-lg text-[10px] font-bold text-slate-300 hover:bg-slate-700 transition-colors shrink-0"
+          >
+            {isFull ? '显示尾部' : '加载完整'}
+          </button>
+          <button onClick={onClose} className="p-1 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-950/50 transition-colors shrink-0">
+            <Plus className="w-4 h-4 rotate-45" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto custom-scrollbar p-4">
+          {loading ? (
+            <div className="text-slate-400 text-sm">加载中...</div>
+          ) : (
+            <pre className="text-xs font-mono text-slate-300 whitespace-pre-wrap break-all">{content}</pre>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

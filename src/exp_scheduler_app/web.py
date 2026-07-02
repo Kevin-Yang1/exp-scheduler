@@ -13,10 +13,12 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .backup import BackupService
 from .conda_inventory import CondaInventoryService
 from .config import SchedulerConfig
 from .database import Database
-from .interactive_terminal import MAX_INPUT_BYTES, InteractiveTerminalService
+from .file_browser import FileBrowserService
+from .interactive_terminal import MAX_INPUT_BYTES, SNAPSHOT_CHUNK_BYTES, InteractiveTerminalService
 from .nodes import NodeRegistryService
 from .scheduler import SchedulerService
 from .system_terminal import NvitopTerminalService
@@ -63,6 +65,7 @@ class CreateTaskRequest(BaseModel):
     queue_name: str | None = None
     requested_gpu: int | None = None
     gpu_memory_budget_mb: int | None = Field(default=None, gt=0)
+    gpu_memory_reservation_mb: int | None = Field(default=None, gt=0)
     profile_id: int | None = None
     depends_on: list[int] = Field(default_factory=list)
 
@@ -190,10 +193,40 @@ class CreateInteractiveTerminalRequest(BaseModel):
     node_id: str = Field(min_length=1)
     cols: int = Field(default=160, ge=2, le=1000)
     rows: int = Field(default=48, ge=1, le=1000)
+    name: str | None = Field(default=None, max_length=100)
+    startup_command: str | None = Field(default=None, max_length=MAX_INPUT_BYTES)
 
 
 class TerminalInputRequest(BaseModel):
     data: str = Field(min_length=1, max_length=90000)
+
+
+class RenameTerminalRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class CreateBackupJobRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    src_node_id: str = Field(min_length=1)
+    src_path: str = Field(min_length=1)
+    dst_node_id: str = Field(min_length=1)
+    dst_path: str = Field(min_length=1)
+    schedule_type: str = Field(default="manual")
+    schedule_hour: int = Field(default=2, ge=0, le=23)
+    schedule_minute: int = Field(default=0, ge=0, le=59)
+    schedule_day_of_week: int | None = Field(default=None, ge=0, le=6)
+    enabled: bool = True
+    delete_extras: bool = False
+
+
+class UpdateBackupJobRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    enabled: bool | None = None
+    schedule_type: str | None = None
+    schedule_hour: int | None = Field(default=None, ge=0, le=23)
+    schedule_minute: int | None = Field(default=None, ge=0, le=59)
+    schedule_day_of_week: int | None = Field(default=None, ge=0, le=6)
+    delete_extras: bool | None = None
 
 
 def create_app(
@@ -207,7 +240,6 @@ def create_app(
     rsync_binary: str = "rsync",
     sshpass_binary: str = "sshpass",
     ssh_keygen_binary: str = "ssh-keygen",
-    interactive_command_builder=None,
     conda_inventory_runner=None,
 ) -> FastAPI:
     database = Database(config.db_path)
@@ -240,13 +272,17 @@ def create_app(
         sshpass_binary=sshpass_binary,
     )
     interactive_terminals = InteractiveTerminalService(
-        state_dir=config.state_dir / "interactive-terminals",
+        state_dir=config.state_dir,
+        terminal_log_dir=config.terminal_log_dir,
         events=scheduler.events,
         node_resolver=node_registry.resolve_auth,
         max_sessions=config.max_interactive_terminals,
-        idle_timeout_seconds=config.terminal_idle_timeout_seconds,
-        command_builder=interactive_command_builder,
+        history_limit=config.terminal_history_limit,
+        max_log_mb=config.terminal_max_log_mb,
+        remote_max_log_mb=config.terminal_remote_max_log_mb,
         known_hosts_path=node_registry.known_hosts_path(),
+        ssh_binary=ssh_binary,
+        sshpass_binary=sshpass_binary,
         database=database,
     )
     conda_inventory = CondaInventoryService(
@@ -254,17 +290,36 @@ def create_app(
         profile_discovery_provider=profile_discovery_provider,
         runner=conda_inventory_runner,
     )
+    file_browser = FileBrowserService(
+        node_resolver=node_registry.resolve_auth,
+        known_hosts_path=node_registry.known_hosts_path(),
+        ssh_binary=ssh_binary,
+        sshpass_binary=sshpass_binary,
+    )
+    backup = BackupService(
+        config=config,
+        database=database,
+        events=scheduler.events,
+        node_resolver=node_registry.resolve_auth,
+        known_hosts_path=node_registry.known_hosts_path(),
+        rsync_binary=rsync_binary,
+        ssh_binary=ssh_binary,
+        sshpass_binary=sshpass_binary,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if autostart:
             await scheduler.startup()
             await transfer.startup()
+            await interactive_terminals.reconcile_on_startup()
+            await backup.startup()
         try:
             yield
         finally:
             await interactive_terminals.shutdown()
             await transfer.shutdown()
+            await backup.shutdown()
             await nvitop_terminal.shutdown()
             if autostart:
                 await scheduler.shutdown()
@@ -414,6 +469,7 @@ def create_app(
                 queue_name=payload.queue_name,
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
+                gpu_memory_reservation_mb=payload.gpu_memory_reservation_mb,
                 profile_id=payload.profile_id,
                 depends_on_ids=payload.depends_on,
             )
@@ -439,6 +495,7 @@ def create_app(
                 queue_name=payload.queue_name,
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
+                gpu_memory_reservation_mb=payload.gpu_memory_reservation_mb,
                 profile_id=payload.profile_id,
                 depends_on_ids=payload.depends_on,
             )
@@ -523,6 +580,14 @@ def create_app(
     async def preempt_task_endpoint(task_id: int) -> dict[str, object]:
         try:
             await scheduler.preempt_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/api/tasks/{task_id}/interrupt")
+    async def interrupt_task_endpoint(task_id: int) -> dict[str, object]:
+        try:
+            await scheduler.interrupt_task_to_staged(task_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True}
@@ -973,6 +1038,18 @@ def create_app(
         except ValueError as exc:
             raise _value_error_to_http(exc) from exc
 
+    # ---------- 目录浏览 ----------
+
+    @app.get("/api/files/browse")
+    async def browse_directory_endpoint(
+        node_id: str = Query(min_length=1),
+        path: str = Query(default="~"),
+    ) -> dict[str, object]:
+        try:
+            return await file_browser.list_directory(node_id, path)
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+
     # ---------- 文件传输 ----------
     # 注意：/api/transfers/plan 与 /api/transfers/settings 必须声明在 /api/transfers/{job_id} 之前
 
@@ -1093,15 +1170,42 @@ def create_app(
     async def create_interactive_terminal_endpoint(
         payload: CreateInteractiveTerminalRequest,
     ) -> dict[str, object]:
+        startup_data = (
+            payload.startup_command.encode("utf-8")
+            if payload.startup_command
+            else None
+        )
+        if startup_data is not None and len(startup_data) > MAX_INPUT_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"启动命令超过 {MAX_INPUT_BYTES // 1024}KB 上限",
+            )
         try:
             session = await interactive_terminals.create_session(
                 payload.node_id,
                 cols=payload.cols,
                 rows=payload.rows,
+                name=payload.name,
             )
+            if startup_data is not None:
+                await interactive_terminals.write_startup_input(
+                    str(session["session_id"]),
+                    startup_data,
+                )
         except ValueError as exc:
             raise _value_error_to_http(exc) from exc
         return {"session": session}
+
+    @app.patch("/api/terminals/{session_id}")
+    async def rename_interactive_terminal_endpoint(
+        session_id: str,
+        payload: RenameTerminalRequest,
+    ) -> dict[str, object]:
+        try:
+            info = await interactive_terminals.rename_session(session_id, payload.name)
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+        return {"session": info}
 
     @app.get("/api/terminals/{session_id}/stream")
     async def get_interactive_terminal_stream_endpoint(
@@ -1120,13 +1224,27 @@ def create_app(
 
         async def event_stream():
             try:
+                # 分块 snapshot 协议：snapshot_start → snapshot_chunk* → snapshot_done
                 yield sse_message(
-                    "snapshot",
+                    "snapshot_start",
                     {
                         "session_id": session_id,
-                        "data": base64.b64encode(snapshot).decode("ascii"),
+                        "total_bytes": len(snapshot),
+                        "cols": _info.get("cols") if isinstance(_info, dict) else None,
+                        "rows": _info.get("rows") if isinstance(_info, dict) else None,
                     },
                 )
+                for offset in range(0, len(snapshot), SNAPSHOT_CHUNK_BYTES):
+                    chunk = snapshot[offset : offset + SNAPSHOT_CHUNK_BYTES]
+                    yield sse_message(
+                        "snapshot_chunk",
+                        {
+                            "session_id": session_id,
+                            "data": base64.b64encode(chunk).decode("ascii"),
+                        },
+                    )
+                yield sse_message("snapshot_done", {"session_id": session_id})
+                # live 流
                 while True:
                     chunk_task = asyncio.create_task(subscriber.chunk_queue.get())
                     control_task = asyncio.create_task(subscriber.control_queue.get())
@@ -1167,7 +1285,6 @@ def create_app(
         try:
             data = base64.b64decode(payload.data, validate=True)
         except ValueError as exc:
-            # binascii.Error 是 ValueError 子类
             raise HTTPException(status_code=400, detail="输入数据不是有效的 base64") from exc
         if len(data) > MAX_INPUT_BYTES:
             raise HTTPException(
@@ -1198,6 +1315,141 @@ def create_app(
         except ValueError as exc:
             raise _value_error_to_http(exc) from exc
         return {"ok": True}
+
+    @app.get("/api/terminals/{session_id}/log")
+    async def read_live_terminal_log_endpoint(
+        session_id: str,
+        tail: int | None = Query(default=None, ge=1, le=10 * 1024 * 1024),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        try:
+            data = await interactive_terminals.read_live_log(
+                session_id, tail_bytes=tail, offset=offset
+            )
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+        return {
+            "session_id": session_id,
+            "data": base64.b64encode(data).decode("ascii"),
+            "size": len(data),
+        }
+
+    # ---------- 归档终端日志 ----------
+
+    @app.get("/api/terminals/logs")
+    async def list_archived_terminal_logs_endpoint() -> dict[str, object]:
+        return {"archives": await interactive_terminals.list_archived()}
+
+    @app.get("/api/terminals/logs/{terminal_id}")
+    async def read_archived_terminal_log_endpoint(
+        terminal_id: str,
+        tail: int | None = Query(default=None, ge=1, le=10 * 1024 * 1024),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, object]:
+        try:
+            data = await interactive_terminals.read_archived_log(
+                terminal_id, tail_bytes=tail, offset=offset
+            )
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+        return {
+            "terminal_id": terminal_id,
+            "data": base64.b64encode(data).decode("ascii"),
+            "size": len(data),
+        }
+
+    # ---------- 定时备份 ----------
+
+    @app.get("/api/backups")
+    async def list_backup_jobs_endpoint() -> dict[str, object]:
+        return {"jobs": await backup.list_jobs()}
+
+    @app.post("/api/backups")
+    async def create_backup_job_endpoint(
+        payload: CreateBackupJobRequest,
+    ) -> dict[str, object]:
+        try:
+            job = await backup.create_job(
+                name=payload.name,
+                src_node_id=payload.src_node_id,
+                src_path=payload.src_path,
+                dst_node_id=payload.dst_node_id,
+                dst_path=payload.dst_path,
+                schedule_type=payload.schedule_type,
+                schedule_hour=payload.schedule_hour,
+                schedule_minute=payload.schedule_minute,
+                schedule_day_of_week=payload.schedule_day_of_week,
+                enabled=payload.enabled,
+                delete_extras=payload.delete_extras,
+            )
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+        return {"job": job}
+
+    @app.get("/api/backups/{job_id}")
+    async def get_backup_job_endpoint(job_id: str) -> dict[str, object]:
+        try:
+            job = await backup.get_job(job_id)
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"备份任务不存在: {job_id}")
+        return {"job": job}
+
+    @app.patch("/api/backups/{job_id}")
+    async def update_backup_job_endpoint(
+        job_id: str,
+        payload: UpdateBackupJobRequest,
+    ) -> dict[str, object]:
+        try:
+            job = await backup.update_job(
+                job_id,
+                name=payload.name,
+                enabled=payload.enabled,
+                schedule_type=payload.schedule_type,
+                schedule_hour=payload.schedule_hour,
+                schedule_minute=payload.schedule_minute,
+                schedule_day_of_week=payload.schedule_day_of_week,
+                delete_extras=payload.delete_extras,
+            )
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"备份任务不存在: {job_id}")
+        return {"job": job}
+
+    @app.delete("/api/backups/{job_id}")
+    async def delete_backup_job_endpoint(job_id: str) -> dict[str, object]:
+        try:
+            ok = await backup.delete_job(job_id)
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+        return {"ok": ok}
+
+    @app.post("/api/backups/{job_id}/run")
+    async def trigger_backup_run_endpoint(job_id: str) -> dict[str, object]:
+        try:
+            run = await backup.trigger_run(job_id)
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
+        return {"run": run}
+
+    @app.get("/api/backups/{job_id}/runs")
+    async def list_backup_runs_endpoint(
+        job_id: str,
+        limit: int = Query(default=50, ge=1, le=500),
+    ) -> dict[str, object]:
+        return {"runs": await backup.list_runs(job_id=job_id, limit=limit)}
+
+    @app.get("/api/backups/runs/{run_id}/log")
+    async def read_backup_run_log_endpoint(
+        run_id: int,
+        full: bool = Query(default=False),
+    ) -> dict[str, object]:
+        try:
+            return await backup.read_run_log(run_id, tail_bytes=None if full else 64 * 1024)
+        except ValueError as exc:
+            raise _value_error_to_http(exc) from exc
 
     # ---------- conda 环境对比 ----------
 

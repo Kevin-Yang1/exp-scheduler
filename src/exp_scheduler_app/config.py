@@ -19,6 +19,9 @@ DEFAULT_AUTO_RETRY_DELAY_SECONDS = 5
 DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS = 5 * 60
 DEFAULT_MAX_INTERACTIVE_TERMINALS = 16
 DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS = 30 * 60
+DEFAULT_TERMINAL_HISTORY_LIMIT = 100000
+DEFAULT_TERMINAL_MAX_LOG_MB = 200
+DEFAULT_TERMINAL_REMOTE_MAX_LOG_MB = 200
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "exp-scheduler" / "config.toml"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "share" / "exp-scheduler"
 
@@ -122,6 +125,10 @@ class SchedulerConfig:
     )
     max_interactive_terminals: int = DEFAULT_MAX_INTERACTIVE_TERMINALS
     terminal_idle_timeout_seconds: float = DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS
+    terminal_log_dir: Path = DEFAULT_STATE_DIR / "terminals"
+    terminal_history_limit: int = DEFAULT_TERMINAL_HISTORY_LIMIT
+    terminal_max_log_mb: int = DEFAULT_TERMINAL_MAX_LOG_MB
+    terminal_remote_max_log_mb: int = DEFAULT_TERMINAL_REMOTE_MAX_LOG_MB
     state_dir: Path = DEFAULT_STATE_DIR
     log_dir: Path = DEFAULT_STATE_DIR / "logs"
 
@@ -159,6 +166,9 @@ def _nonnegative_seconds(value: object, *, name: str) -> float:
 def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
     state_dir = _resolve_path(data.get("state_dir", DEFAULT_STATE_DIR))
     log_dir = _resolve_path(data.get("log_dir", state_dir / "logs"))
+    terminal_log_dir = _resolve_path(
+        data.get("terminal_log_dir", state_dir / "terminals")
+    )
     return SchedulerConfig(
         host=str(data.get("host", DEFAULT_HOST)),
         port=int(data.get("port", DEFAULT_PORT)),
@@ -202,8 +212,20 @@ def config_from_mapping(data: dict[str, object]) -> SchedulerConfig:
             ),
             name="terminal_idle_timeout_seconds",
         ),
+        terminal_history_limit=int(
+            data.get("terminal_history_limit", DEFAULT_TERMINAL_HISTORY_LIMIT)
+        ),
+        terminal_max_log_mb=int(
+            data.get("terminal_max_log_mb", DEFAULT_TERMINAL_MAX_LOG_MB)
+        ),
+        terminal_remote_max_log_mb=int(
+            data.get(
+                "terminal_remote_max_log_mb", DEFAULT_TERMINAL_REMOTE_MAX_LOG_MB
+            )
+        ),
         state_dir=state_dir,
         log_dir=log_dir,
+        terminal_log_dir=terminal_log_dir,
     )
 
 
@@ -223,8 +245,12 @@ def default_config_text() -> str:
             f"external_kill_gpu_cooldown_seconds = {DEFAULT_EXTERNAL_KILL_GPU_COOLDOWN_SECONDS}",
             f"max_interactive_terminals = {DEFAULT_MAX_INTERACTIVE_TERMINALS}",
             f"terminal_idle_timeout_seconds = {DEFAULT_TERMINAL_IDLE_TIMEOUT_SECONDS}",
+            f"terminal_history_limit = {DEFAULT_TERMINAL_HISTORY_LIMIT}",
+            f"terminal_max_log_mb = {DEFAULT_TERMINAL_MAX_LOG_MB}",
+            f"terminal_remote_max_log_mb = {DEFAULT_TERMINAL_REMOTE_MAX_LOG_MB}",
             f'state_dir = "{DEFAULT_STATE_DIR}"',
             f'log_dir = "{DEFAULT_STATE_DIR / "logs"}"',
+            f'terminal_log_dir = "{DEFAULT_STATE_DIR / "terminals"}"',
             "",
         ]
     )
@@ -233,6 +259,7 @@ def default_config_text() -> str:
 def ensure_directories(config: SchedulerConfig) -> None:
     config.state_dir.mkdir(parents=True, exist_ok=True)
     config.log_dir.mkdir(parents=True, exist_ok=True)
+    config.terminal_log_dir.mkdir(parents=True, exist_ok=True)
 
 
 def write_default_config(config_path: Path, *, force: bool = False) -> Path:

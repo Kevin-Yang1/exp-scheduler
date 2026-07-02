@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import uvicorn
 
 from .config import DEFAULT_CONFIG_PATH, check_port_available, init_config, load_config
 from .database import Database
+from .tmux_utils import ensure_tmux_installed, has_passwordless_sudo, detect_package_manager
 from .web import create_app
 
 
@@ -149,6 +151,48 @@ def run_doctor(config_path: Path) -> int:
     sshpass_path = shutil.which("sshpass")
     print(f"sshpass: {sshpass_path or '未安装（可选，仅密码认证的节点需要）'}")
 
+    # tmux 检查（持久终端依赖）：缺失时尝试自动安装
+    tmux_path = shutil.which("tmux")
+    if tmux_path:
+        print(f"tmux: {tmux_path}")
+    else:
+        print("tmux: missing → 尝试自动安装...")
+        can_sudo = has_passwordless_sudo()
+        is_root = os.geteuid() == 0
+        mgr = detect_package_manager()
+        if not (is_root or can_sudo):
+            print(
+                "  ✗ 无法自动安装: 需要 root 或 passwordless sudo 权限。"
+                f"请手动安装: {mgr + ' install tmux' if mgr else 'apt install tmux'}"
+            )
+        elif mgr is None:
+            print("  ✗ 无法自动安装: 未检测到支持的包管理器（apt-get/dnf/yum/pacman/zypper）")
+        else:
+            try:
+                tmux_path = ensure_tmux_installed()
+                print(f"  ✓ tmux 已安装: {tmux_path}")
+            except ValueError as exc:
+                print(f"  ✗ {exc}")
+
+    # terminal_log_dir 可写性检查
+    try:
+        config.terminal_log_dir.mkdir(parents=True, exist_ok=True)
+        (config.terminal_log_dir / ".write-test").write_text("ok", encoding="utf-8")
+        (config.terminal_log_dir / ".write-test").unlink()
+        print(f"terminal_log_dir 可写: {config.terminal_log_dir}")
+    except OSError as exc:
+        print(f"terminal_log_dir 不可写: {config.terminal_log_dir} ({exc})")
+        return 1
+    log_fstype = _state_dir_fstype(config.terminal_log_dir)
+    if log_fstype:
+        print(f"terminal_log_dir 文件系统: {log_fstype}")
+        if log_fstype in {"9p", "drvfs", "v9fs"}:
+            print(
+                "警告: terminal_log_dir 位于 9p/drvfs/v9fs 文件系统，"
+                "pipe-pane 日志写入可能不可靠，"
+                "请将 terminal_log_dir 移至 Linux 原生分区"
+            )
+
     # state_dir 文件系统：9p/drvfs 上 0600 私钥权限与 ssh-agent socket 不可用
     fstype = _state_dir_fstype(config.state_dir)
     if fstype:
@@ -162,8 +206,36 @@ def run_doctor(config_path: Path) -> int:
     return 0
 
 
+def _is_loopback_host(host: str) -> bool:
+    """判断 host 是否为 loopback 地址（仅允许本地连接）。"""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback
+    except ValueError:
+        return host in {"localhost", "localhost.localdomain"}
+
+
 def run_serve(config_path: Path) -> int:
     config = load_config(config_path)
+
+    # 校验 host 为 loopback（webssh 仅允许本地连接，通过 SSH 端口转发访问）
+    if not _is_loopback_host(config.host):
+        print(
+            f"错误: host={config.host} 不是 loopback 地址。"
+            "webssh 终端仅允许本地连接，请将 config.toml 中的 host 设为 127.0.0.1 或 ::1，"
+            "通过 SSH 端口转发（ssh -L {port}:127.0.0.1:{port} user@server）访问。"
+        )
+        return 1
+
+    # 确保 tmux 已安装（持久终端依赖）
+    try:
+        tmux_path = ensure_tmux_installed()
+        print(f"tmux: {tmux_path}")
+    except ValueError as exc:
+        print(f"tmux: {exc}")
+        return 1
+
     app = create_app(config)
     uvicorn.run(app, host=config.host, port=config.port, log_level="info")
     return 0
