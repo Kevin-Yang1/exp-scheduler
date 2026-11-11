@@ -6,26 +6,32 @@ from pathlib import Path
 import asyncio
 import base64
 import json
+import logging
+import time
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .backup import BackupService
 from .conda_inventory import CondaInventoryService
-from .config import SchedulerConfig
+from .config import SchedulerConfig, normalize_server_name, persist_server_name
 from .database import Database
 from .file_browser import FileBrowserService
 from .interactive_terminal import MAX_INPUT_BYTES, SNAPSHOT_CHUNK_BYTES, InteractiveTerminalService
 from .nodes import NodeRegistryService
+from .monitor_history import MonitorHistory, MonitorService
+from .processes import ProcessService, SORT_FIELDS
 from .scheduler import SchedulerService
+from .system_metrics import SystemMetrics
 from .system_terminal import NvitopTerminalService
 from .transfer import TransferService
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+LOGGER = logging.getLogger(__name__)
 
 
 def sse_message(event_name: str, payload: dict[str, object]) -> str:
@@ -53,6 +59,27 @@ def _value_error_to_http(exc: ValueError) -> HTTPException:
     else:
         status_code = 400
     return HTTPException(status_code=status_code, detail=message)
+
+
+class UpdateServerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    server_name: str = Field(min_length=1, max_length=80, strict=True)
+
+    @field_validator("server_name")
+    @classmethod
+    def validate_server_name(cls, value: str) -> str:
+        return normalize_server_name(value)
+
+
+class ProcessTarget(BaseModel):
+    pid: int = Field(gt=0)
+    create_time: float = Field(gt=0, allow_inf_nan=False)
+
+
+class SignalProcessesRequest(BaseModel):
+    targets: list[ProcessTarget] = Field(min_length=1, max_length=100)
+    action: Literal["terminate", "kill", "stop", "continue"]
+    boot_id: str = Field(min_length=1, max_length=80)
 
 
 class CreateTaskRequest(BaseModel):
@@ -243,12 +270,17 @@ def create_app(
     conda_inventory_runner=None,
 ) -> FastAPI:
     database = Database(config.db_path)
+    server_settings_lock = asyncio.Lock()
+    system_metrics = SystemMetrics()
     scheduler = SchedulerService(
         config=config,
         database=database,
         gpu_provider=gpu_provider,
         profile_discovery_provider=profile_discovery_provider,
     )
+    monitor_history = MonitorHistory(config.state_dir / "monitor.db")
+    monitor = MonitorService(monitor_history, system_metrics, scheduler.list_gpus)
+    processes = ProcessService(database.list_running_tasks)
     nvitop_terminal = NvitopTerminalService(
         state_dir=config.state_dir / "system-terminals",
         command=nvitop_command,
@@ -314,9 +346,12 @@ def create_app(
             await transfer.startup()
             await interactive_terminals.reconcile_on_startup()
             await backup.startup()
+            await monitor.startup()
         try:
             yield
         finally:
+            if autostart:
+                await monitor.shutdown()
             await interactive_terminals.shutdown()
             await transfer.shutdown()
             await backup.shutdown()
@@ -327,6 +362,8 @@ def create_app(
     app = FastAPI(title="exp-scheduler", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.state.scheduler = scheduler
+    app.state.monitor_history = monitor_history
+    app.state.processes = processes
     app.state.nvitop_terminal = nvitop_terminal
     app.state.node_registry = node_registry
     app.state.transfer = transfer
@@ -393,6 +430,21 @@ def create_app(
             "host": config.host,
             "port": config.port,
         }
+
+    @app.patch("/api/server")
+    async def update_server_info(payload: UpdateServerRequest) -> dict[str, object]:
+        async with server_settings_lock:
+            try:
+                await asyncio.to_thread(persist_server_name, config, payload.server_name)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail="服务器名称保存失败，请检查配置文件是否存在且可写") from exc
+            config.server_name = payload.server_name
+            node_registry.server_name = payload.server_name
+            result = await get_server_info()
+            await scheduler.events.publish("server_updated", result)
+            return result
 
     @app.get("/api/profiles")
     async def list_profiles() -> dict[str, object]:
@@ -634,6 +686,85 @@ def create_app(
     @app.get("/api/gpus")
     async def list_gpus_endpoint() -> dict[str, object]:
         return {"gpus": await scheduler.list_gpus()}
+
+    @app.get("/api/system/metrics")
+    def system_metrics_endpoint() -> dict[str, object]:
+        return system_metrics.snapshot()
+
+    @app.get("/api/system/history")
+    def system_history_endpoint(
+        start: float | None = Query(default=None, allow_inf_nan=False),
+        end: float | None = Query(default=None, allow_inf_nan=False),
+        max_points: int = Query(default=900, ge=50, le=2000),
+    ) -> dict:
+        end = time.time() if end is None else end
+        start = end - 3600 if start is None else start
+        try:
+            return monitor_history.query(start, end, max_points=max_points) | {"warning": monitor.error}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/system/processes")
+    async def list_processes_endpoint(
+        search: str = Query(default="", max_length=200),
+        user: str = Query(default="", max_length=100),
+        status: str = Query(default="", max_length=40),
+        scope: Literal["all", "mine", "gpu", "tasks"] = "all",
+        gpu: int | None = Query(default=None, ge=0),
+        sort: str = "cpu_percent",
+        descending: bool = True,
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=500),
+        tree: bool = False,
+    ) -> dict:
+        if sort not in SORT_FIELDS:
+            raise HTTPException(status_code=400, detail="不支持的排序字段")
+        gpu_error = None
+        try:
+            gpus = await scheduler.list_gpus()
+        except Exception:
+            gpus, gpu_error = [], "GPU 设备信息暂不可用"
+        result = await asyncio.to_thread(processes.query,
+            gpu_indices={gpu["uuid"]: gpu["index"] for gpu in gpus}, search=search, user=user,
+            status=status, scope=scope, gpu=gpu, sort=sort, descending=descending,
+            offset=offset, limit=limit, tree=tree)
+        if gpu_error:
+            result["gpu_error"] = gpu_error
+        return result
+
+    @app.get("/api/system/processes/{pid}")
+    def process_detail_endpoint(pid: int, create_time: float = Query(gt=0, allow_inf_nan=False), boot_id: str = Query(max_length=80)) -> dict:
+        import psutil
+        try:
+            return processes.detail(pid, create_time, boot_id)
+        except psutil.NoSuchProcess as exc:
+            raise HTTPException(status_code=410, detail="进程已退出") from exc
+        except psutil.AccessDenied as exc:
+            raise HTTPException(status_code=403, detail="无权读取进程详情") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/system/processes/signal")
+    async def signal_processes_endpoint(payload: SignalProcessesRequest, request: Request) -> dict:
+        origin = request.headers.get("origin")
+        expected_origin = f"{request.url.scheme}://{request.url.netloc}"
+        if request.headers.get("sec-fetch-site") == "cross-site" or (origin is not None and origin != expected_origin):
+            raise HTTPException(status_code=403, detail="进程操作仅接受同源请求")
+        if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
+            raise HTTPException(status_code=415, detail="请使用 application/json")
+        results = await asyncio.to_thread(processes.send_signal,
+            [target.model_dump() for target in payload.targets], payload.action, payload.boot_id)
+        audit_warning = None
+        try:
+            log = await asyncio.to_thread(database.add_operation_log,
+                level="warning", source="processes", action=f"process_{payload.action}", entity_type="process",
+                title=f"进程操作 {payload.action}：{sum(result['ok'] for result in results)}/{len(results)} 个信号已发送",
+                metadata={"results": results, "service_uid": processes.uid})
+            await scheduler.events.publish("operation_log_created", {"log_id": log["id"]})
+        except Exception:
+            LOGGER.exception("Failed to audit process operation")
+            audit_warning = "操作已执行，但系统日志写入失败"
+        return {"results": results, "audit_warning": audit_warning}
 
     @app.get("/api/settings")
     async def get_settings_endpoint() -> dict[str, object]:

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ipaddress
+import json
+import os
 from pathlib import Path
+import re
 import socket
+import stat
 import subprocess
+import tempfile
 import tomllib
 
 
@@ -131,6 +136,7 @@ class SchedulerConfig:
     terminal_remote_max_log_mb: int = DEFAULT_TERMINAL_REMOTE_MAX_LOG_MB
     state_dir: Path = DEFAULT_STATE_DIR
     log_dir: Path = DEFAULT_STATE_DIR / "logs"
+    source_path: Path | None = field(default=None, repr=False, compare=False)
 
     @property
     def db_path(self) -> Path:
@@ -279,8 +285,61 @@ def load_config(config_path: Path | None = None) -> SchedulerConfig:
         )
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     config = config_from_mapping(data)
+    config.source_path = path
     ensure_directories(config)
     return config
+
+
+def normalize_server_name(value: str) -> str:
+    name = value.strip()
+    if not name or len(name) > 80 or not name.isprintable():
+        raise ValueError("服务器名称须为 1–80 个可显示字符")
+    return name
+
+
+def persist_server_name(config: SchedulerConfig, value: str) -> None:
+    name = normalize_server_name(value)
+    if config.source_path is None:
+        raise ValueError("当前服务未绑定配置文件，无法持久化服务器名称")
+    path = config.source_path
+    original = path.read_bytes()
+    text = original.decode("utf-8")
+    current = tomllib.loads(text)
+    expected = current | {"server_name": name}
+    newline = "\r\n" if "\r\n" in text else "\n"
+    assignment = f"server_name = {json.dumps(name, ensure_ascii=False)}{newline}"
+    updated = assignment + text if "server_name" not in current else None
+    if updated is None:
+        # Validate the whole document before accepting a replacement. This also
+        # handles multiline values and avoids changing a similarly named table key.
+        for match in re.finditer(r'''(?m)^[ \t]*(?:server_name|"server_name"|'server_name')[ \t]*=''', text):
+            ends = [match.end() + item.end() for item in re.finditer("\n", text[match.end():])]
+            for end in [*ends, len(text)]:
+                candidate = text[:match.start()] + assignment + text[end:]
+                try:
+                    if tomllib.loads(candidate) == expected:
+                        updated = candidate
+                        break
+                except tomllib.TOMLDecodeError:
+                    continue
+            if updated is not None:
+                break
+    if updated is None or tomllib.loads(updated) != expected:
+        raise ValueError("无法安全更新服务器名称，请检查配置文件格式")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+            temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), stat.S_IMODE(path.stat().st_mode))
+            handle.write(updated.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.read_bytes() != original:
+            raise ValueError("配置文件已被其他操作修改，请重试")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def init_config(config_path: Path | None = None, *, force: bool = False) -> SchedulerConfig:

@@ -51,6 +51,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState, ReactNode, Fo
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
+import ResourceMonitor from './ResourceMonitor';
+import ThemeToggle from './ThemeToggle';
 
 // --- Types ---
 type GpuScheduleAction = 'enable' | 'disable';
@@ -474,7 +476,6 @@ export default function App() {
   const [historySort, setHistorySort] = useState<HistorySortKey>('finished_at');
   const [historyLimit, setHistoryLimit] = useState(HISTORY_PAGE_SIZE);
   const [isConsoleFullScreen, setIsConsoleFullScreen] = useState(false);
-  const [isNvitopFullScreen, setIsNvitopFullScreen] = useState(false);
   const [gpus, setGpus] = useState<GPUStatus[]>([]);
   const [isEditingTask, setIsEditingTask] = useState(false);
   const [dragState, setDragState] = useState<{ id: string, overId: string | null, position: 'before' | 'after' } | null>(null);
@@ -515,6 +516,7 @@ export default function App() {
   const [managedProfileId, setManagedProfileId] = useState('');
   const [profileDraft, setProfileDraft] = useState<Profile | null>(null);
   const [serverIp, setServerIp] = useState('读取中...');
+  const [serverName, setServerName] = useState('');
   const [message, setMessage] = useState('');
   const [nowMs, setNowMs] = useState(() => Date.now());
   const followRunningTaskRef = useRef(true);
@@ -711,6 +713,7 @@ export default function App() {
     });
     setGpuSchedule(settingsPayload.gpu_schedule || {});
     setServerIp(serverPayload.server_ip || serverPayload.server_name || 'unknown');
+    setServerName(serverPayload.server_name || '当前服务器');
     setSelectedTaskId(prev => {
       const runningTask = nextTasks.find(task => task.status === 'running') || null;
       const previousTask = prev ? nextTasks.find(task => task.id === prev) || null : null;
@@ -1329,8 +1332,8 @@ export default function App() {
           <NavItem
             active={activeTab === 'nvitop'}
             onClick={() => setActiveTab('nvitop')}
-            icon={<Terminal className="w-5 h-5" />}
-            label="GPU 监控"
+            icon={<Activity className="w-5 h-5" />}
+            label="资源监控"
           />
           <NavItem
             active={activeTab === 'sync'}
@@ -1369,51 +1372,13 @@ export default function App() {
             label="系统日志"
           />
 
-          <div className="mt-8 pt-6 border-t border-slate-100">
-            <p className="px-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3">活跃流水线</p>
-            <div className="space-y-2">
-              <div className="flex items-center gap-3 px-3 py-1.5 text-sm text-slate-600">
-                <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-sm shadow-emerald-500/20" />
-                <span className="font-medium">数据主同步</span>
-              </div>
-              <div className="flex items-center gap-3 px-3 py-1.5 text-sm text-slate-600">
-                <div className="w-2 h-2 rounded-full bg-blue-500 shadow-sm shadow-blue-500/20" />
-                <span className="font-medium">日志清理</span>
-              </div>
-            </div>
-          </div>
         </nav>
 
-        <div className="p-4 bg-slate-50/50 border-t border-slate-100">
-          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm space-y-3">
-            <div className="flex items-center gap-2 text-slate-500">
-              <Server className="w-4 h-4" />
-              <span className="text-xs font-bold truncate tracking-tight uppercase">高性能计算服务器</span>
-            </div>
-            <div className="space-y-1.5 pt-1 border-t border-slate-50">
-              <div className="flex justify-between text-[10px] font-bold text-slate-400 uppercase tracking-tighter">
-                <span>核心利用率</span>
-                <span>42%</span>
-              </div>
-              <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
-                <div className="bg-blue-500 h-full w-[42%] transition-all"></div>
-              </div>
-            </div>
-            <div className="flex items-center justify-between pt-1">
-              <div className="flex items-center gap-1.5">
-                <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                <span className="text-[10px] text-slate-500 font-medium tracking-tight">{serverIp}</span>
-              </div>
-              <button className="text-slate-400 hover:text-slate-600 transition-colors">
-                <RefreshCcw className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-        </div>
+        <ServerSummary serverName={serverName} serverIp={serverIp} gpuCount={gpus.length} runningTaskCount={runningTaskCount} onRename={setServerName} />
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col overflow-hidden relative">
+      <main className="flex-1 min-w-0 flex flex-col overflow-hidden relative">
         {/* Top Header */}
         <header className="h-16 bg-white border-b border-slate-200 px-6 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-3">
@@ -1422,7 +1387,7 @@ export default function App() {
 	              {activeTab === 'queue' && <Layers className="w-4 h-4" />}
 	              {activeTab === 'history' && <History className="w-4 h-4" />}
 	              {activeTab === 'activity' && <FileText className="w-4 h-4" />}
-	              {activeTab === 'nvitop' && <Terminal className="w-4 h-4" />}
+	              {activeTab === 'nvitop' && <Activity className="w-4 h-4" />}
 	              {activeTab === 'sync' && <ArrowLeftRight className="w-4 h-4" />}
 	              {activeTab === 'terminals' && <SquareTerminal className="w-4 h-4" />}
 	              {activeTab === 'conda' && <HardDrive className="w-4 h-4" />}
@@ -1434,7 +1399,7 @@ export default function App() {
 	              {activeTab === 'queue' && '任务队列'}
 	              {activeTab === 'history' && '历史记录'}
 	              {activeTab === 'activity' && '系统日志'}
-	              {activeTab === 'nvitop' && 'GPU 监控'}
+	              {activeTab === 'nvitop' && '资源监控'}
 	              {activeTab === 'sync' && '文件同步'}
 	              {activeTab === 'terminals' && '多终端'}
 	              {activeTab === 'conda' && 'Conda 环境对比'}
@@ -1444,6 +1409,7 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2.5">
+            <ThemeToggle />
             {isBatchDeleteMode && canUseBatchDelete ? (
               <>
                 <button
@@ -1609,24 +1575,8 @@ export default function App() {
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
-                className={isNvitopFullScreen ? "fixed inset-0 z-50 bg-slate-100 p-6 flex flex-col space-y-4" : "space-y-4"}
               >
-                <div className="flex items-center justify-between px-1 shrink-0">
-                  <h3 className="text-[10px] font-bold uppercase tracking-widest text-slate-400 flex items-center gap-2">
-                    <Terminal className="w-3.5 h-3.5" />
-                    nvitop GPU 终端
-                  </h3>
-                  <button
-                    onClick={() => setIsNvitopFullScreen(!isNvitopFullScreen)}
-                    className="p-1.5 bg-white border border-slate-200 rounded text-slate-500 hover:text-blue-600 hover:bg-blue-50 transition-colors"
-                    title={isNvitopFullScreen ? "退出全屏" : "全屏显示"}
-                  >
-                    {isNvitopFullScreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
-                  </button>
-                </div>
-                <div className={`bg-slate-900 rounded-2xl p-5 font-mono text-xs leading-relaxed shadow-xl overflow-hidden ${isNvitopFullScreen ? 'flex-1' : 'h-[calc(100vh-11rem)] min-h-[600px]'}`}>
-                  <NvitopTerminal />
-                </div>
+                <ResourceMonitor terminal={<NvitopTerminal />} tasks={runningTasks} />
               </motion.div>
             )}
 
@@ -2813,6 +2763,82 @@ export default function App() {
       </AnimatePresence>
     </div>
   );
+}
+
+function ServerSummary({ serverName, serverIp, gpuCount, runningTaskCount, onRename }: {
+  serverName: string; serverIp: string; gpuCount: number; runningTaskCount: number; onRename: (name: string) => void;
+}) {
+  const [host, setHost] = useState<{ cpu: { logical_count: number } | null; uptime_seconds: number | null } | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [nameError, setNameError] = useState('');
+
+  async function saveName(event: FormEvent) {
+    event.preventDefault();
+    if (saving || !nameDraft.trim()) return;
+    setSaving(true); setNameError('');
+    try {
+      const result = await api<{ server_name: string }>('/api/server', {
+        method: 'PATCH', body: JSON.stringify({ server_name: nameDraft.trim() }),
+      });
+      onRename(result.server_name); setEditing(false);
+    } catch (error) {
+      setNameError(error instanceof Error ? error.message : '服务器名称保存失败');
+    } finally { setSaving(false); }
+  }
+
+  useEffect(() => {
+    let disposed = false;
+    let timer: number;
+    let controller: AbortController;
+    async function refresh() {
+      if (document.hidden) { timer = window.setTimeout(refresh, 60000); return; }
+      controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 8000);
+      try {
+        const metrics = await api<{ cpu: { logical_count: number } | null; uptime_seconds: number | null }>('/api/system/metrics', { signal: controller.signal });
+        if (!disposed) setHost(metrics);
+      } catch {
+        // Keep the last host summary when a request temporarily fails.
+      } finally {
+        window.clearTimeout(timeout);
+        if (!disposed) timer = window.setTimeout(refresh, 60000);
+      }
+    }
+    void refresh();
+    return () => { disposed = true; window.clearTimeout(timer); controller?.abort(); };
+  }, []);
+
+  const seconds = host?.uptime_seconds;
+  const days = Math.floor((seconds ?? 0) / 86400), hours = Math.floor((seconds ?? 0) % 86400 / 3600);
+  const uptime = seconds == null ? '运行时间未知' : days ? `已运行 ${days} 天 ${hours} 小时` : `已运行 ${hours} 小时 ${Math.floor(seconds % 3600 / 60)} 分钟`;
+
+  return <section aria-label="服务器信息" className="px-5 py-4 border-t border-slate-100 text-slate-500 shrink-0">
+    <div className="flex items-center gap-2 text-xs font-medium text-slate-700">
+      <Server className="w-3.5 h-3.5 shrink-0" />
+      <span className="truncate flex-1" title={serverName}>{serverName || '当前服务器'}</span>
+      <button type="button" aria-label="修改服务器名称" title="修改服务器名称" disabled={editing} onClick={() => { setNameDraft(serverName); setNameError(''); setEditing(true); }} className="p-1 rounded text-slate-400 hover:text-blue-600 hover:bg-blue-50 disabled:opacity-40 shrink-0">
+        <Pencil className="w-3 h-3" />
+      </button>
+    </div>
+    {editing && <form onSubmit={saveName} className="mt-2 space-y-2" onKeyDown={event => { if (event.key === 'Escape' && !saving) { event.preventDefault(); setEditing(false); } }}>
+      <label className="block text-[11px] text-slate-600">服务器名称
+        <input autoFocus aria-label="服务器名称" value={nameDraft} onChange={event => setNameDraft(event.target.value)} maxLength={80} required disabled={saving} className="mt-1 w-full min-w-0 rounded border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
+      </label>
+      {nameError && <p role="alert" className="text-[11px] text-rose-600 break-words">{nameError}</p>}
+      <div className="flex items-center gap-2">
+        <button type="submit" disabled={saving || !nameDraft.trim()} className="rounded bg-blue-600 px-2.5 py-1 text-[11px] text-white hover:bg-blue-700 disabled:opacity-50">{saving ? '保存中…' : '保存'}</button>
+        <button type="button" disabled={saving} onClick={() => setEditing(false)} className="rounded border border-slate-200 bg-white px-2.5 py-1 text-[11px] text-slate-600 hover:bg-slate-50 disabled:opacity-50">取消</button>
+      </div>
+    </form>}
+    <div className="mt-1.5 text-[11px] pl-5.5 flex items-center gap-1.5">
+      <span className="truncate" title={serverIp}>{serverIp}</span>
+      <span className="shrink-0">· {host?.cpu ? `${host.cpu.logical_count} 核心` : '核心 —'}</span>
+    </div>
+    <p className="mt-1 text-[11px] pl-5.5">{uptime}</p>
+    <p className="mt-1 text-[11px] pl-5.5">{gpuCount} 张 GPU · {runningTaskCount} 个运行任务</p>
+  </section>;
 }
 
 function NavItem({ icon, label, active, count, onClick }: { icon: ReactNode, label: string, active?: boolean, count?: number, onClick: () => void }) {

@@ -1,0 +1,121 @@
+:root {
+  color-scheme: light;
+  --app-canvas: #f8fafc;
+  --app-surface: #fff;
+  --chart-blue: #2563eb;
+  --chart-green: #059669;
+  --chart-purple: #8b5cf6;
+  --chart-amber: #d97706;
+  --chart-cyan: #0891b2;
+  --chart-rose: #e11d48;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --app-canvas: #0b1220;
+  --app-surface: #131e30;
+  --app-subtle: #18253a;
+  --app-hover: #22324b;
+  --app-line: #2c3c53;
+  --app-line-soft: #223148;
+  --app-text: #e5edf9;
+  --app-secondary: #bfcee2;
+  --app-muted: #95a7c1;
+  --app-blue-bg: #172d4b;
+  --app-blue-line: #2c4c77;
+  --app-blue-text: #82b6ff;
+  --app-green-bg: #11352f;
+  --app-green-line: #24604e;
+  --app-green-text: #6ee7b7;
+  --app-amber-bg: #382d1c;
+  --app-amber-line: #66502a;
+  --app-amber-text: #fcd188;
+  --app-rose-bg: #3b2331;
+  --app-rose-line: #6e354a;
+  --app-rose-text: #fda4af;
+  --app-violet-bg: #2c2548;
+  --app-violet-line: #514375;
+  --app-violet-text: #c4b5fd;
+  --chart-blue: #60a5fa;
+  --chart-green: #34d399;
+  --chart-purple: #a78bfa;
+  --chart-amber: #fbbf24;
+  --chart-cyan: #22d3ee;
+  --chart-rose: #fb7185;
+  background: var(--app-canvas);
+}
+
+html[data-theme='dark'] body {
+  background: var(--app-canvas);
+  color: var(--app-text);
+}
+
+/* Adapt the shared utility palette; terminal and log surfaces keep their dark colors. */
+@layer utilities {
+  :where(html[data-theme='dark']) {
+    .bg-white { background-color: var(--app-surface); }
+    .bg-white\/50 { background-color: color-mix(in srgb, var(--app-surface) 50%, transparent); }
+    .bg-white\/70 { background-color: color-mix(in srgb, var(--app-surface) 70%, transparent); }
+    .bg-white\/80 { background-color: color-mix(in srgb, var(--app-surface) 80%, transparent); }
+    .bg-white\/90 { background-color: color-mix(in srgb, var(--app-surface) 90%, transparent); }
+    .bg-slate-50 { background-color: var(--app-canvas); }
+    .bg-slate-50\/30, .bg-slate-50\/40, .bg-slate-50\/50, .bg-slate-50\/60, .bg-slate-50\/80 { background-color: var(--app-subtle); }
+    .bg-slate-100 { background-color: var(--app-subtle); }
+    .bg-slate-200, .bg-slate-300 { background-color: #3b4c65; }
+    .text-slate-900, .text-slate-800 { color: var(--app-text); }
+    .text-slate-700, .text-slate-600 { color: var(--app-secondary); }
+    .text-slate-500, .text-slate-400 { color: var(--app-muted); }
+    .border-slate-50, .border-slate-100, .border-slate-100\/80 { border-color: var(--app-line-soft); }
+    .border-slate-200, .border-white\/70 { border-color: var(--app-line); }
+    .border-slate-300, .border-slate-400 { border-color: #425570; }
+    .divide-slate-50 > :not(:last-child) { border-color: var(--app-line-soft); }
+
+    .bg-blue-50, .bg-blue-50\/20, .bg-blue-50\/40, .bg-blue-100, .bg-blue-200 { background-color: var(--app-blue-bg); }
+    .text-blue-500, .text-blue-600, .text-blue-700, .text-blue-800 { color: var(--app-blue-text); }
+    .border-blue-100, .border-blue-200, .border-blue-300 { border-color: var(--app-blue-line); }
+    .ring-blue-100, .ring-blue-200 { --tw-ring-color: var(--app-blue-line); }
+    .bg-emerald-50, .bg-emerald-50\/30, .bg-emerald-50\/50, .bg-emerald-50\/60, .bg-emerald-100 { background-color: var(--app-green-bg); }
+    .text-emerald-500, .text-emerald-600, .text-emerald-700, .text-emerald-700\/80, .text-emerald-800 { color: var(--app-green-text); }
+    .border-emerald-100, .border-emerald-200 { border-color: var(--app-green-line); }
+    .bg-amber-50, .bg-amber-50\/40, .bg-amber-50\/70, .bg-amber-100 { background-color: var(--app-amber-bg); }
+    .text-amber-500, .text-amber-600, .text-amber-700 { color: var(--app-amber-text); }
+    .border-amber-100, .border-amber-200, .border-amber-300 { border-color: var(--app-amber-line); }
+    .bg-rose-50, .bg-rose-50\/30, .bg-rose-100 { background-color: var(--app-rose-bg); }
+    .text-rose-500, .text-rose-600, .text-rose-700 { color: var(--app-rose-text); }
+    .border-rose-100, .border-rose-200 { border-color: var(--app-rose-line); }
+    .bg-violet-50 { background-color: var(--app-violet-bg); }
+    .text-violet-600, .text-violet-700 { color: var(--app-violet-text); }
+    .border-violet-100 { border-color: var(--app-violet-line); }
+
+    .focus\:bg-white:focus { background-color: var(--app-surface); }
+    .peer-checked\:bg-white:is(:where(.peer):checked ~ *) { background-color: var(--app-surface); }
+    .peer-checked\:text-blue-600:is(:where(.peer):checked ~ *) { color: var(--app-blue-text); }
+    .disabled\:bg-slate-100:disabled { background-color: var(--app-subtle); }
+    .disabled\:bg-slate-300:disabled { background-color: #3b4c65; }
+    .disabled\:text-slate-400:disabled { color: var(--app-muted); }
+    @media (hover: hover) {
+      .hover\:bg-white:hover, .hover\:bg-slate-50:hover, .hover\:bg-slate-50\/40:hover, .hover\:bg-slate-50\/60:hover, .hover\:bg-slate-100:hover, .hover\:bg-slate-200:hover { background-color: var(--app-hover); }
+      .hover\:text-slate-600:hover, .hover\:text-slate-700:hover, .hover\:text-slate-900:hover { color: var(--app-text); }
+      .hover\:border-slate-300:hover { border-color: #425570; }
+      .group-hover\:text-slate-600:is(:where(.group):hover *) { color: var(--app-text); }
+      .hover\:bg-blue-50:hover, .hover\:bg-blue-50\/50:hover { background-color: var(--app-blue-bg); }
+      .hover\:text-blue-500:hover, .hover\:text-blue-600:hover { color: #add0ff; }
+      .hover\:border-blue-200:hover { border-color: var(--app-blue-line); }
+      .hover\:bg-emerald-50:hover { background-color: var(--app-green-bg); }
+      .hover\:text-emerald-600:hover { color: var(--app-green-text); }
+      .hover\:bg-amber-50:hover, .hover\:bg-amber-100:hover { background-color: var(--app-amber-bg); }
+      .hover\:text-amber-500:hover, .hover\:text-amber-600:hover { color: var(--app-amber-text); }
+      .hover\:bg-rose-50:hover, .hover\:bg-rose-50\/30:hover, .hover\:bg-rose-100:hover { background-color: var(--app-rose-bg); }
+      .hover\:text-rose-500:hover, .hover\:text-rose-600:hover { color: var(--app-rose-text); }
+      .hover\:border-rose-300:hover { border-color: var(--app-rose-line); }
+      .hover\:text-violet-600:hover { color: var(--app-violet-text); }
+    }
+  }
+}
+
+html[data-theme='dark'] ::-webkit-scrollbar-thumb {
+  background: #384a65;
+}
+html[data-theme='dark'] ::-webkit-scrollbar-thumb:hover {
+  background: #4d6383;
+}
