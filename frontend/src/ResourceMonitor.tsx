@@ -1,9 +1,10 @@
-import React, { ReactNode, useEffect, useId, useMemo, useState } from 'react';
-import { Activity, ArrowDown, ArrowUp, ChevronDown, Cpu, HardDrive, Maximize2, MemoryStick, Minimize2, Pause, Play, RefreshCcw, Terminal, TriangleAlert } from 'lucide-react';
+import React, { CSSProperties, ReactNode, useEffect, useId, useMemo, useState } from 'react';
+import { Activity, ArrowDown, ArrowUp, ChevronDown, Cpu, HardDrive, Info, Maximize2, MemoryStick, Minimize2, Pause, Play, RefreshCcw, Terminal, TriangleAlert } from 'lucide-react';
 import MonitorChart, { CHART_COLORS, ChartPoint, ChartSeries, formatBytes, formatPercent } from './MonitorChart';
 import './ResourceMonitor.css';
 import HistoryTimeline, { PERIODS, TimeWindow, useMonitorHistory } from './HistoryTimeline';
 import ProcessMonitor from './ProcessMonitor';
+import GpuProcesses from './GpuProcesses';
 
 interface HostMetrics {
   sampled_at: string;
@@ -71,6 +72,25 @@ function Meter({ value, label, warnAt = 101 }: { value: number | null; label: st
   </div>;
 }
 
+function LoadAverage({ values, cores }: { values?: number[] | null; cores?: number }) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  return <span className="rm-load-average">
+    <span className="rm-load-label">平均负载（任务数）
+    <span className="rm-load-help" onMouseEnter={() => setOpen(true)} onMouseLeave={event => { if (!event.currentTarget.contains(document.activeElement)) setOpen(false); }}>
+      <button type="button" aria-label="系统平均负载说明" aria-expanded={open} aria-controls={id} aria-describedby={open ? id : undefined} onFocus={() => setOpen(true)} onBlur={() => setOpen(false)} onClick={() => setOpen(true)} onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setOpen(false); } }}><Info size={12} aria-hidden="true" /></button>
+      {open && <span className="rm-load-tooltip" role="tooltip" id={id}>
+        <strong>系统平均负载是什么？</strong>
+        <span>分别显示过去 1、5、15 分钟的平均任务数，包括正在运行、等待 CPU 和不可中断等待（常见于磁盘 I/O）的任务。</span>
+        <span>负载的单位是任务数，不是 CPU 使用率百分比。数值越大，通常表示系统压力越大。</span>
+        {cores != null && cores > 0 && <span>当前有 {cores} 个逻辑核心。以 CPU 计算为主时，负载接近 {cores} 表示 CPU 接近满载；I/O 等待也会推高负载。</span>}
+      </span>}
+    </span>
+    </span>
+    <span className="rm-load-values">{[1, 5, 15].map((minutes, index) => <span className="rm-load-reading" key={minutes}><span>{minutes}分钟</span><b>{values?.[index] == null ? '—' : values[index].toFixed(2)}</b></span>)}</span>
+  </span>;
+}
+
 function Summary({ icon, label, value, detail }: { icon: ReactNode; label: string; value: string; detail: string }) {
   return <div className="rm-summary-item"><div className="rm-summary-label">{icon}{label}</div><div className="rm-summary-reading"><strong>{value}</strong><span>{detail}</span></div></div>;
 }
@@ -130,6 +150,7 @@ export default function ResourceMonitor({ terminal, tasks }: {
   const [customOpen, setCustomOpen] = useState(false);
   const [diskFilter, setDiskFilter] = useState('all');
   const [cursorTime, setCursorTime] = useState<number | null>(null);
+  const [processTarget, setProcessTarget] = useState<{ gpu?: number; pid?: number }>({});
   const id = useId();
   const terminalView = view === 'terminal';
   const inactive = terminalView || view === 'processes';
@@ -205,10 +226,13 @@ export default function ResourceMonitor({ terminal, tasks }: {
     range: range ?? { start: Date.now() - period, end: Date.now() }, stepSeconds: timeline.step_seconds,
     onZoom: (start: number, end: number) => { setPeriod(end - start); setRange({ start, end }); setCursorTime(null); } };
   const show = (section: View) => view === 'overview' || view === section;
+  const overview = view === 'overview';
+  const loadAverage = <LoadAverage values={cpu?.load_average} cores={cpu?.logical_count} />;
+  const swapUsage = memory?.swap_total_bytes === 0 ? '未启用' : `${formatBytes(memory?.swap_used_bytes)} / ${formatBytes(memory?.swap_total_bytes)}`;
   const partialErrors = Object.keys(host?.errors ?? {}).map(key => ({ cpu: 'CPU', memory: '内存', disks: '磁盘', disk_io: '磁盘读写', uptime_seconds: '运行时间' }[key] ?? (key.startsWith('disk:') ? `磁盘 ${key.slice(5)}` : '部分主机指标')));
 
   return (
-    <div className={`resource-monitor${fullScreen ? ' rm-fullscreen' : ''}`}>
+    <div className={`resource-monitor${overview ? ' rm-overview' : ''}${fullScreen ? ' rm-fullscreen' : ''}`}>
       <div className="rm-viewbar">
         <div className="rm-tabs" role="tablist" aria-label="资源监控视图" onKeyDown={event => {
           if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
@@ -218,7 +242,7 @@ export default function ResourceMonitor({ terminal, tasks }: {
           const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
           tabs[next].focus(); tabs[next].click();
         }}>
-          {[...VIEW_LABELS, { id: 'terminal' as View, label: 'nvitop 终端' }].map(tab => <button key={tab.id} id={`${id}-${tab.id}`} type="button" role="tab" aria-selected={view === tab.id} aria-controls={`${id}-panel`} tabIndex={view === tab.id ? 0 : -1} onClick={() => { setView(tab.id); setCursorTime(null); }}>{tab.id === 'terminal' && <Terminal size={13} />}{tab.label}</button>)}
+          {[...VIEW_LABELS, { id: 'terminal' as View, label: 'nvitop 终端' }].map(tab => <button key={tab.id} id={`${id}-${tab.id}`} type="button" role="tab" aria-selected={view === tab.id} aria-controls={`${id}-panel`} tabIndex={view === tab.id ? 0 : -1} onClick={() => { setView(tab.id); setCursorTime(null); if (tab.id === 'processes') setProcessTarget({}); }}>{tab.id === 'terminal' && <Terminal size={13} />}{tab.label}</button>)}
         </div>
         <div className="rm-view-controls">
           {!inactive && <span className="rm-update-time">{lastUpdate ? `更新于 ${new Date(lastUpdate).toLocaleTimeString('zh-CN', { hour12: false })}` : '等待采样'}</span>}
@@ -239,20 +263,20 @@ export default function ResourceMonitor({ terminal, tasks }: {
       </div>
 
       <div id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-${view}`} className="rm-panel">
-        {terminalView ? <div className="rm-terminal">{terminal}</div> : view === 'processes' ? <ProcessMonitor /> : <>
+        {terminalView ? <div className="rm-terminal">{terminal}</div> : view === 'processes' ? <ProcessMonitor initialGpu={processTarget.gpu} initialPid={processTarget.pid} /> : <>
           <HistoryTimeline period={period} range={range} onRange={setRange} onPeriod={setPeriod} coverageStart={timeline.coverage_start} step={timeline.step_seconds} customOpen={customOpen} onCustomOpen={setCustomOpen} />
           {timeline.error && <div className="rm-notice" role="alert"><TriangleAlert size={15} />历史数据：{timeline.error}</div>}
           {(error || gpuError || partialErrors.length > 0) && <div className="rm-notice" role="alert"><TriangleAlert size={15} /><span>{[error, gpuError, partialErrors.length ? `${partialErrors.join('、')}暂不可用` : ''].filter(Boolean).join('；')}</span></div>}
 
           <div className="rm-summary">
             <Summary icon={<Cpu size={14} />} label="GPU 使用率" value={formatPercent(averageGpu)} detail={`${gpus.length} 张设备 · ${gpus.filter(gpu => gpu.scheduler_occupied).length} 张运行任务`} />
-            <Summary icon={<Activity size={14} />} label="CPU 使用率" value={formatPercent(cpu?.percent)} detail={`负载 ${cpu?.load_average?.[0]?.toFixed(2) ?? '—'}`} />
+            <Summary icon={<Activity size={14} />} label="CPU 使用率" value={formatPercent(cpu?.percent)} detail={`1分钟负载 ${cpu?.load_average?.[0]?.toFixed(2) ?? '—'}`} />
             <Summary icon={<MemoryStick size={14} />} label="内存" value={formatPercent(memory?.percent)} detail={`${formatBytes(memory?.used_bytes)} / ${formatBytes(memory?.total_bytes)}`} />
             <Summary icon={<HardDrive size={14} />} label="存储可用" value={disks.length ? formatBytes(disks.reduce((sum, disk) => sum + disk.available_bytes, 0)) : '—'} detail={`${disks.length} 个文件系统`} />
           </div>
 
-          {show('gpu') && <section className="rm-section">
-            <SectionHeading title="GPU 设备" detail={`${gpus.length} 张`}><span className="rm-hint">使用率趋势 · 最近 2 分钟</span></SectionHeading>
+          {show('gpu') && <section className="rm-section rm-gpu-section">
+            {!overview && <><SectionHeading title="GPU 设备" detail={`${gpus.length} 张`}><span className="rm-hint">使用率趋势 · 最近 2 分钟</span></SectionHeading>
             <div className="rm-table-scroll"><table className="rm-table rm-gpu-table">
               <thead><tr><th scope="col">设备</th><th scope="col">状态</th><th scope="col">GPU 使用率</th><th scope="col">显存占用</th><th scope="col">趋势</th><th scope="col">当前任务</th></tr></thead>
               <tbody>{gpus.map(gpu => {
@@ -266,38 +290,105 @@ export default function ResourceMonitor({ terminal, tasks }: {
                   <td><span className="rm-task" title={task?.name}>{task ? <><span className="rm-task-id">#{task.id}</span>{task.name}</> : <span className="rm-secondary">—</span>}</span></td>
                 </tr>;
               })}</tbody>
-            </table></div>
+            </table></div></>}
             {!gpus.length && <EmptyState>{loading ? '正在读取 GPU…' : gpuError ? 'GPU 指标暂不可用' : '当前服务器没有可用的 GPU 设备'}</EmptyState>}
+            {gpus.length > 0 && <GpuProcesses gpus={gpus} paused={paused} refresh={refresh} onInspect={(gpu, pid) => { setProcessTarget({ gpu, pid }); setView('processes'); setCursorTime(null); }} renderDevice={overview ? index => {
+              const gpu = gpus.find(item => item.index === index);
+              if (!gpu) return null;
+              const task = tasks.find(task => task.gpu === index);
+              return <div className="rm-gpu-device">
+                <div className="rm-gpu-device-heading">
+                  <h4>GPU {index}</h4>
+                  <span className="rm-gpu-device-model" title={gpu.name}>{gpu.name}</span>
+                  <GPUState gpu={gpu} stale={Boolean(gpuError)} />
+                </div>
+                {task && <div className="rm-overview-gpu-task" title={task.name}>#{task.id} {task.name}</div>}
+                <div className="rm-overview-gpu-metrics">
+                  <div className="rm-gpu-metric">
+                    <span className="rm-gpu-metric-label">使用率</span>
+                    <div className="rm-gpu-metric-reading"><b>{formatPercent(gpu.utilization_gpu)}</b></div>
+                    <Meter value={gpu.utilization_gpu} label={`GPU ${index} 使用率`} />
+                  </div>
+                  <div className="rm-gpu-metric rm-gpu-metric-memory">
+                    <span className="rm-gpu-metric-label">显存</span>
+                    <div className="rm-gpu-metric-reading">
+                      <b>{formatBytes(gpu.memory_used_mb * 1024 ** 2)}</b>{' '}
+                      <span>/ {formatBytes(gpu.memory_total_mb * 1024 ** 2)}</span>
+                    </div>
+                    <Meter value={ratio(gpu.memory_used_mb, gpu.memory_total_mb)} label={`GPU ${index} 显存使用率`} warnAt={90} />
+                  </div>
+                </div>
+              </div>;
+            } : undefined} />}
             {view === 'gpu' && gpus.length > 0 && <div className="rm-chart-grid rm-detail-charts">
               <MonitorChart {...chartProps} title="GPU 计算使用率" subtitle="各设备使用率 · %" series={gpuSeries} formatValue={formatPercent} percent />
               <MonitorChart {...chartProps} title="GPU 显存使用率" subtitle="各设备显存占比 · %" series={vramSeries} formatValue={formatPercent} percent />
             </div>}
           </section>}
 
-          {show('cpu') && <section className="rm-section">
+          {show('cpu') && <section className="rm-section rm-cpu-section">
             <div className="rm-chart-grid">
-              <MonitorChart {...chartProps} title="CPU 使用率" subtitle={`${cpu?.logical_count ?? '—'} 个逻辑核心 · %`} series={CPU_SERIES} formatValue={formatPercent} percent />
-              <MonitorChart {...chartProps} title="内存使用量" subtitle={`总计 ${formatBytes(memory?.total_bytes)} · 可用 ${formatBytes(memory?.available_bytes)}`} series={MEMORY_SERIES} formatValue={bytesValue} />
+              <MonitorChart {...chartProps} compact={overview} title="CPU 使用率" subtitle={overview ? loadAverage : `${cpu?.logical_count ?? '—'} 个逻辑核心 · %`} series={CPU_SERIES} formatValue={formatPercent} percent />
+              <MonitorChart {...chartProps} compact={overview} title="内存使用量" subtitle={overview ? `Swap ${swapUsage}` : `总计 ${formatBytes(memory?.total_bytes)} · 可用 ${formatBytes(memory?.available_bytes)}`} series={MEMORY_SERIES} formatValue={bytesValue} />
             </div>
-            <div className="rm-resource-notes"><span>系统负载 <b>{cpu?.load_average?.map(value => value.toFixed(2)).join(' / ') ?? '—'}</b><em>1 / 5 / 15 分钟</em></span><span>Swap <b>{memory?.swap_total_bytes === 0 ? '未启用' : `${formatBytes(memory?.swap_used_bytes)} / ${formatBytes(memory?.swap_total_bytes)}`}</b></span></div>
-            <details className="rm-cores" open={view === 'cpu' || undefined}>
-              <summary><ChevronDown size={14} />CPU 核心详情<span>{cpu?.model ?? '处理器信息不可用'}</span></summary>
-              <div className="rm-core-grid">{cpu?.cores.map(core => <div key={core.index} className={core.percent != null && core.percent >= 90 ? 'is-high' : ''} title={`CPU ${core.index}: ${formatPercent(core.percent)}`}><span>{String(core.index).padStart(2, '0')}</span><strong>{formatPercent(core.percent)}</strong><Meter value={core.percent} label={`CPU ${core.index} 使用率`} /></div>) ?? <EmptyState>CPU 核心指标不可用</EmptyState>}</div>
-            </details>
+            {!overview && <div className="rm-resource-notes">
+              {loadAverage}
+              <span>Swap <b>{swapUsage}</b></span>
+            </div>}
           </section>}
 
-          {show('disk') && <section className="rm-section">
+          {show('disk') && <section className="rm-section rm-disk-section">
             <SectionHeading title="磁盘与存储" detail={`${disks.length} 个文件系统`}>
-              <div className="rm-io-summary"><span><ArrowDown size={12} />读取 <b>{formatBytes(sumRates(disks, 'read_bytes_per_second'), true)}</b></span><span><ArrowUp size={12} />写入 <b>{formatBytes(sumRates(disks, 'write_bytes_per_second'), true)}</b></span></div>
+              {overview ? <button type="button" className="rm-detail-link" onClick={() => setView('disk')}>磁盘详情 <ChevronDown size={12} /></button> : <div className="rm-io-summary"><span><ArrowDown size={12} />读取 <b>{formatBytes(sumRates(disks, 'read_bytes_per_second'), true)}</b></span><span><ArrowUp size={12} />写入 <b>{formatBytes(sumRates(disks, 'write_bytes_per_second'), true)}</b></span></div>}
             </SectionHeading>
-            <div className="rm-table-scroll"><table className="rm-table rm-disk-table">
-              <colgroup><col className="rm-disk-col-mount" /><col className="rm-disk-col-size" span={3} /><col className="rm-disk-col-usage" /><col className="rm-disk-col-rate" span={2} /></colgroup>
-              <thead><tr><th scope="col">挂载点 / 设备</th><th scope="col">容量</th><th scope="col">已用</th><th scope="col">可用</th><th scope="col">使用率</th><th scope="col">读取 / 秒</th><th scope="col">写入 / 秒</th></tr></thead>
+            {overview && <div className="rm-io-summary rm-overview-io"><span><ArrowDown size={12} />读取 <b>{formatBytes(sumRates(disks, 'read_bytes_per_second'), true)}</b></span><span><ArrowUp size={12} />写入 <b>{formatBytes(sumRates(disks, 'write_bytes_per_second'), true)}</b></span></div>}
+            <div className="rm-table-scroll"><table className={`rm-table rm-disk-table${overview ? ' rm-disk-table-compact' : ''}`}>
+              <colgroup>
+                <col className="rm-disk-col-mount" />
+                {overview ? <><col /><col className="rm-disk-col-usage" /><col className="rm-disk-col-rate" /></> :
+                  <><col className="rm-disk-col-size" span={3} /><col className="rm-disk-col-usage" /><col className="rm-disk-col-rate" span={2} /></>}
+              </colgroup>
+              <thead><tr>
+                <th scope="col">挂载点 / 设备</th>
+                {overview ? <>
+                  <th scope="col" className="rm-disk-capacity-cell">
+                    <div className="rm-disk-capacity">
+                      <span>已用</span><span className="rm-disk-capacity-separator"> / </span>
+                      <span>容量</span><span className="rm-disk-capacity-separator"> / </span><span>可用</span>
+                    </div>
+                  </th>
+                  <th scope="col">使用率</th><th scope="col">实时读写</th>
+                </> : <>
+                  <th scope="col">容量</th><th scope="col">已用</th><th scope="col">可用</th>
+                  <th scope="col">使用率</th><th scope="col">读取 / 秒</th><th scope="col">写入 / 秒</th>
+                </>}
+              </tr></thead>
               <tbody>{disks.map(disk => <tr key={disk.device_id}>
                 <th scope="row"><div className="rm-mount" title={disk.mountpoint}>{disk.mountpoint}<span title={`${disk.device} · ${disk.filesystem}`}>{disk.device} · {disk.filesystem}</span></div></th>
-                <td>{formatBytes(disk.total_bytes)}</td><td>{formatBytes(disk.used_bytes)}</td><td className={disk.percent >= 90 ? 'rm-danger' : ''}>{formatBytes(disk.available_bytes)}</td>
-                <td><div className="rm-usage"><strong className={disk.percent >= 90 ? 'rm-danger' : ''}>{formatPercent(disk.percent)}</strong><Meter value={disk.percent} label={`${disk.mountpoint} 磁盘使用率`} warnAt={90} /></div></td>
-                <td>{formatBytes(disk.read_bytes_per_second, true)}</td><td>{formatBytes(disk.write_bytes_per_second, true)}</td>
+                {overview ? <td className="rm-disk-capacity-cell">
+                  <div className="rm-disk-capacity">
+                    <span>{formatBytes(disk.used_bytes)}</span><span className="rm-disk-capacity-separator"> / </span>
+                    <span>{formatBytes(disk.total_bytes)}</span><span className="rm-disk-capacity-separator"> / </span>
+                    <span className={disk.percent >= 90 ? 'rm-danger' : ''}>{formatBytes(disk.available_bytes)}</span>
+                  </div>
+                </td> : <>
+                  <td>{formatBytes(disk.total_bytes)}</td>
+                  <td>{formatBytes(disk.used_bytes)}</td>
+                  <td className={disk.percent >= 90 ? 'rm-danger' : ''}>{formatBytes(disk.available_bytes)}</td>
+                </>}
+                <td>
+                  <div className="rm-usage">
+                    <strong className={disk.percent >= 90 ? 'rm-danger' : ''}>{formatPercent(disk.percent)}</strong>
+                    <Meter value={disk.percent} label={`${disk.mountpoint} 磁盘使用率`} warnAt={90} />
+                  </div>
+                </td>
+                {overview ? <td className="rm-disk-rates">
+                  <div><span title="读取">读</span><b>{formatBytes(disk.read_bytes_per_second, true)}</b></div>
+                  <div><span title="写入">写</span><b>{formatBytes(disk.write_bytes_per_second, true)}</b></div>
+                </td> : <>
+                  <td>{formatBytes(disk.read_bytes_per_second, true)}</td>
+                  <td>{formatBytes(disk.write_bytes_per_second, true)}</td>
+                </>}
               </tr>)}</tbody>
             </table></div>
             {!disks.length && <EmptyState>{loading ? '正在读取磁盘…' : '没有可用的本地文件系统指标'}</EmptyState>}
@@ -307,6 +398,21 @@ export default function ResourceMonitor({ terminal, tasks }: {
               <p className="rm-hint rm-io-note">未提供块设备计数的文件系统不计入读写合计。</p>
             </div>}
           </section>}
+          {show('cpu') && <details className="rm-cores" open={view === 'cpu' || undefined}>
+            <summary>
+              <ChevronDown size={14} />CPU 核心详情
+              {overview && cpu && <small>{cpu.logical_count} 个逻辑核心</small>}
+              <small className="rm-core-legend" title="每格代表一个逻辑核心，背景颜色越深，使用率越高"><span>0%</span><i aria-hidden="true" /><span>100%</span></small>
+              <span title={cpu?.model ?? undefined}>{cpu?.model ?? '处理器信息不可用'}</span>
+            </summary>
+            <div className="rm-core-grid" tabIndex={overview ? 0 : undefined} role={overview ? 'region' : undefined} aria-label={overview ? '逻辑核心使用率' : undefined}>
+              {cpu?.cores.map(core => <div key={core.index} className={`rm-core-cell${core.percent != null && core.percent >= 81 ? ' is-dark' : ''}`} style={core.percent == null ? undefined : { '--rm-core-usage': `${Math.max(0, Math.min(100, core.percent))}%` } as CSSProperties} title={`CPU ${core.index}: ${formatPercent(core.percent)}`}>
+                <span>{String(core.index).padStart(2, '0')}</span>
+                <strong>{formatPercent(core.percent)}</strong>
+                <Meter value={core.percent} label={`CPU ${core.index} 使用率`} />
+              </div>) ?? <EmptyState>CPU 核心指标不可用</EmptyState>}
+            </div>
+          </details>}
           <footer className="rm-footer"><span><i />{paused ? '刷新已暂停' : '每 2 秒更新'} · 悬停图表查看读数</span><span>服务端保留 7 天历史 · 阴影表示采样区间范围 · 空间不足 10% 标红</span></footer>
         </>}
       </div>

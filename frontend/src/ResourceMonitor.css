@@ -4,6 +4,10 @@
   --rm-muted: #68717d;
   --rm-line: #e4e7eb;
   --rm-soft: #f5f6f8;
+  --rm-core-fill: #1d4ed8;
+  --rm-core-border: #1d4ed8;
+  --rm-core-text: #000;
+  --rm-core-text-hot: #fff;
   container-type: inline-size;
   width: 100%;
   min-width: 0;
@@ -19,6 +23,10 @@
   --rm-muted: var(--app-muted);
   --rm-line: var(--app-line);
   --rm-soft: var(--app-subtle);
+  --rm-core-fill: #1e3a8a;
+  --rm-core-border: #60a5fa;
+  --rm-core-text: var(--app-text);
+  --rm-core-text-hot: var(--app-text);
   --rm-canvas: var(--app-canvas);
   --rm-secondary: var(--app-secondary);
   --rm-control-line: var(--app-line);
@@ -123,10 +131,213 @@
 .rm-task { display: block; max-width: 210px; overflow: hidden; text-overflow: ellipsis; }
 .rm-task-id { color: var(--rm-muted); margin-right: 6px; }
 .rm-secondary { color: var(--rm-muted); }
+.rm-gpu-processes { display: grid; gap: 10px; margin-top: 14px; min-width: 0; }
+.rm-gpu-processes > .rm-section-heading { margin-bottom: 0; }
+.rm-gpu-process-grid { display: grid; gap: 10px; min-width: 0; }
+.rm-gpu-process-panel { min-width: 0; }
+.rm-gpu-process-group { min-width: 0; border: 1px solid var(--rm-line); border-radius: 6px; background: var(--app-surface); overflow: hidden; }
+.rm-gpu-process-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; padding: 9px 14px; border-bottom: 1px solid var(--rm-line); }
+.rm-gpu-process-heading > div { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1 1 200px; }
+.rm-gpu-process-heading h4 { margin: 0; font-size: 12px; font-weight: 600; flex-shrink: 0; }
+.rm-gpu-process-heading > div > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--rm-muted); }
+.rm-gpu-process-count { font-size: 11px; color: var(--rm-muted); font-variant-numeric: tabular-nums; }
+.rm-gpu-process-heading button { display: inline-flex; align-items: center; gap: 3px; border: 0; background: none; padding: 0; color: var(--rm-accent); font-size: 11px; }
+.rm-gpu-processes .rm-gpu-process-scroll { max-height: 250px; overflow: auto; scrollbar-gutter: stable; border: 0; border-radius: 0; overflow-anchor: none; }
+.rm-gpu-process-table { min-width: 740px; table-layout: fixed; }
+.rm-gp-col-pid { width: 88px; }
+.rm-gp-col-user { width: 112px; }
+.rm-gp-col-memory { width: 120px; }
+.rm-gp-col-cpu { width: 90px; }
+.rm-gpu-process-table thead { position: sticky; top: 0; z-index: 1; }
+.rm-gpu-process-table thead th { padding: 7px 14px; font-size: 11px; }
+.rm-gpu-process-table tbody td { height: 34px; padding: 7px 14px; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+.rm-gpu-process-table :is(th, td):nth-child(3), .rm-gpu-process-table :is(th, td):nth-child(4) { text-align: right; }
+.rm-gpu-process-pid { border: 0; background: none; padding: 0; color: var(--rm-accent); font: inherit; }
+.rm-gpu-process-command { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.rm-gpu-process-command code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.rm-gpu-command-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.rm-gpu-inspect { display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0; padding: 0; border: 0; background: none; color: var(--rm-accent); font-size: 11px; font-weight: 400; }
+.rm-gpu-process-empty { padding: 14px; font-size: 12px; color: var(--rm-muted); }
+/* Keep the host summary in one row with CPU core details below it. */
+.rm-overview .rm-viewbar { margin-bottom: 4px; }
+.rm-overview .rm-panel { grid-template-columns: repeat(2, minmax(0, 1fr)) clamp(480px, 40%, 640px); gap: 8px 12px; }
+.rm-overview .rm-panel > :is(.rm-timeline, .rm-notice, .rm-summary, .rm-gpu-section, .rm-cores, .rm-footer) { grid-column: 1 / -1; }
+.rm-overview .rm-cpu-section { display: grid; grid-column: span 2; }
+.rm-overview .rm-summary-item { padding: 8px 14px; }
+.rm-overview .rm-summary-reading { margin-top: 1px; gap: 3px 9px; }
+.rm-overview .rm-summary-reading strong { font-size: 21px; }
+.rm-gpu-processes-compact { margin-top: 0; gap: 8px; }
+.rm-gpu-processes-compact .rm-gpu-process-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.rm-gpu-processes-compact .rm-gpu-process-group {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  border-radius: 9px;
+}
+.rm-gpu-device {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  border-right: 1px solid var(--rm-line);
+  padding: 8px 12px;
+  background: linear-gradient(110deg, color-mix(in srgb, var(--rm-accent) 5%, var(--app-surface)), var(--app-surface));
+}
+.rm-gpu-device-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.rm-gpu-device-heading h4 {
+  flex-shrink: 0;
+  margin: 0;
+  padding-inline: 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--rm-accent) 10%, var(--app-surface));
+  color: var(--rm-accent);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.rm-gpu-device-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--rm-muted); font-size: 11px; }
+.rm-gpu-device-heading .rm-state {
+  flex-shrink: 0;
+  margin-inline-start: auto;
+  padding-inline: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 11%, var(--app-surface));
+  font-size: 11px;
+}
+.rm-overview-gpu-task { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--rm-muted); font-size: 11px; }
+.rm-overview-gpu-metrics { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.65fr); gap: 6px; }
+.rm-gpu-metric {
+  --rm-meter-fill: var(--rm-accent);
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 2px;
+  min-width: 0;
+  padding: 4px 8px 6px;
+  border: 1px solid var(--rm-line);
+  border-radius: 6px;
+  background: var(--app-surface);
+}
+.rm-gpu-metric-memory { --rm-meter-fill: #8463d7; }
+.rm-gpu-metric-label { color: var(--rm-muted); font-size: 11px; line-height: 1.25; }
+.rm-gpu-metric-reading { color: var(--rm-text); font-size: 13px; font-variant-numeric: tabular-nums; line-height: 1.25; }
+.rm-gpu-metric-reading > * { white-space: nowrap; }
+.rm-gpu-metric-reading > span { color: var(--rm-muted); font-size: 11px; }
+.rm-gpu-metric .rm-meter {
+  min-width: 0;
+  width: 100%;
+  max-width: 116px;
+  height: 4px;
+  margin-top: 2px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--rm-meter-fill) 16%, var(--app-surface));
+}
+.rm-gpu-metric .rm-meter > span { border-radius: inherit; }
+.rm-gpu-processes-compact .rm-gpu-process-table { min-width: 430px; }
+.rm-gpu-processes-compact .rm-gp-col-pid { width: 96px; }
+.rm-gpu-processes-compact .rm-gp-col-user { width: 64px; }
+.rm-gpu-processes-compact .rm-gp-col-memory { width: 96px; }
+.rm-gpu-processes-compact .rm-gpu-process-table thead {
+  background: color-mix(in srgb, var(--rm-accent) 4%, var(--rm-table-head, #f8f9fa));
+}
+.rm-gpu-processes-compact .rm-gpu-process-table thead th { padding: 3px 10px; font-weight: 600; }
+.rm-gpu-processes-compact .rm-gpu-process-table tbody td { height: 26px; padding: 3px 10px; }
+.rm-gpu-processes-compact .rm-gpu-process-table :is(th, td):last-child { text-align: left; }
+.rm-gpu-processes-compact .rm-gpu-process-table tbody td:nth-child(3),
+.rm-gpu-processes-compact .rm-gpu-process-pid { font-weight: 600; }
+.rm-gpu-processes-compact .rm-gpu-process-command code { color: var(--rm-muted); }
+.rm-gpu-processes-compact .rm-gpu-process-command strong { color: var(--rm-text); }
+.rm-gpu-processes-compact :is(.rm-gpu-process-pid, .rm-gpu-inspect):hover { text-decoration: underline; text-underline-offset: 2px; }
+.rm-gpu-processes-compact .rm-gpu-process-scroll { max-height: 140px; }
+.rm-gpu-processes-compact .rm-gpu-process-empty { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; }
+.rm-overview :is(.rm-chart, .rm-disk-section) { padding: 9px 10px 7px; }
+.rm-overview .rm-chart-heading { margin-bottom: 3px; }
+.rm-overview .rm-chart-heading > strong { font-size: 15px; }
+.rm-overview .rm-cores,
+.rm-overview .rm-disk-section { border: 1px solid var(--rm-line); border-radius: 6px; background: var(--app-surface); }
+.rm-overview .rm-cores summary { padding: 6px 10px; }
+.rm-overview .rm-cores summary small { font-size: 11px; color: var(--rm-muted); }
+.rm-overview .rm-cores summary > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rm-overview .rm-cores[open] summary { border-bottom: 1px solid var(--rm-line); }
+.rm-overview .rm-core-grid {
+  grid-template-columns: repeat(auto-fill, min(72px, 100%));
+  gap: 5px;
+  max-height: 230px;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+.rm-overview .rm-core-grid > div:not(.rm-empty) { gap: 3px 2px; padding: 4px 2px; }
+.rm-overview .rm-core-grid > .rm-empty { grid-column: 1 / -1; }
+.rm-overview .rm-core-grid:focus-visible { outline: 2px solid var(--rm-accent); outline-offset: -2px; }
+.rm-detail-link { display: inline-flex; align-items: center; gap: 4px; border: 0; padding: 0; background: none; color: var(--rm-accent); font-size: 11px; }
+.rm-detail-link svg { transform: rotate(-90deg); }
+.rm-overview .rm-disk-section .rm-section-heading { margin-bottom: 2px; }
+.rm-overview-io { margin-bottom: 6px; gap: 2px 12px; }
+.rm-overview .rm-overview-io b { width: auto; }
+.rm-overview .rm-disk-table-compact { min-width: 430px; }
+.rm-overview .rm-disk-table-compact .rm-disk-col-mount { width: 100px; }
+.rm-overview .rm-disk-table-compact .rm-disk-col-usage { width: 64px; }
+.rm-overview .rm-disk-table-compact .rm-disk-col-rate { width: 94px; }
+.rm-overview .rm-disk-table thead th { padding: 4px 8px; font-size: 11px; }
+.rm-overview .rm-disk-table tbody :is(th, td) { padding: 3px 8px; font-size: 12px; }
+.rm-overview .rm-disk-table tbody td { overflow: hidden; text-overflow: ellipsis; }
+.rm-overview .rm-disk-table .rm-disk-capacity-cell { padding-inline: 1px; }
+.rm-overview .rm-disk-table tbody th { padding-inline-end: 4px; }
+.rm-overview .rm-mount { font-size: 12px; }
+.rm-overview .rm-mount span { font-size: 11px; }
+.rm-disk-capacity {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr) 4px) minmax(0, 1fr);
+  align-items: center;
+  gap: 1px;
+  font-size: 11px;
+  text-align: center;
+  white-space: normal;
+}
+.rm-disk-capacity-separator { color: var(--rm-muted); }
+.rm-overview .rm-disk-table .rm-usage { display: grid; gap: 4px; min-width: 0; max-width: none; }
+.rm-overview .rm-disk-table .rm-usage strong { font-size: 11px; }
+.rm-disk-table-compact .rm-usage .rm-meter { min-width: 0; }
+.rm-overview .rm-disk-table td.rm-disk-rates { font-size: 11px; }
+.rm-disk-rates > div { display: flex; justify-content: space-between; gap: 4px; max-width: 96px; margin-inline-start: auto; }
+.rm-disk-rates span { color: var(--rm-muted); }
+.rm-disk-rates b { font-weight: 500; }
+.rm-overview .rm-disk-section .rm-table-scroll { max-height: 200px; overflow: auto; scrollbar-gutter: stable; }
+.rm-overview .rm-disk-table thead { position: sticky; top: 0; z-index: 1; }
+.rm-overview .rm-footer { font-size: 10px; }
+@container (min-width: 1250px) {
+  .rm-overview .rm-disk-table-compact .rm-disk-col-usage { width: 22%; }
+  .rm-overview .rm-disk-table-compact .rm-disk-col-rate { width: 24%; }
+}
+@container (max-width: 950px) {
+  .rm-overview .rm-panel { grid-template-columns: minmax(0, 1fr); }
+  .rm-overview .rm-cpu-section { grid-column: 1; }
+}
+@container (max-width: 760px) {
+  .rm-gpu-processes-compact .rm-gpu-process-group { grid-template-columns: minmax(0, 1fr); }
+  .rm-gpu-device { border-right: 0; border-bottom: 1px solid var(--rm-line); }
+}
+@container (max-width: 260px) {
+  .rm-gpu-device { padding-inline: 6px; }
+  .rm-gpu-device-heading { flex-wrap: wrap; gap: 4px 6px; }
+  .rm-gpu-device-heading .rm-state { margin-inline-start: 0; white-space: normal; }
+  .rm-overview-gpu-metrics { grid-template-columns: minmax(0, 1fr); }
+}
 .rm-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .rm-chart { min-width: 0; background: var(--app-surface); border: 1px solid var(--rm-line); border-radius: 6px; padding: 13px 14px 10px; }
 .rm-chart-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
 .rm-chart-heading p { font-size: 11px; color: var(--rm-muted); margin-top: 2px; }
+.rm-load-average { position: relative; display: inline-flex; align-items: center; flex-wrap: wrap; gap: 2px 8px; max-width: 100%; color: var(--rm-muted); font-size: 11px; line-height: 1.5; vertical-align: middle; }
+.rm-load-label, .rm-load-reading { white-space: nowrap; }
+.rm-load-label { display: inline-flex; align-items: center; gap: 4px; }
+.rm-load-values { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; max-width: 100%; }
+.rm-load-reading { display: inline-flex; align-items: baseline; gap: 3px; }
+.rm-load-average .rm-load-reading b { margin: 0; color: var(--rm-secondary, #46505c); font-weight: 500; font-variant-numeric: tabular-nums; }
+.rm-load-help { display: inline-flex; align-items: center; }
+.rm-load-help button { display: inline-flex; align-items: center; justify-content: center; padding: 1px; border: 0; border-radius: 3px; background: none; color: var(--rm-muted); }
+.rm-load-help button:hover, .rm-load-help button:focus-visible { color: var(--rm-accent); }
+.rm-load-tooltip { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20; width: 320px; max-width: calc(100vw - 64px); padding: 10px 12px; border: 1px solid var(--rm-control-line, #d9dee5); border-radius: 5px; background: var(--rm-tooltip-bg, #fff); color: var(--rm-text); box-shadow: 0 3px 12px #172b4d20; font-size: 12px; font-weight: 400; line-height: 1.6; white-space: normal; }
+.rm-load-tooltip > span { display: block; margin-top: 5px; }
+.rm-load-tooltip strong { font-weight: 600; }
 .rm-chart-heading > strong { color: var(--rm-text); font-size: 17px; letter-spacing: -.3px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .rm-chart-plot { position: relative; min-width: 0; touch-action: pan-y; border-radius: 2px; }
 .rm-chart-plot > svg { display: block; overflow: visible; }
@@ -153,9 +364,14 @@
 .rm-cores summary > span { color: var(--rm-muted); font-size: 11px; margin-left: auto; }
 .rm-core-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 7px; padding: 4px 0 12px; }
 .rm-core-grid > div { display: grid; grid-template-columns: 1fr auto; gap: 6px; padding: 7px 8px; background: var(--app-surface); border: 1px solid var(--rm-line); border-radius: 4px; font-size: 11px; color: var(--rm-muted); font-variant-numeric: tabular-nums; }
-.rm-core-grid strong { font-weight: 500; color: var(--rm-secondary, #46505c); }
+.rm-core-grid > .rm-core-cell { background: color-mix(in srgb, var(--rm-core-fill) var(--rm-core-usage, 0%), var(--app-surface)); border-color: color-mix(in srgb, var(--rm-core-border) var(--rm-core-usage, 0%), var(--rm-line)); color: var(--rm-core-text); }
+.rm-core-grid > .rm-core-cell.is-dark { color: var(--rm-core-text-hot); }
+.rm-core-grid strong { font-weight: 500; color: inherit; }
 .rm-core-grid .rm-meter { grid-column: 1 / -1; min-width: 0; }
-.rm-core-grid > div.is-high strong { color: var(--rm-danger, #c64444); }
+.rm-core-cell .rm-meter { background: color-mix(in srgb, currentColor 14%, transparent); }
+.rm-core-cell .rm-meter > span { background: currentColor; }
+.rm-core-legend { display: inline-flex; align-items: center; gap: 4px; margin-inline-start: 4px; font-size: 11px; color: var(--rm-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rm-core-legend i { width: 56px; height: 6px; border: 1px solid var(--rm-line); border-radius: 2px; background: linear-gradient(to right, var(--app-surface), var(--rm-core-fill)); }
 .rm-disk-table { min-width: 1000px; table-layout: fixed; }
 .rm-disk-col-mount { width: 22%; }
 .rm-disk-col-size, .rm-disk-col-rate { width: 12%; }

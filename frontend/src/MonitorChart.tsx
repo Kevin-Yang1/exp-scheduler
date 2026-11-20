@@ -37,10 +37,10 @@ function clock(time: number) {
 }
 
 export default function MonitorChart({
-  title, subtitle, points, series, period, formatValue, percent = false, percentLimit = 100, cursorTime, onCursorTime, range, stepSeconds = 2, onZoom,
+  title, subtitle, points, series, period, formatValue, percent = false, percentLimit = 100, cursorTime, onCursorTime, range, stepSeconds = 2, onZoom, compact = false,
 }: {
   title: string;
-  subtitle?: string;
+  subtitle?: React.ReactNode;
   points: ChartPoint[];
   series: ChartSeries[];
   period: number;
@@ -52,6 +52,7 @@ export default function MonitorChart({
   range?: { start: number; end: number };
   stepSeconds?: number;
   onZoom?: (start: number, end: number) => void;
+  compact?: boolean;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(480);
@@ -70,7 +71,7 @@ export default function MonitorChart({
   const span = range ? range.end - range.start : Math.min(period, Math.max(10000, end - (points[0]?.time ?? end)));
   const start = end - span;
   const visible = useMemo(() => points.filter(point => point.time >= start && point.time <= end), [points, start, end]);
-  const height = 160, left = 60, right = width - 14, top = 12, bottom = height - 28;
+  const height = compact ? 144 : 160, left = 60, right = width - 14, top = 12, bottom = height - 28;
   const values = visible.flatMap(point => series.flatMap(item => [point.values[item.key], point.maximum?.[item.key]]).filter((value): value is number => value != null));
   const maximum = Math.max(0, ...values);
   const unit = 1024 ** Math.max(0, Math.floor(Math.log(Math.max(1, maximum)) / Math.log(1024)));
@@ -178,7 +179,7 @@ export default function MonitorChart({
           {series.map(item => <React.Fragment key={item.key}><div><span><i style={{ background: item.color }} />{item.label}</span><strong>{formatValue(selected.values[item.key] ?? null)}</strong></div>{selected.maximum?.[item.key] != null && selected.maximum[item.key] !== selected.values[item.key] && <small>区间峰值 {formatValue(selected.maximum[item.key])}</small>}</React.Fragment>)}
         </div>}
       </div>
-      <div className="rm-chart-legend">{series.map(item => <span key={item.key}><i style={{ background: item.color }} />{item.label}{series.length > 1 && <b>{formatValue(latest?.values[item.key] ?? null)}</b>}</span>)}</div>
+      {(!compact || series.length > 1) && <div className="rm-chart-legend">{series.map(item => <span key={item.key}><i style={{ background: item.color }} />{item.label}{series.length > 1 && <b>{formatValue(latest?.values[item.key] ?? null)}</b>}</span>)}</div>}
     </section>
   );
 }

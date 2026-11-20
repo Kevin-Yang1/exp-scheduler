@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, Copy, Pause, Play, RefreshCcw, Search, Square, X } from 'lucide-react';
 import MonitorChart, { CHART_COLORS, ChartPoint, formatBytes, formatPercent } from './MonitorChart';
 
-interface ProcessRow {
+export interface ProcessRow {
   pid: number; ppid: number; create_time: number; uid: number; user: string; name: string;
   command: string; status: string; cpu_percent: number | null; memory_percent: number;
   rss_bytes: number; vms_bytes: number; elapsed_seconds: number; cpu_seconds: number;
@@ -12,7 +12,7 @@ interface ProcessRow {
   task: { id: number; name: string } | null;
   can_signal: boolean; signal_disabled_reason: string | null; context: boolean;
 }
-interface ProcessResponse {
+export interface ProcessResponse {
   items: ProcessRow[]; total: number; all_total: number; sampled_at: number; boot_id: string;
   service_uid: number; users: string[]; statuses: string[]; gpu_indices: number[]; gpu_error: string | null;
 }
@@ -58,10 +58,10 @@ function ProcessDialog({ title, onClose, children, drawer = false }: { title: st
   </div>, document.body);
 }
 
-export default function ProcessMonitor() {
+export default function ProcessMonitor({ initialGpu, initialPid }: { initialGpu?: number; initialPid?: number } = {}) {
   const [data, setData] = useState<ProcessResponse | null>(null);
-  const [search, setSearch] = useState(''), [query, setQuery] = useState('');
-  const [scope, setScope] = useState('all'), [user, setUser] = useState(''), [status, setStatus] = useState(''), [gpu, setGpu] = useState('');
+  const [search, setSearch] = useState(initialPid == null ? '' : String(initialPid)), [query, setQuery] = useState(search);
+  const [scope, setScope] = useState(initialGpu == null ? 'all' : 'gpu'), [user, setUser] = useState(''), [status, setStatus] = useState(''), [gpu, setGpu] = useState(initialGpu == null ? '' : String(initialGpu));
   const [sort, setSort] = useState('cpu_percent'), [descending, setDescending] = useState(true);
   const [mode, setMode] = useState('list'), [offset, setOffset] = useState(0);
   const [paused, setPaused] = useState(false), [refresh, setRefresh] = useState(0), [loading, setLoading] = useState(true);
