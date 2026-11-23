@@ -19,6 +19,7 @@ VALID_QUEUE_NAMES = {NORMAL_QUEUE, URGENT_QUEUE, STAGED_QUEUE}
 SCHEDULER_SETTINGS_META_KEY = "scheduler_settings"
 TRANSFER_SETTINGS_META_KEY = "transfer_settings"
 TERMINAL_LOG_DIR_META_KEY = "terminal_log_dir"
+DISK_DISPLAY_ORDER_META_KEY = "disk_display_order"
 
 # 主控自身的隐含伪节点 id（不入 nodes 表）
 LOCAL_NODE_ID = "local"
@@ -1527,6 +1528,28 @@ class Database:
             )
             conn.commit()
         return paused
+
+    def get_disk_display_order(self) -> list[str]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (DISK_DISPLAY_ORDER_META_KEY,)).fetchone()
+        if row is None:
+            return []
+        try:
+            order = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(order, list) or not all(isinstance(item, str) for item in order):
+            return []
+        return list(dict.fromkeys(order))
+
+    def set_disk_display_order(self, mountpoints: list[str]) -> list[str]:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (DISK_DISPLAY_ORDER_META_KEY, json.dumps(mountpoints, ensure_ascii=False)),
+            )
+            conn.commit()
+        return mountpoints
 
     def get_scheduler_settings(self) -> dict[str, object] | None:
         with self._lock, self._connect() as conn:

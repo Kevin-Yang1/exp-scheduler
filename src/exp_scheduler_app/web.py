@@ -71,6 +71,20 @@ class UpdateServerRequest(BaseModel):
         return normalize_server_name(value)
 
 
+class UpdateDiskOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mountpoints: list[str] = Field(max_length=1024)
+
+    @field_validator("mountpoints")
+    @classmethod
+    def validate_mountpoints(cls, value: list[str]) -> list[str]:
+        if any(not path.startswith("/") or len(path) > 4096 or "\x00" in path for path in value):
+            raise ValueError("挂载路径必须以 / 开头，长度不超过 4096 且不包含空字符")
+        if len(set(value)) != len(value):
+            raise ValueError("挂载路径不能重复")
+        return value
+
+
 class ProcessTarget(BaseModel):
     pid: int = Field(gt=0)
     create_time: float = Field(gt=0, allow_inf_nan=False)
@@ -686,7 +700,21 @@ def create_app(
 
     @app.get("/api/system/metrics")
     def system_metrics_endpoint() -> dict[str, object]:
-        return system_metrics.snapshot()
+        payload = system_metrics.snapshot()
+        order = database.get_disk_display_order()
+        ranks = {mountpoint: index for index, mountpoint in enumerate(order)}
+        return payload | {
+            "disk_order": order,
+            "disks": sorted(payload["disks"], key=lambda disk: ranks.get(disk["mountpoint"], len(ranks))),
+        }
+
+    @app.get("/api/system/disks/order")
+    def get_disk_order_endpoint() -> dict[str, object]:
+        return {"mountpoints": database.get_disk_display_order()}
+
+    @app.put("/api/system/disks/order")
+    def update_disk_order_endpoint(payload: UpdateDiskOrderRequest) -> dict[str, object]:
+        return {"mountpoints": database.set_disk_display_order(payload.mountpoints)}
 
     @app.get("/api/system/history")
     def system_history_endpoint(

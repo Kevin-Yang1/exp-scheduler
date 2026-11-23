@@ -27,6 +27,7 @@
   --rm-core-border: #60a5fa;
   --rm-core-text: var(--app-text);
   --rm-core-text-hot: var(--app-text);
+  --rm-order-label: #07182d;
   --rm-canvas: var(--app-canvas);
   --rm-secondary: var(--app-secondary);
   --rm-control-line: var(--app-line);
@@ -158,11 +159,16 @@
 .rm-gpu-command-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .rm-gpu-inspect { display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0; padding: 0; border: 0; background: none; color: var(--rm-accent); font-size: 11px; font-weight: 400; }
 .rm-gpu-process-empty { padding: 14px; font-size: 12px; color: var(--rm-muted); }
-/* Keep the host summary in one row with CPU core details below it. */
+/* Let the stacked charts determine the height of the independently scrolling disk list. */
 .rm-overview .rm-viewbar { margin-bottom: 4px; }
-.rm-overview .rm-panel { grid-template-columns: repeat(2, minmax(0, 1fr)) clamp(480px, 40%, 640px); gap: 8px 12px; }
+.rm-overview .rm-panel { grid-template-columns: minmax(0, 1fr); gap: 8px 12px; }
 .rm-overview .rm-panel > :is(.rm-timeline, .rm-notice, .rm-summary, .rm-gpu-section, .rm-cores, .rm-footer) { grid-column: 1 / -1; }
-.rm-overview .rm-cpu-section { display: grid; grid-column: span 2; }
+.rm-host-resources { display: contents; }
+.rm-host-overview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(480px, 1fr); align-items: start; gap: 12px; min-width: 0; }
+.rm-overview .rm-cpu-section { min-width: 0; }
+.rm-overview .rm-cpu-section .rm-chart-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.rm-overview .rm-disk-section { display: flex; flex-direction: column; align-self: stretch; min-height: 0; contain: size; }
+.rm-overview .rm-disk-section > :is(.rm-section-heading, .rm-disk-toolbar, .rm-disk-order-error) { flex-shrink: 0; }
 .rm-overview .rm-summary-item { padding: 8px 14px; }
 .rm-overview .rm-summary-reading { margin-top: 1px; gap: 3px 9px; }
 .rm-overview .rm-summary-reading strong { font-size: 21px; }
@@ -271,8 +277,31 @@
 .rm-detail-link { display: inline-flex; align-items: center; gap: 4px; border: 0; padding: 0; background: none; color: var(--rm-accent); font-size: 11px; }
 .rm-detail-link svg { transform: rotate(-90deg); }
 .rm-overview .rm-disk-section .rm-section-heading { margin-bottom: 2px; }
-.rm-overview-io { margin-bottom: 6px; gap: 2px 12px; }
-.rm-overview .rm-overview-io b { width: auto; }
+.rm-disk-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; min-width: 0; }
+.rm-disk-toolbar .rm-io-summary { gap: 2px 12px; min-width: 0; }
+.rm-disk-toolbar .rm-io-summary b { width: auto; }
+.resource-monitor .rm-disk-order-button {
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; gap: 4px;
+  width: 76px; height: 24px; padding: 2px 6px; border: 1px solid var(--rm-line); border-radius: 5px;
+  background: var(--app-surface); color: var(--rm-text); font-size: 11px;
+}
+.rm-disk-order-button:hover:not(:disabled) { background: var(--rm-soft); }
+.rm-disk-order-button.is-saving { background: var(--rm-accent); color: var(--rm-order-label, #fff); border-color: transparent; }
+.rm-disk-order-button.is-saving:hover:not(:disabled) { background: color-mix(in srgb, var(--rm-accent) 85%, var(--rm-text)); }
+.rm-disk-order-button svg { flex-shrink: 0; }
+.rm-disk-order-button:disabled, .rm-disk-moves button:disabled { opacity: .4; cursor: default; }
+.rm-disk-order-error { padding-bottom: 6px; color: var(--rm-danger, #dc2626); font-size: 11px; }
+.rm-disk-identity { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.rm-disk-identity .rm-mount { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resource-monitor .rm-disk-grip { display: inline-flex; flex-shrink: 0; padding: 3px 0; border: 0; background: none; color: var(--rm-muted); cursor: grab; }
+.resource-monitor .rm-disk-grip:active { cursor: grabbing; }
+.rm-disk-col-move { width: 72px; }
+.rm-disk-moves { display: flex; justify-content: flex-end; gap: 3px; }
+.rm-disk-moves button { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 3px; border: 1px solid var(--rm-line); border-radius: 5px; background: var(--app-surface); color: var(--rm-text); }
+.rm-disk-moves button:hover:not(:disabled) { background: var(--rm-soft); }
+.rm-disk-table tr[data-drop='before'] > * { box-shadow: inset 0 2px var(--rm-accent); }
+.rm-disk-table tr[data-drop='after'] > * { box-shadow: inset 0 -2px var(--rm-accent); }
+.rm-overview .is-sorting .rm-disk-table-compact { min-width: 500px; }
 .rm-overview .rm-disk-table-compact { min-width: 430px; }
 .rm-overview .rm-disk-table-compact .rm-disk-col-mount { width: 100px; }
 .rm-overview .rm-disk-table-compact .rm-disk-col-usage { width: 64px; }
@@ -301,7 +330,8 @@
 .rm-disk-rates > div { display: flex; justify-content: space-between; gap: 4px; max-width: 96px; margin-inline-start: auto; }
 .rm-disk-rates span { color: var(--rm-muted); }
 .rm-disk-rates b { font-weight: 500; }
-.rm-overview .rm-disk-section .rm-table-scroll { max-height: 200px; overflow: auto; scrollbar-gutter: stable; }
+.rm-overview .rm-disk-section .rm-table-scroll { flex: 1; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
+.rm-overview .rm-disk-section .rm-table-scroll:focus-visible { outline: 2px solid var(--rm-accent); outline-offset: -2px; }
 .rm-overview .rm-disk-table thead { position: sticky; top: 0; z-index: 1; }
 .rm-overview .rm-footer { font-size: 10px; }
 @container (min-width: 1250px) {
@@ -309,8 +339,13 @@
   .rm-overview .rm-disk-table-compact .rm-disk-col-rate { width: 24%; }
 }
 @container (max-width: 950px) {
-  .rm-overview .rm-panel { grid-template-columns: minmax(0, 1fr); }
-  .rm-overview .rm-cpu-section { grid-column: 1; }
+  .rm-host-overview { grid-template-columns: minmax(0, 1fr); }
+  .rm-overview .rm-disk-section { contain: none; max-height: 420px; }
+}
+@media (pointer: coarse) {
+  .resource-monitor .rm-disk-order-button { min-height: 44px; }
+  .rm-disk-moves button, .rm-disk-grip { min-width: 44px; min-height: 44px; }
+  .rm-disk-col-move { width: 112px; }
 }
 @container (max-width: 760px) {
   .rm-gpu-processes-compact .rm-gpu-process-group { grid-template-columns: minmax(0, 1fr); }

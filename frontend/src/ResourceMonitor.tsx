@@ -1,10 +1,11 @@
-import React, { CSSProperties, ReactNode, useEffect, useId, useMemo, useState } from 'react';
-import { Activity, ArrowDown, ArrowUp, ChevronDown, Cpu, HardDrive, Info, Maximize2, MemoryStick, Minimize2, Pause, Play, RefreshCcw, Terminal, TriangleAlert } from 'lucide-react';
+import React, { CSSProperties, ReactNode, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Activity, ArrowDown, ArrowUp, Check, ChevronDown, Cpu, GripVertical, HardDrive, Info, ListOrdered, LoaderCircle, Maximize2, MemoryStick, Minimize2, Pause, Play, RefreshCcw, Terminal, TriangleAlert } from 'lucide-react';
 import MonitorChart, { CHART_COLORS, ChartPoint, ChartSeries, formatBytes, formatPercent } from './MonitorChart';
 import './ResourceMonitor.css';
 import HistoryTimeline, { PERIODS, TimeWindow, useMonitorHistory } from './HistoryTimeline';
 import ProcessMonitor from './ProcessMonitor';
 import GpuProcesses from './GpuProcesses';
+import useDiskOrder from './useDiskOrder';
 
 interface HostMetrics {
   sampled_at: string;
@@ -12,6 +13,7 @@ interface HostMetrics {
   cpu: { percent: number | null; logical_count: number; model: string | null; load_average: number[] | null; cores: { index: number; percent: number | null }[] } | null;
   memory: { total_bytes: number; used_bytes: number; available_bytes: number; percent: number; swap_total_bytes: number; swap_used_bytes: number; swap_percent: number } | null;
   disks: DiskMetrics[];
+  disk_order?: string[];
   errors: Record<string, string>;
 }
 
@@ -151,6 +153,13 @@ export default function ResourceMonitor({ terminal, tasks }: {
   const [diskFilter, setDiskFilter] = useState('all');
   const [cursorTime, setCursorTime] = useState<number | null>(null);
   const [processTarget, setProcessTarget] = useState<{ gpu?: number; pid?: number }>({});
+  const diskSection = useRef<HTMLElement>(null);
+  const draggedDisk = useRef<string | null>(null);
+  const [diskDrop, setDiskDrop] = useState<{ mountpoint: string; after: boolean } | null>(null);
+  const diskOrder = useDiskOrder(host?.disks ?? [], host?.disk_order ?? [], diskSection, order => {
+    setHost(previous => previous ? { ...previous, disk_order: order } : previous);
+    setRefresh(value => value + 1);
+  }, view);
   const id = useId();
   const terminalView = view === 'terminal';
   const inactive = terminalView || view === 'processes';
@@ -213,7 +222,9 @@ export default function ResourceMonitor({ terminal, tasks }: {
     return () => window.removeEventListener('keydown', escape);
   }, [fullScreen]);
 
-  const cpu = host?.cpu, memory = host?.memory, disks = host?.disks ?? [];
+  useEffect(() => { if (!diskOrder.editing) { draggedDisk.current = null; setDiskDrop(null); } }, [diskOrder.editing]);
+
+  const cpu = host?.cpu, memory = host?.memory, disks = diskOrder.disks;
   const averageGpu = gpus.length ? gpus.reduce((sum, gpu) => sum + gpu.utilization_gpu, 0) / gpus.length : null;
   const selectedDisks = diskFilter === 'all' ? disks : disks.filter(disk => disk.device_id === diskFilter);
   const ioPoints = useMemo(() => diskFilter === 'all' ? history : history.map(point => {
@@ -230,6 +241,18 @@ export default function ResourceMonitor({ terminal, tasks }: {
   const loadAverage = <LoadAverage values={cpu?.load_average} cores={cpu?.logical_count} />;
   const swapUsage = memory?.swap_total_bytes === 0 ? '未启用' : `${formatBytes(memory?.swap_used_bytes)} / ${formatBytes(memory?.swap_total_bytes)}`;
   const partialErrors = Object.keys(host?.errors ?? {}).map(key => ({ cpu: 'CPU', memory: '内存', disks: '磁盘', disk_io: '磁盘读写', uptime_seconds: '运行时间' }[key] ?? (key.startsWith('disk:') ? `磁盘 ${key.slice(5)}` : '部分主机指标')));
+
+  function diskDropPosition(event: React.DragEvent<HTMLDivElement>) {
+    if (!diskOrder.editing || diskOrder.saving || !draggedDisk.current) return null;
+    if ((event.target as Element).closest('thead')) return null;
+    const rows = Array.from(event.currentTarget.querySelectorAll<HTMLTableRowElement>('tbody tr'));
+    // The empty space below the table is a drop target after the final row.
+    const row = rows.find(row => event.clientY < row.getBoundingClientRect().bottom) ?? rows.at(-1);
+    if (!row) return null;
+    const rect = row.getBoundingClientRect();
+    if (event.clientY < rect.top) return null;
+    return { mountpoint: row.dataset.mountpoint!, after: event.clientY >= rect.y + rect.height / 2 };
+  }
 
   return (
     <div className={`resource-monitor${overview ? ' rm-overview' : ''}${fullScreen ? ' rm-fullscreen' : ''}`}>
@@ -326,6 +349,7 @@ export default function ResourceMonitor({ terminal, tasks }: {
             </div>}
           </section>}
 
+          {(show('cpu') || show('disk')) && <div className={overview ? 'rm-host-overview' : 'rm-host-resources'}>
           {show('cpu') && <section className="rm-section rm-cpu-section">
             <div className="rm-chart-grid">
               <MonitorChart {...chartProps} compact={overview} title="CPU 使用率" subtitle={overview ? loadAverage : `${cpu?.logical_count ?? '—'} 个逻辑核心 · %`} series={CPU_SERIES} formatValue={formatPercent} percent />
@@ -337,16 +361,40 @@ export default function ResourceMonitor({ terminal, tasks }: {
             </div>}
           </section>}
 
-          {show('disk') && <section className="rm-section rm-disk-section">
+          {show('disk') && <section ref={diskSection} className={`rm-section rm-disk-section${diskOrder.editing ? ' is-sorting' : ''}`}>
             <SectionHeading title="磁盘与存储" detail={`${disks.length} 个文件系统`}>
-              {overview ? <button type="button" className="rm-detail-link" onClick={() => setView('disk')}>磁盘详情 <ChevronDown size={12} /></button> : <div className="rm-io-summary"><span><ArrowDown size={12} />读取 <b>{formatBytes(sumRates(disks, 'read_bytes_per_second'), true)}</b></span><span><ArrowUp size={12} />写入 <b>{formatBytes(sumRates(disks, 'write_bytes_per_second'), true)}</b></span></div>}
+              {overview && <button type="button" className="rm-detail-link" onClick={() => setView('disk')}>磁盘详情 <ChevronDown size={12} /></button>}
             </SectionHeading>
-            {overview && <div className="rm-io-summary rm-overview-io"><span><ArrowDown size={12} />读取 <b>{formatBytes(sumRates(disks, 'read_bytes_per_second'), true)}</b></span><span><ArrowUp size={12} />写入 <b>{formatBytes(sumRates(disks, 'write_bytes_per_second'), true)}</b></span></div>}
-            <div className="rm-table-scroll"><table className={`rm-table rm-disk-table${overview ? ' rm-disk-table-compact' : ''}`}>
+            <div className="rm-disk-toolbar">
+              <div className="rm-io-summary"><span><ArrowDown size={12} />读取 <b>{formatBytes(sumRates(disks, 'read_bytes_per_second'), true)}</b></span><span><ArrowUp size={12} />写入 <b>{formatBytes(sumRates(disks, 'write_bytes_per_second'), true)}</b></span></div>
+              <button type="button" className={`rm-disk-order-button${diskOrder.editing ? ' is-saving' : ''}`} onClick={() => void diskOrder.toggle()} disabled={diskOrder.saving || !host || (!diskOrder.editing && disks.length < 2)} aria-busy={diskOrder.saving}>
+                {diskOrder.saving ? <LoaderCircle size={13} className="rm-spinning" /> : diskOrder.editing ? <Check size={13} /> : <ListOrdered size={13} />}<span>{diskOrder.editing ? '保存顺序' : '调整顺序'}</span>
+              </button>
+            </div>
+            {diskOrder.error && <p className="rm-disk-order-error" role="alert">{diskOrder.error}</p>}
+            <div className="rm-table-scroll" tabIndex={overview ? 0 : undefined} role={overview ? 'region' : undefined} aria-label={overview ? '磁盘列表' : undefined}
+              onDragOver={event => {
+                const position = diskDropPosition(event);
+                if (!position) { setDiskDrop(null); return; }
+                event.preventDefault(); event.dataTransfer.dropEffect = 'move';
+                setDiskDrop(previous => previous?.mountpoint === position.mountpoint && previous.after === position.after ? previous : position);
+                const scroll = event.currentTarget, area = scroll.getBoundingClientRect();
+                if (event.clientY > area.bottom - 32) scroll.scrollTop += 16;
+                else if (event.clientY < area.top + 32) scroll.scrollTop -= 16;
+              }}
+              onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDiskDrop(null); }}
+              onDrop={event => {
+                const position = diskDropPosition(event);
+                if (!position) return;
+                event.preventDefault();
+                diskOrder.move(draggedDisk.current!, position.mountpoint, position.after);
+                draggedDisk.current = null; setDiskDrop(null);
+              }}><table className={`rm-table rm-disk-table${overview ? ' rm-disk-table-compact' : ''}`}>
               <colgroup>
                 <col className="rm-disk-col-mount" />
                 {overview ? <><col /><col className="rm-disk-col-usage" /><col className="rm-disk-col-rate" /></> :
                   <><col className="rm-disk-col-size" span={3} /><col className="rm-disk-col-usage" /><col className="rm-disk-col-rate" span={2} /></>}
+                {diskOrder.editing && <col className="rm-disk-col-move" />}
               </colgroup>
               <thead><tr>
                 <th scope="col">挂载点 / 设备</th>
@@ -362,9 +410,13 @@ export default function ResourceMonitor({ terminal, tasks }: {
                   <th scope="col">容量</th><th scope="col">已用</th><th scope="col">可用</th>
                   <th scope="col">使用率</th><th scope="col">读取 / 秒</th><th scope="col">写入 / 秒</th>
                 </>}
+                {diskOrder.editing && <th scope="col">排序</th>}
               </tr></thead>
-              <tbody>{disks.map(disk => <tr key={disk.device_id}>
-                <th scope="row"><div className="rm-mount" title={disk.mountpoint}>{disk.mountpoint}<span title={`${disk.device} · ${disk.filesystem}`}>{disk.device} · {disk.filesystem}</span></div></th>
+              <tbody>{disks.map((disk, index) => <tr key={disk.device_id} data-mountpoint={disk.mountpoint} data-drop={diskDrop?.mountpoint === disk.mountpoint ? (diskDrop.after ? 'after' : 'before') : undefined}>
+                <th scope="row"><div className="rm-disk-identity">
+                  {diskOrder.editing && <button type="button" className="rm-disk-grip" draggable={!diskOrder.saving} disabled={diskOrder.saving} aria-label={`拖动 ${disk.mountpoint} 调整顺序`} title="拖动调整顺序" onDragStart={event => { draggedDisk.current = disk.mountpoint; event.dataTransfer.setData('text/plain', disk.mountpoint); event.dataTransfer.effectAllowed = 'move'; }} onDragEnd={() => { draggedDisk.current = null; setDiskDrop(null); }}><GripVertical size={14} /></button>}
+                  <div className="rm-mount" title={disk.mountpoint}>{disk.mountpoint}<span title={`${disk.device} · ${disk.filesystem}`}>{disk.device} · {disk.filesystem}</span></div>
+                </div></th>
                 {overview ? <td className="rm-disk-capacity-cell">
                   <div className="rm-disk-capacity">
                     <span>{formatBytes(disk.used_bytes)}</span><span className="rm-disk-capacity-separator"> / </span>
@@ -389,6 +441,10 @@ export default function ResourceMonitor({ terminal, tasks }: {
                   <td>{formatBytes(disk.read_bytes_per_second, true)}</td>
                   <td>{formatBytes(disk.write_bytes_per_second, true)}</td>
                 </>}
+                {diskOrder.editing && <td><div className="rm-disk-moves">
+                  <button type="button" disabled={diskOrder.saving || index === 0} aria-label={`上移 ${disk.mountpoint}`} title="上移" onClick={() => diskOrder.move(disk.mountpoint, disks[index - 1].mountpoint)}><ArrowUp size={13} /></button>
+                  <button type="button" disabled={diskOrder.saving || index === disks.length - 1} aria-label={`下移 ${disk.mountpoint}`} title="下移" onClick={() => diskOrder.move(disk.mountpoint, disks[index + 1].mountpoint, true)}><ArrowDown size={13} /></button>
+                </div></td>}
               </tr>)}</tbody>
             </table></div>
             {!disks.length && <EmptyState>{loading ? '正在读取磁盘…' : '没有可用的本地文件系统指标'}</EmptyState>}
@@ -398,6 +454,7 @@ export default function ResourceMonitor({ terminal, tasks }: {
               <p className="rm-hint rm-io-note">未提供块设备计数的文件系统不计入读写合计。</p>
             </div>}
           </section>}
+          </div>}
           {show('cpu') && <details className="rm-cores" open={view === 'cpu' || undefined}>
             <summary>
               <ChevronDown size={14} />CPU 核心详情
