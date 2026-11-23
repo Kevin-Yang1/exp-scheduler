@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import signal
 import shlex
+import sqlite3
 import sys
 import time
 
@@ -504,23 +505,27 @@ def test_memory_budget_allows_scheduling_when_default_idle_threshold_would_wait(
         assert history_task["gpu_memory_budget_mb"] == 16 * 1024
 
 
-def test_memory_budget_waits_until_free_memory_exceeds_budget_plus_headroom(tmp_path):
+def test_memory_budget_waits_until_free_memory_reaches_budget(tmp_path):
+    budget_mb = 16 * 1024
+    total_mb = 24 * 1024
     provider = FakeGPUProvider([
-        gpu(0, idle=False, memory_total_mb=24564, memory_used_mb=7000),
+        gpu(0, idle=False, memory_total_mb=total_mb, memory_used_mb=total_mb - budget_mb + 1),
     ])
     with build_client(tmp_path, provider) as client:
         task_id = create_task(
             client,
             command("print('budget-ready')"),
             name="budget-wait",
-            gpu_memory_budget_mb=16 * 1024,
+            gpu_memory_budget_mb=budget_mb,
         )
 
         time.sleep(0.5)
         queued = client.get("/api/tasks").json()["queued"]
         assert [task["id"] for task in queued] == [task_id]
 
-        provider.set_gpus([gpu(0, idle=False, memory_total_mb=24564, memory_used_mb=5000)])
+        provider.set_gpus([
+            gpu(0, idle=False, memory_total_mb=total_mb, memory_used_mb=total_mb - budget_mb),
+        ])
         wait_for(
             lambda: next(
                 task
@@ -531,9 +536,46 @@ def test_memory_budget_waits_until_free_memory_exceeds_budget_plus_headroom(tmp_
         )
 
 
+def test_legacy_memory_reservation_is_ignored(tmp_path):
+    db_path = make_config(tmp_path).db_path
+    database = Database(db_path)
+    database.init()
+    task = database.create_task(
+        name="legacy task",
+        command="true",
+        cwd=None,
+        env={},
+        notes=None,
+        gpu_memory_budget_mb=4096,
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("ALTER TABLE tasks ADD COLUMN gpu_memory_reservation_mb INTEGER")
+        conn.execute(
+            "UPDATE tasks SET gpu_memory_reservation_mb = 4096 WHERE id = ?",
+            (task["id"],),
+        )
+
+    with build_client(tmp_path, FakeGPUProvider([])) as client:
+        queued_task, = client.get("/api/tasks").json()["queued"]
+        assert queued_task["id"] == task["id"]
+        assert "gpu_memory_reservation_mb" not in queued_task
+        response = client.put(
+            f"/api/tasks/{task['id']}",
+            json={
+                "command": "true",
+                "gpu_memory_budget_mb": 4096,
+                "gpu_memory_reservation_mb": 4096,
+            },
+        )
+        response.raise_for_status()
+        updated = response.json()["task"]
+        assert updated["gpu_memory_budget_mb"] == 4096
+        assert "gpu_memory_reservation_mb" not in updated
+
+
 def test_memory_budget_also_waits_for_consecutive_checks(tmp_path):
     provider = FakeGPUProvider([
-        gpu(0, idle=False, has_processes=True, memory_total_mb=24564, memory_used_mb=7000),
+        gpu(0, idle=False, has_processes=True, memory_total_mb=24564, memory_used_mb=9000),
     ])
     with build_client(
         tmp_path,

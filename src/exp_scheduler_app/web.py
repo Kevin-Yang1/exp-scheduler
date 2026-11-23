@@ -92,7 +92,6 @@ class CreateTaskRequest(BaseModel):
     queue_name: str | None = None
     requested_gpu: int | None = None
     gpu_memory_budget_mb: int | None = Field(default=None, gt=0)
-    gpu_memory_reservation_mb: int | None = Field(default=None, gt=0)
     profile_id: int | None = None
     depends_on: list[int] = Field(default_factory=list)
 
@@ -521,7 +520,6 @@ def create_app(
                 queue_name=payload.queue_name,
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
-                gpu_memory_reservation_mb=payload.gpu_memory_reservation_mb,
                 profile_id=payload.profile_id,
                 depends_on_ids=payload.depends_on,
             )
@@ -547,7 +545,6 @@ def create_app(
                 queue_name=payload.queue_name,
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
-                gpu_memory_reservation_mb=payload.gpu_memory_reservation_mb,
                 profile_id=payload.profile_id,
                 depends_on_ids=payload.depends_on,
             )

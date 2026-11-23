@@ -39,7 +39,6 @@ from .terminal import (
 LOGGER = logging.getLogger("exp_scheduler")
 LOG_TAIL_BYTES = 1024 * 1024
 TERMINATE_GRACE_SECONDS = 5
-GPU_MEMORY_BUDGET_HEADROOM_MB = 2048
 TASK_LOG_NAME_RE = re.compile(r"^task_(?P<task_id>\d+)_attempt_(?P<attempt>\d+)\.log$")
 INTERRUPTED_SIGNAL_NUMBERS = {
     int(signal.SIGHUP),
@@ -82,14 +81,6 @@ class ProcessHandle:
     requeue_to_queue_name: str | None = None
 
 
-@dataclass(slots=True)
-class MemoryReservationHandle:
-    task_id: int
-    gpu_id: int
-    memory_mb: int
-    process: subprocess.Popen[bytes]
-
-
 class SchedulerService:
     def __init__(
         self,
@@ -111,8 +102,6 @@ class SchedulerService:
         self._wake_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._running: dict[int, ProcessHandle] = {}
-        self._memory_reservations: dict[int, MemoryReservationHandle] = {}
-        self._memory_reservation_failures: dict[int, tuple[int, int]] = {}
         self._terminal_sessions: dict[int, TerminalSession] = {}
         self._watchers: dict[int, asyncio.Task[None]] = {}
         self._last_gpu_payload: list[dict[str, object]] = []
@@ -141,7 +130,6 @@ class SchedulerService:
 
     async def shutdown(self) -> None:
         self._stop_event.set()
-        await self._release_all_memory_reservations(reason="shutdown")
         if self._scheduler_task is not None:
             self._scheduler_task.cancel()
             try:
@@ -267,16 +255,12 @@ class SchedulerService:
         queue_name: str | None = None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
-        gpu_memory_reservation_mb: int | None = None,
         profile_id: int | None = None,
         depends_on_ids: list[int] | None = None,
     ) -> dict[str, object]:
         normalized_requested_gpu = await self._normalize_requested_gpu(requested_gpu)
         normalized_gpu_memory_budget_mb = self._normalize_gpu_memory_budget_mb(
             gpu_memory_budget_mb
-        )
-        normalized_gpu_memory_reservation_mb = self._normalize_gpu_memory_reservation_mb(
-            gpu_memory_reservation_mb
         )
         final_queue_name = queue_name or (URGENT_QUEUE if is_urgent else NORMAL_QUEUE)
         final_name = (name or "").strip() or command.strip()[:80]
@@ -306,7 +290,6 @@ class SchedulerService:
             notes=notes,
             requested_gpu=normalized_requested_gpu,
             gpu_memory_budget_mb=normalized_gpu_memory_budget_mb,
-            gpu_memory_reservation_mb=normalized_gpu_memory_reservation_mb,
             queue_name=final_queue_name,
             profile_id=profile_id,
             profile_name=profile_name,
@@ -478,16 +461,12 @@ class SchedulerService:
         queue_name: str | None = None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
-        gpu_memory_reservation_mb: int | None = None,
         profile_id: int | None = None,
         depends_on_ids: list[int] | None = None,
     ) -> dict[str, object]:
         normalized_requested_gpu = await self._normalize_requested_gpu(requested_gpu)
         normalized_gpu_memory_budget_mb = self._normalize_gpu_memory_budget_mb(
             gpu_memory_budget_mb
-        )
-        normalized_gpu_memory_reservation_mb = self._normalize_gpu_memory_reservation_mb(
-            gpu_memory_reservation_mb
         )
         final_queue_name = queue_name or (URGENT_QUEUE if is_urgent else NORMAL_QUEUE)
         final_name = (name or "").strip() or command.strip()[:80]
@@ -519,7 +498,6 @@ class SchedulerService:
                 notes=notes,
                 requested_gpu=normalized_requested_gpu,
                 gpu_memory_budget_mb=normalized_gpu_memory_budget_mb,
-                gpu_memory_reservation_mb=normalized_gpu_memory_reservation_mb,
                 queue_name=final_queue_name,
                 profile_id=profile_id,
                 profile_name=profile_name,
@@ -1197,7 +1175,6 @@ class SchedulerService:
                 for task in self.database.list_queued_tasks()
                 if self._is_task_ready_for_launch(task)
             ]
-            self._sync_memory_reservations(queued_tasks)
             self._refresh_gpu_ready_counts(payload, queued_tasks)
             if self.database.get_queue_paused():
                 return
@@ -1212,24 +1189,7 @@ class SchedulerService:
             if not available:
                 return
             for task, gpu in self._match_tasks_to_gpus(queued_tasks, available):
-                task_id = int(task["id"])
-                gpu_id = int(gpu["index"])
-                reservation_mb = task.get("gpu_memory_reservation_mb")
-                if isinstance(reservation_mb, int) and reservation_mb > 0:
-                    reservation = self._memory_reservations.get(task_id)
-                    if (
-                        self._memory_reservation_failures.get(task_id) != (gpu_id, reservation_mb)
-                        and (
-                            reservation is None
-                            or reservation.gpu_id != gpu_id
-                            or reservation.memory_mb != reservation_mb
-                            or reservation.process.poll() is not None
-                        )
-                    ):
-                        await self._start_memory_reservation(task, gpu, reservation_mb)
-                        continue
                 await self._launch_task(task, gpu)
-
 
     async def _apply_due_gpu_schedule(self) -> None:
         schedule = self.database.get_gpu_schedule()
@@ -1504,7 +1464,6 @@ class SchedulerService:
     ) -> None:
         task_id = int(task["id"])
         gpu_id = int(gpu["index"])
-        await self._release_memory_reservation(task_id, reason="launch")
         self._clear_gpu_ready_counts(gpu_id)
         next_attempt = int(task.get("attempt_count") or 0) + 1
         log_path = self._log_path_for_task(task_id, next_attempt)
@@ -2025,8 +1984,6 @@ class SchedulerService:
             exclusive_gpus=exclusive_gpus,
         ):
             return False
-        if self._task_has_live_memory_reservation(task, int(gpu["index"])):
-            return True
         return self._gpu_ready_counts.get(key, 0) >= self._required_gpu_ready_checks()
 
     def _readiness_key_for_task(
@@ -2042,11 +1999,7 @@ class SchedulerService:
             return None
         budget_mb = task.get("gpu_memory_budget_mb")
         if isinstance(budget_mb, int):
-            if self._gpu_has_budget_capacity(
-                gpu,
-                budget_mb,
-                task_id=int(task["id"]),
-            ):
+            if self._gpu_has_budget_capacity(gpu, budget_mb):
                 return (gpu_id, self._budget_readiness_key(budget_mb))
             return None
         if bool(gpu.get("is_idle")):
@@ -2057,17 +2010,8 @@ class SchedulerService:
         self,
         gpu: dict[str, object],
         budget_mb: int,
-        *,
-        task_id: int | None = None,
     ) -> bool:
-        free_mb = int(gpu.get("memory_free_mb") or 0)
-        if not free_mb:
-            free_mb = int(gpu.get("memory_total_mb") or 0) - int(gpu.get("memory_used_mb") or 0)
-        if task_id is not None:
-            reservation = self._memory_reservations.get(task_id)
-            if reservation is not None and reservation.gpu_id == int(gpu["index"]):
-                free_mb += reservation.memory_mb
-        return free_mb > budget_mb + GPU_MEMORY_BUDGET_HEADROOM_MB
+        return int(gpu["memory_free_mb"]) >= budget_mb
 
     def _task_has_planned_gpu_capacity(
         self,
@@ -2087,10 +2031,7 @@ class SchedulerService:
                 if planned_free_mb is not None
                 else int(gpu.get("memory_free_mb") or 0)
             )
-            reservation = self._memory_reservations.get(int(task["id"]))
-            if reservation is not None and reservation.gpu_id == gpu_id:
-                free_mb += reservation.memory_mb
-            return free_mb > budget_mb + GPU_MEMORY_BUDGET_HEADROOM_MB
+            return free_mb >= budget_mb
         if not bool(gpu.get("is_idle")):
             return False
         if planned_free_mb is None:
@@ -2111,240 +2052,9 @@ class SchedulerService:
         budget_mb = task.get("gpu_memory_budget_mb")
         if isinstance(budget_mb, int):
             free_mb = planned_free_mb.get(gpu_id, int(gpu.get("memory_free_mb") or 0))
-            reservation = self._memory_reservations.get(int(task["id"]))
-            if reservation is not None and reservation.gpu_id == gpu_id:
-                free_mb += reservation.memory_mb
             planned_free_mb[gpu_id] = max(0, free_mb - budget_mb)
             return
         exclusive_gpus.add(gpu_id)
-
-    def _task_has_live_memory_reservation(
-        self,
-        task: dict[str, object],
-        gpu_id: int,
-    ) -> bool:
-        reservation = self._memory_reservations.get(int(task["id"]))
-        return (
-            reservation is not None
-            and reservation.gpu_id == gpu_id
-            and reservation.process.poll() is None
-        )
-
-    def _sync_memory_reservations(self, queued_tasks: list[dict[str, object]]) -> None:
-        desired: dict[int, tuple[int | None, int | None]] = {}
-        for task in queued_tasks:
-            task_id = int(task["id"])
-            reservation_mb = task.get("gpu_memory_reservation_mb")
-            requested_gpu = task.get("requested_gpu")
-            desired[task_id] = (
-                requested_gpu if isinstance(requested_gpu, int) else None,
-                reservation_mb if isinstance(reservation_mb, int) else None,
-            )
-
-        for task_id, reservation in list(self._memory_reservations.items()):
-            requested_gpu, reservation_mb = desired.get(task_id, (None, None))
-            if (
-                reservation_mb is None
-                or reservation.memory_mb != reservation_mb
-                or (requested_gpu is not None and reservation.gpu_id != requested_gpu)
-                or reservation.process.poll() is not None
-            ):
-                self._terminate_memory_reservation(reservation, wait=False)
-                self._memory_reservations.pop(task_id, None)
-
-        desired_task_ids = set(desired)
-        for task_id in list(self._memory_reservation_failures):
-            if task_id not in desired_task_ids:
-                self._memory_reservation_failures.pop(task_id, None)
-
-    async def _start_memory_reservation(
-        self,
-        task: dict[str, object],
-        gpu: dict[str, object],
-        memory_mb: int,
-    ) -> None:
-        task_id = int(task["id"])
-        gpu_id = int(gpu["index"])
-        existing = self._memory_reservations.get(task_id)
-        if existing is not None:
-            await self._release_memory_reservation(task_id, reason="replace")
-
-        env = self._build_task_environment(
-            task=task,
-            gpu_id=gpu_id,
-            next_attempt=max(1, int(task.get("attempt_count") or 0) + 1),
-        )
-        env["EXP_SCHEDULER_MEMORY_RESERVATION_MB"] = str(memory_mb)
-        cwd = task["cwd"] if isinstance(task["cwd"], str) and task["cwd"] else None
-        try:
-            process = subprocess.Popen(
-                ["bash", "-lc", self._build_memory_reservation_command(task)],
-                cwd=cwd,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                close_fds=True,
-                text=False,
-            )
-        except Exception as exc:
-            self._memory_reservation_failures[task_id] = (gpu_id, memory_mb)
-            await self._record_operation(
-                level="warning",
-                action="gpu_memory_reservation_failed",
-                entity_type="task",
-                entity_id=task_id,
-                title=f"任务 #{task_id} 显存预留启动失败",
-                detail=str(exc),
-                metadata=self._task_log_metadata(
-                    task,
-                    extra={"gpu_id": gpu_id, "reservation_mb": memory_mb},
-                ),
-            )
-            return
-
-        reservation = MemoryReservationHandle(
-            task_id=task_id,
-            gpu_id=gpu_id,
-            memory_mb=memory_mb,
-            process=process,
-        )
-        self._memory_reservations[task_id] = reservation
-        await asyncio.sleep(0.5)
-        exit_code = process.poll()
-        if exit_code is not None:
-            self._memory_reservations.pop(task_id, None)
-            self._memory_reservation_failures[task_id] = (gpu_id, memory_mb)
-            await self._record_operation(
-                level="warning",
-                action="gpu_memory_reservation_failed",
-                entity_type="task",
-                entity_id=task_id,
-                title=f"任务 #{task_id} 显存预留失败",
-                detail=(
-                    f"GPU {gpu_id} 预留 {memory_mb} MB 的辅助进程已退出，"
-                    f"退出码 {exit_code}。任务将继续按显存预算调度。"
-                ),
-                metadata=self._task_log_metadata(
-                    task,
-                    extra={
-                        "gpu_id": gpu_id,
-                        "reservation_mb": memory_mb,
-                        "exit_code": exit_code,
-                    },
-                ),
-            )
-            return
-
-        self._memory_reservation_failures.pop(task_id, None)
-        await self._record_operation(
-            level="info",
-            action="gpu_memory_reserved",
-            entity_type="task",
-            entity_id=task_id,
-            title=f"任务 #{task_id} 已预留显存",
-            detail=f"GPU {gpu_id} 已为任务预留 {memory_mb} MB 显存，正式启动前会释放。",
-            metadata=self._task_log_metadata(
-                task,
-                extra={"gpu_id": gpu_id, "reservation_mb": memory_mb, "pid": process.pid},
-            ),
-        )
-
-    def _build_memory_reservation_command(self, task: dict[str, object]) -> str:
-        shell_setup = (
-            str(task["shell_setup"]).strip()
-            if isinstance(task.get("shell_setup"), str) and str(task["shell_setup"]).strip()
-            else ""
-        )
-        reservation_script = r"""
-import os
-import signal
-import sys
-import time
-
-memory_mb = int(os.environ["EXP_SCHEDULER_MEMORY_RESERVATION_MB"])
-stop = False
-
-def request_stop(signum, frame):
-    global stop
-    stop = True
-
-signal.signal(signal.SIGINT, request_stop)
-signal.signal(signal.SIGTERM, request_stop)
-
-try:
-    import torch
-    chunks = []
-    remaining = memory_mb * 1024 * 1024
-    chunk_bytes = 512 * 1024 * 1024
-    while remaining > 0:
-        size = min(chunk_bytes, remaining)
-        chunks.append(torch.empty((size,), dtype=torch.uint8, device="cuda"))
-        remaining -= size
-    torch.cuda.synchronize()
-    print(f"[exp-scheduler] reserved {memory_mb} MB on CUDA", flush=True)
-    while not stop:
-        time.sleep(1)
-    chunks.clear()
-    torch.cuda.empty_cache()
-except Exception as exc:
-    print(f"[exp-scheduler] GPU memory reservation failed: {exc}", file=sys.stderr, flush=True)
-    raise
-"""
-        lines = ["set -e"]
-        if shell_setup:
-            lines.append(shell_setup)
-        lines.extend(["python - <<'PY'", reservation_script.strip(), "PY"])
-        return "\n".join(lines)
-
-    async def _release_memory_reservation(self, task_id: int, *, reason: str) -> None:
-        reservation = self._memory_reservations.pop(task_id, None)
-        if reservation is None:
-            return
-        await asyncio.to_thread(
-            self._terminate_memory_reservation,
-            reservation,
-            wait=True,
-        )
-
-    async def _release_all_memory_reservations(self, *, reason: str) -> None:
-        reservations = list(self._memory_reservations.values())
-        self._memory_reservations.clear()
-        if not reservations:
-            return
-        await asyncio.gather(
-            *[
-                asyncio.to_thread(
-                    self._terminate_memory_reservation,
-                    reservation,
-                    wait=True,
-                )
-                for reservation in reservations
-            ],
-            return_exceptions=True,
-        )
-
-    def _terminate_memory_reservation(
-        self,
-        reservation: MemoryReservationHandle,
-        *,
-        wait: bool,
-    ) -> None:
-        process = reservation.process
-        if process.poll() is not None:
-            return
-        self._signal_process_group(process.pid, signal.SIGTERM)
-        if not wait:
-            return
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self._signal_process_group(process.pid, signal.SIGKILL)
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
 
     def _is_gpu_physically_idle(self, gpu: dict[str, object]) -> bool:
         if "physically_idle" in gpu:
@@ -2739,17 +2449,6 @@ except Exception as exc:
             raise ValueError("显存预算必须是正整数 MB")
         return value
 
-    def _normalize_gpu_memory_reservation_mb(
-        self,
-        reservation_mb: int | None,
-    ) -> int | None:
-        if reservation_mb is None:
-            return None
-        value = int(reservation_mb)
-        if value <= 0:
-            raise ValueError("显存预留必须是正整数 MB")
-        return value
-
     def _normalize_gpu_schedule_action(self, action: str) -> str:
         if action not in {"enable", "disable"}:
             raise ValueError("GPU 定时动作必须是 enable 或 disable")
@@ -3119,7 +2818,6 @@ except Exception as exc:
             "requested_gpu": task.get("requested_gpu"),
             "assigned_gpu": task.get("assigned_gpu"),
             "gpu_memory_budget_mb": task.get("gpu_memory_budget_mb"),
-            "gpu_memory_reservation_mb": task.get("gpu_memory_reservation_mb"),
             "queue_name": task.get("queue_name"),
             "queue_rank": task.get("queue_rank"),
             "profile_id": task.get("profile_id"),

@@ -98,7 +98,6 @@ class Database:
                     "next_retry_at": "TEXT",
                     "requested_gpu": "INTEGER",
                     "gpu_memory_budget_mb": "INTEGER",
-                    "gpu_memory_reservation_mb": "INTEGER",
                     "queue_name": "TEXT",
                 },
             )
@@ -407,7 +406,6 @@ class Database:
         notes: str | None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
-        gpu_memory_reservation_mb: int | None = None,
         queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
@@ -425,8 +423,8 @@ class Database:
                     name, command, cwd, env, status, queue_rank, assigned_gpu, pid,
                     exit_code, created_at, started_at, finished_at, log_path, notes,
                     profile_id, profile_name, shell_setup, attempt_count, next_retry_at,
-                    requested_gpu, gpu_memory_budget_mb, gpu_memory_reservation_mb, queue_name
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
+                    requested_gpu, gpu_memory_budget_mb, queue_name
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
                 """,
                 (
                     name,
@@ -442,7 +440,6 @@ class Database:
                     shell_setup,
                     requested_gpu,
                     gpu_memory_budget_mb,
-                    gpu_memory_reservation_mb,
                     normalized_queue_name,
                 ),
             )
@@ -1327,7 +1324,6 @@ class Database:
         notes: str | None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
-        gpu_memory_reservation_mb: int | None = None,
         queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
@@ -1368,7 +1364,6 @@ class Database:
                     notes = ?,
                     requested_gpu = ?,
                     gpu_memory_budget_mb = ?,
-                    gpu_memory_reservation_mb = ?,
                     queue_name = ?,
                     queue_rank = ?,
                     profile_id = ?,
@@ -1388,7 +1383,6 @@ class Database:
                     notes,
                     requested_gpu,
                     gpu_memory_budget_mb,
-                    gpu_memory_reservation_mb,
                     normalized_queue_name,
                     queue_rank,
                     profile_id,
@@ -2740,9 +2734,6 @@ class Database:
             gpu_memory_budget_mb=task["gpu_memory_budget_mb"]
             if isinstance(task.get("gpu_memory_budget_mb"), int)
             else None,
-            gpu_memory_reservation_mb=task["gpu_memory_reservation_mb"]
-            if isinstance(task.get("gpu_memory_reservation_mb"), int)
-            else None,
             queue_name=str(task.get("queue_name") or NORMAL_QUEUE),
             profile_id=task["profile_id"] if isinstance(task["profile_id"], int) else None,
             profile_name=task["profile_name"]
@@ -2883,11 +2874,6 @@ class Database:
             "gpu_memory_budget_mb": (
                 row["gpu_memory_budget_mb"]
                 if "gpu_memory_budget_mb" in keys and row["gpu_memory_budget_mb"] is not None
-                else None
-            ),
-            "gpu_memory_reservation_mb": (
-                row["gpu_memory_reservation_mb"]
-                if "gpu_memory_reservation_mb" in keys and row["gpu_memory_reservation_mb"] is not None
                 else None
             ),
             "queue_name": (

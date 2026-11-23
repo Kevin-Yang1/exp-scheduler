@@ -99,7 +99,6 @@ interface Task {
   env?: Record<string, string>;
   requestedGpu?: number | null;
   gpuMemoryBudgetMb?: number | null;
-  gpuMemoryReservationMb?: number | null;
   profileId?: number | null;
   queueName?: QueueName;
   dependsOn?: number[];
@@ -124,7 +123,6 @@ interface BackendTask {
   assigned_gpu?: number | null;
   requested_gpu?: number | null;
   gpu_memory_budget_mb?: number | null;
-  gpu_memory_reservation_mb?: number | null;
   profile_id?: number | null;
   profile_name?: string | null;
   started_at?: string | null;
@@ -409,7 +407,6 @@ function mapTask(task: BackendTask): Task {
     env: task.env || {},
     requestedGpu: task.requested_gpu ?? null,
     gpuMemoryBudgetMb: task.gpu_memory_budget_mb ?? null,
-    gpuMemoryReservationMb: task.gpu_memory_reservation_mb ?? null,
     profileId: task.profile_id ?? null,
     queueName,
     dependsOn: task.depends_on || [],
@@ -1000,7 +997,6 @@ export default function App() {
         queue_name,
         requested_gpu: formData.get('requested_gpu') ? Number(formData.get('requested_gpu')) : null,
         gpu_memory_budget_mb: formData.get('gpu_memory_budget_gb') ? Math.round(Number(formData.get('gpu_memory_budget_gb')) * 1024) : null,
-        gpu_memory_reservation_mb: formData.get('gpu_memory_reservation_gb') ? Math.round(Number(formData.get('gpu_memory_reservation_gb')) * 1024) : null,
         profile_id: formData.get('profile_id') ? Number(formData.get('profile_id')) : null,
         depends_on,
       };
@@ -2618,19 +2614,6 @@ export default function App() {
                           className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
                         />
                       </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">显存预留 (GB)</label>
-                        <input
-                          type="number"
-                          min="0"
-                          step="any"
-                          name="gpu_memory_reservation_gb"
-                          defaultValue={taskDraft?.gpuMemoryReservationMb ? taskDraft.gpuMemoryReservationMb / 1024 : ''}
-                          placeholder="可选，启动前临时占用"
-                          className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
-                        />
-                      </div>
                     </>
                   )}
                 </div>
@@ -3017,12 +3000,6 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
                   <span>{(task.gpuMemoryBudgetMb / 1024).toFixed(1)}G</span>
                 </>
               )}
-              {task.gpuMemoryReservationMb && (
-                <>
-                  <span>•</span>
-                  <span>预留 {(task.gpuMemoryReservationMb / 1024).toFixed(1)}G</span>
-                </>
-              )}
               {task.workingDir && (
                 <>
                   <span>•</span>
@@ -3407,12 +3384,6 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
                <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm whitespace-nowrap">
                  <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px]">预算</span>
                  <span className="font-medium text-slate-700">{(task.gpuMemoryBudgetMb / 1024).toFixed(1)}G</span>
-               </div>
-             )}
-             {task.gpuMemoryReservationMb && (
-               <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm whitespace-nowrap">
-                 <span className="text-slate-400 font-bold uppercase tracking-tight text-[8px]">预留</span>
-                 <span className="font-medium text-slate-700">{(task.gpuMemoryReservationMb / 1024).toFixed(1)}G</span>
                </div>
              )}
              <div className="flex items-center gap-1.5 px-2 py-0.5 bg-white border border-slate-100/80 rounded text-[9px] text-slate-500 shadow-sm w-full max-w-[150px] sm:max-w-xs xl:max-w-md flex-1">
