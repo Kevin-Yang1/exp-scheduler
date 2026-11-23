@@ -61,7 +61,10 @@ function ProcessDialog({ title, onClose, children, drawer = false }: { title: st
 export default function ProcessMonitor({ initialGpu, initialPid }: { initialGpu?: number; initialPid?: number } = {}) {
   const [data, setData] = useState<ProcessResponse | null>(null);
   const [search, setSearch] = useState(initialPid == null ? '' : String(initialPid)), [query, setQuery] = useState(search);
-  const [scope, setScope] = useState(initialGpu == null ? 'all' : 'gpu'), [user, setUser] = useState(''), [status, setStatus] = useState(''), [gpu, setGpu] = useState(initialGpu == null ? '' : String(initialGpu));
+  const [scope, setScope] = useState(initialGpu == null ? 'all' : 'gpu');
+  const [user, setUser] = useState(''), [status, setStatus] = useState('');
+  const [selectedGpu, setSelectedGpu] = useState<string>();
+  const gpu = selectedGpu ?? (scope === 'gpu' && initialGpu != null ? String(initialGpu) : '');
   const [sort, setSort] = useState('cpu_percent'), [descending, setDescending] = useState(true);
   const [mode, setMode] = useState('list'), [offset, setOffset] = useState(0);
   const [paused, setPaused] = useState(false), [refresh, setRefresh] = useState(0), [loading, setLoading] = useState(true);
@@ -174,7 +177,7 @@ export default function ProcessMonitor({ initialGpu, initialPid }: { initialGpu?
       <label className="pm-search"><Search size={15} /><input aria-label="搜索进程" value={search} placeholder="搜索 PID、进程名或命令…" onChange={event => setSearch(event.target.value)} />{search && <button type="button" aria-label="清空进程搜索" onClick={() => setSearch('')}><X size={13} /></button>}</label>
       <select aria-label="筛选进程用户" value={user} onChange={event => setUser(event.target.value)}><option value="">所有用户</option>{data?.users.map(user => <option key={user}>{user}</option>)}</select>
       <select aria-label="筛选进程状态" value={status} onChange={event => setStatus(event.target.value)}><option value="">所有状态</option>{data?.statuses.map(status => <option key={status} value={status}>{STATES[status] ?? status}</option>)}</select>
-      <select aria-label="筛选进程 GPU" value={gpu} onChange={event => setGpu(event.target.value)}><option value="">所有 GPU</option>{data?.gpu_indices.map(index => <option key={index} value={index}>GPU {index}</option>)}</select>
+      <select aria-label="筛选进程 GPU" value={gpu} onChange={event => setSelectedGpu(event.target.value)}><option value="">所有 GPU</option>{data?.gpu_indices.map(index => <option key={index} value={index}>GPU {index}</option>)}</select>
       <select aria-label="进程显示方式" value={mode} onChange={event => setMode(event.target.value)}><option value="list">列表视图</option><option value="tree">进程树</option><option value="io">I/O 视图</option></select>
     </div>
     <div className="pm-scopebar"><div className="pm-scopes">{[['all', '全部进程'], ['mine', '我的进程'], ['gpu', 'GPU 进程'], ['tasks', '调度任务']].map(([value, label]) => <button type="button" key={value} aria-pressed={scope === value} onClick={() => setScope(value)}>{label}</button>)}</div><span className="rm-hint">匹配 {data?.total ?? 0} 个{data && ` · 更新于 ${new Date(data.sampled_at * 1000).toLocaleTimeString('zh-CN', { hour12: false })}`}</span></div>
