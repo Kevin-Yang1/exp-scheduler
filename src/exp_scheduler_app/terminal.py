@@ -55,8 +55,10 @@ class TerminalSession:
     reader_task: asyncio.Task[None] | None = None
     closed: bool = False
 
-    def subscribe(self, *, snapshot_bytes: int | None = TERMINAL_SNAPSHOT_BYTES) -> tuple[TerminalSubscriber, bytes]:
-        snapshot = read_bytes_tail(self.log_path, tail_bytes=snapshot_bytes)
+    def subscribe(
+        self, *, snapshot_bytes: int | None = TERMINAL_SNAPSHOT_BYTES, end_offset: int | None = None,
+    ) -> tuple[TerminalSubscriber, bytes]:
+        snapshot = read_bytes_tail(self.log_path, tail_bytes=snapshot_bytes, end_offset=end_offset)
         subscriber = TerminalSubscriber()
         self.subscribers.add(subscriber)
         return subscriber, snapshot
@@ -75,6 +77,9 @@ class TerminalSession:
             return
         self.log_file.write(data)
         self.log_file.flush()
+        self.publish_bytes(data)
+
+    def publish_bytes(self, data: bytes) -> None:
         for subscriber in list(self.subscribers):
             if subscriber.chunk_queue.full():
                 subscriber.control_queue.put_nowait(("disconnect", None))
@@ -91,15 +96,15 @@ class TerminalSession:
         self.subscribers.clear()
 
 
-def read_bytes_tail(path: Path, *, tail_bytes: int | None) -> bytes:
+def read_bytes_tail(path: Path, *, tail_bytes: int | None, end_offset: int | None = None) -> bytes:
     if not path.exists():
         return b""
     with path.open("rb") as fh:
-        if tail_bytes is not None:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - tail_bytes))
-        return fh.read()
+        if end_offset is None:
+            end_offset = fh.seek(0, os.SEEK_END)
+        start = 0 if tail_bytes is None else max(0, end_offset - tail_bytes)
+        fh.seek(start)
+        return fh.read(end_offset - start)
 
 
 def compact_progress_terminal_bytes(data: bytes) -> bytes:

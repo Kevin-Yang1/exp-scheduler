@@ -68,7 +68,7 @@ cp -R dist/assets ../src/exp_scheduler_app/static/assets
 
 - **调度模型**：单 GPU 单任务。GPU 需通过 N 次连续空闲检测（默认 6×5s=30s）才分配任务；任务可单独指定 GPU 或"进程预算"（显存 MB），否则用全局空闲阈值
 - **三条队列**：`normal` / `urgent` / `staged`（暂存，不参与调度）。`urgent` 可抢占 `normal` 任务，抢占使用 SIGINT→5s→SIGTERM→5s→SIGKILL 梯度
-- **中断恢复**：服务重启或外部信号杀死的任务自动回到队首；外部 kill 还会让对应 GPU 进入可配置冷却时间（默认 300s）
+- **中断恢复**：独立任务进程持有 PTY 和日志，服务重启后重新接管任务。外部信号终止任务后，任务回到队首，对应 GPU 进入可配置冷却时间（默认 300s）
 - **OOM 重试**：检测 CUDA OOM / exit code 137/143，可配置重试次数和延迟；多次 attempt 各保留独立日志（`task_attempts` 表）
 - **任务依赖 (DAG)**：`task_dependencies` 表存储依赖边，调度器通过 `are_dependencies_satisfied` 检查所有依赖 `succeeded` 后才调度；递归 CTE 检测循环；删除任务时手动清理依赖边
 - **Agent GPU lease**：`/api/agent/gpu-leases` 让外部 agent 临时占用指定 GPU（`agent_gpu_leases` 表，支持 TTL 和 `stop_running`）。有效可调度 GPU = 用户白名单 − 活跃 lease；lease 不改写用户白名单，空闲自动恢复不会抢回被 lease 的 GPU。`skills/exp-scheduler-gpu-lease/` 是对应的 agent 包装脚本（lease + task-create/list/reorder 等命令）

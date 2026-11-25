@@ -96,7 +96,7 @@ class SignalProcessesRequest(BaseModel):
     boot_id: str = Field(min_length=1, max_length=80)
 
 
-class CreateTaskRequest(BaseModel):
+class TaskRequest(BaseModel):
     name: str | None = None
     command: str = Field(min_length=1)
     cwd: str | None = None
@@ -110,7 +110,12 @@ class CreateTaskRequest(BaseModel):
     depends_on: list[int] = Field(default_factory=list)
 
 
-class UpdateTaskRequest(CreateTaskRequest):
+class CreateTaskRequest(TaskRequest):
+    exclusive_gpu: bool = True
+
+
+class UpdateTaskRequest(TaskRequest):
+    exclusive_gpu: bool | None = None
     depends_on: list[int] | None = None
 
 
@@ -534,6 +539,7 @@ def create_app(
                 queue_name=payload.queue_name,
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
+                exclusive_gpu=payload.exclusive_gpu,
                 profile_id=payload.profile_id,
                 depends_on_ids=payload.depends_on,
             )
@@ -559,6 +565,7 @@ def create_app(
                 queue_name=payload.queue_name,
                 requested_gpu=payload.requested_gpu,
                 gpu_memory_budget_mb=payload.gpu_memory_budget_mb,
+                exclusive_gpu=payload.exclusive_gpu,
                 profile_id=payload.profile_id,
                 depends_on_ids=payload.depends_on,
             )

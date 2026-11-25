@@ -629,6 +629,7 @@ def test_update_queued_task_endpoint_supports_in_place_edit(tmp_path):
                 "is_urgent": True,
                 "requested_gpu": 0,
                 "gpu_memory_budget_mb": 20000,
+                "exclusive_gpu": False,
                 "profile_id": profile_id,
             },
         )
@@ -648,6 +649,8 @@ def test_update_queued_task_endpoint_supports_in_place_edit(tmp_path):
         assert updated_task["queue_name"] == "urgent"
         assert updated_task["requested_gpu"] == 0
         assert updated_task["gpu_memory_budget_mb"] == 20000
+        assert create.json()["task"]["exclusive_gpu"] is True
+        assert updated_task["exclusive_gpu"] is False
         assert updated_task["profile_id"] == profile_id
         assert updated_task["profile_name"] == "conda-edit"
         assert updated_task["shell_setup"] == "export PROFILE_READY=1"
@@ -683,6 +686,7 @@ def test_update_queued_task_endpoint_supports_in_place_edit(tmp_path):
         assert edited_again["queue_name"] == "normal"
         assert edited_again["requested_gpu"] is None
         assert edited_again["gpu_memory_budget_mb"] is None
+        assert edited_again["exclusive_gpu"] is False
         assert edited_again["profile_id"] is None
         assert edited_again["profile_name"] is None
         assert edited_again["shell_setup"] is None
@@ -1005,6 +1009,7 @@ def test_pause_resume_delete_and_requeue(tmp_path):
                 "cwd": None,
                 "env": {},
                 "notes": None,
+                "exclusive_gpu": False,
             },
         )
         second.raise_for_status()
@@ -1024,6 +1029,7 @@ def test_pause_resume_delete_and_requeue(tmp_path):
         new_task = requeue.json()["task"]
         queued_ids = [task["id"] for task in client.get("/api/tasks").json()["queued"]]
         assert new_task["id"] in queued_ids
+        assert new_task["exclusive_gpu"] is False
 
 
 def test_delete_history_task_removes_record_and_log_file(tmp_path):

@@ -18,6 +18,8 @@ import {
   Pause,
   AlertCircle,
   CheckCircle2,
+  Lock,
+  LockOpen,
   Clock,
   ChevronRight,
   Monitor,
@@ -99,6 +101,7 @@ interface Task {
   env?: Record<string, string>;
   requestedGpu?: number | null;
   gpuMemoryBudgetMb?: number | null;
+  exclusiveGpu: boolean;
   profileId?: number | null;
   queueName?: QueueName;
   dependsOn?: number[];
@@ -123,6 +126,7 @@ interface BackendTask {
   assigned_gpu?: number | null;
   requested_gpu?: number | null;
   gpu_memory_budget_mb?: number | null;
+  exclusive_gpu?: boolean;
   profile_id?: number | null;
   profile_name?: string | null;
   started_at?: string | null;
@@ -407,6 +411,7 @@ function mapTask(task: BackendTask): Task {
     env: task.env || {},
     requestedGpu: task.requested_gpu ?? null,
     gpuMemoryBudgetMb: task.gpu_memory_budget_mb ?? null,
+    exclusiveGpu: task.exclusive_gpu ?? true,
     profileId: task.profile_id ?? null,
     queueName,
     dependsOn: task.depends_on || [],
@@ -452,14 +457,25 @@ function haveSameGpuIds(left: number[], right: number[]) {
 }
 
 type AppTab = 'dashboard' | 'queue' | 'history' | 'activity' | 'nvitop' | 'sync' | 'terminals' | 'conda' | 'backup' | 'settings';
+const RUNNING_TASK_ACTIONS = {
+  preempt: { icon: AlertCircle, label: '抢占给紧急队列', detail: '任务停止后将回到普通队列，空出的 GPU 优先供紧急任务使用。' },
+  interrupt: { icon: Pause, label: '中断到暂存', detail: '任务停止后将移入暂存队列。' },
+  cancel: { icon: Trash2, label: '取消任务', detail: '任务停止后将标记为已取消。' },
+} as const;
+type RunningTaskAction = keyof typeof RUNNING_TASK_ACTIONS;
+type TaskSelectionModifiers = Pick<React.MouseEvent, 'ctrlKey' | 'metaKey' | 'shiftKey'>;
+const runningTaskButtonClass = 'inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-slate-500 transition-colors hover:bg-slate-100 hover:text-blue-600 disabled:opacity-35';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTab>('dashboard');
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedRunningTaskIds, setSelectedRunningTaskIds] = useState<Set<string>>(new Set());
+  const [isSubmittingRunningAction, setIsSubmittingRunningAction] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [showNewTask, setShowNewTask] = useState(false);
   const [isTaskModalExpanded, setIsTaskModalExpanded] = useState(false);
   const [taskDraft, setTaskDraft] = useState<Task | null>(null);
+  const [taskExclusiveGpu, setTaskExclusiveGpu] = useState(true);
   const [enabledGpus, setEnabledGpus] = useState<number[]>([]);
   const [appliedEnabledGpus, setAppliedEnabledGpus] = useState<number[]>([]);
   const [gpuSchedule, setGpuSchedule] = useState<Record<string, GpuScheduleEntry>>({});
@@ -502,6 +518,7 @@ export default function App() {
       return next;
     });
   }, []);
+
   const [tasks, setTasks] = useState<Task[]>([]);
   const [taskCounts, setTaskCounts] = useState<TaskCounts | null>(null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -517,6 +534,7 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [nowMs, setNowMs] = useState(() => Date.now());
   const followRunningTaskRef = useRef(true);
+  const runningSelectionAnchorRef = useRef<string | null>(null);
   const gpuSettingsDraftRef = useRef(false);
   const appliedEnabledGpusRef = useRef<number[]>([]);
   const commandTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -537,6 +555,10 @@ export default function App() {
   }, [resetCommandTextareaSize]);
 
   const runningTasks = useMemo(() => tasks.filter(t => t.status === 'running'), [tasks]);
+  const selectedRunningTasks = runningTasks.filter(task => selectedRunningTaskIds.has(task.id));
+  const allRunningTasksSelected = runningTasks.length > 0 && selectedRunningTasks.length === runningTasks.length;
+  const allSelectedTasksMarked = selectedRunningTasks.every(task => markedTaskIds.has(task.id));
+  const batchActionsDisabled = selectedRunningTasks.length === 0 || isSubmittingRunningAction;
   const historyTasks = useMemo(() => tasks.filter(t => !['running', 'pending', 'staged'].includes(t.status)), [tasks]);
   const urgentQueueTasks = useMemo(() => tasks.filter(t => t.isUrgent && t.status === 'pending'), [tasks]);
   const standardQueueTasks = useMemo(() => tasks.filter(t => !t.isUrgent && t.status === 'pending'), [tasks]);
@@ -613,6 +635,14 @@ export default function App() {
     setIsBatchDeleteMode(false);
     setSelectedForDelete(new Set());
   }, [activeTab]);
+
+  useEffect(() => {
+    setSelectedRunningTaskIds(previous => {
+      if (previous.size === 0) return previous;
+      const next = new Set(runningTasks.filter(task => previous.has(task.id)).map(task => task.id));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [runningTasks]);
 
   useEffect(() => {
     if (activeTab !== 'settings') return;
@@ -798,6 +828,7 @@ export default function App() {
 
   const openNewTaskModal = () => {
     setTaskDraft(null);
+    setTaskExclusiveGpu(true);
     setIsTaskModalExpanded(false);
     setShowNewTask(true);
   };
@@ -997,6 +1028,7 @@ export default function App() {
         queue_name,
         requested_gpu: formData.get('requested_gpu') ? Number(formData.get('requested_gpu')) : null,
         gpu_memory_budget_mb: formData.get('gpu_memory_budget_gb') ? Math.round(Number(formData.get('gpu_memory_budget_gb')) * 1024) : null,
+        exclusive_gpu: taskExclusiveGpu,
         profile_id: formData.get('profile_id') ? Number(formData.get('profile_id')) : null,
         depends_on,
       };
@@ -1057,6 +1089,87 @@ export default function App() {
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '任务抢占失败');
+    }
+  };
+
+  const selectRunningTask = (taskId: string, { ctrlKey, metaKey, shiftKey }: TaskSelectionModifiers) => {
+    if (!ctrlKey && !metaKey && !shiftKey) {
+      followRunningTaskRef.current = true;
+      setSelectedTaskId(taskId);
+      if (!isSubmittingRunningAction) {
+        runningSelectionAnchorRef.current = taskId;
+        setSelectedRunningTaskIds(new Set([taskId]));
+      }
+      return;
+    }
+    if (isSubmittingRunningAction) return;
+
+    const anchorId = runningSelectionAnchorRef.current ?? selectedTaskId;
+    const anchorIndex = runningTasks.findIndex(task => task.id === anchorId);
+    const clickedIndex = runningTasks.findIndex(task => task.id === taskId);
+    const hasRange = shiftKey && anchorIndex >= 0;
+    const targetIds = hasRange
+      ? runningTasks.slice(Math.min(anchorIndex, clickedIndex), Math.max(anchorIndex, clickedIndex) + 1).map(task => task.id)
+      : [taskId];
+    if (!hasRange) runningSelectionAnchorRef.current = taskId;
+
+    setSelectedRunningTaskIds(previous => {
+      const next = new Set(previous);
+      const remove = previous.has(taskId);
+      for (const id of targetIds) {
+        if (remove) next.delete(id);
+        else next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const clearRunningTaskSelection = () => {
+    runningSelectionAnchorRef.current = null;
+    setSelectedRunningTaskIds(new Set());
+  };
+
+  const markSelectedRunningTasks = () => {
+    const shouldMark = !allSelectedTasksMarked;
+    for (const task of selectedRunningTasks) {
+      if (markedTaskIds.has(task.id) !== shouldMark) toggleTaskMark(task.id);
+    }
+  };
+
+  const runBatchTaskAction = async (action: RunningTaskAction) => {
+    if (isSubmittingRunningAction || selectedRunningTasks.length === 0) return;
+    if (action === 'preempt' && !hasWaitingUrgentTask) return;
+    const { label, detail } = RUNNING_TASK_ACTIONS[action];
+    const taskIds = selectedRunningTasks.map(task => task.id);
+    if (!window.confirm(`确认对已选的 ${taskIds.length} 个任务执行「${label}」？\n\n${detail}`)) return;
+
+    setIsSubmittingRunningAction(true);
+    try {
+      const results = await Promise.allSettled(taskIds.map(taskId =>
+        api(`/api/tasks/${taskId}/${action}`, { method: 'POST' })
+      ));
+      const acceptedIds: string[] = [];
+      const failures: string[] = [];
+      results.forEach((result, index) => {
+        const taskId = taskIds[index];
+        if (result.status === 'fulfilled') {
+          acceptedIds.push(taskId);
+        } else {
+          const reason = result.reason instanceof Error ? result.reason.message : '请求失败';
+          failures.push(`#${taskId}（${reason}）`);
+        }
+      });
+      setSelectedRunningTaskIds(previous => {
+        const next = new Set(previous);
+        acceptedIds.forEach(taskId => next.delete(taskId));
+        return next;
+      });
+      const summary = `「${label}」已提交 ${acceptedIds.length}/${taskIds.length} 个任务。`;
+      const failureMessage = failures.length ? ` 失败任务 ${failures.join('、')}。` : '';
+      const refreshed = await refreshAll().then(() => true, () => false);
+      setMessage(summary + failureMessage + (refreshed ? '' : ' 任务列表刷新失败。'));
+    } finally {
+      setIsSubmittingRunningAction(false);
     }
   };
 
@@ -1215,6 +1328,7 @@ export default function App() {
 
   const duplicateTask = (task: Task) => {
     setTaskDraft(task);
+    setTaskExclusiveGpu(task.exclusiveGpu);
     setIsEditingTask(false);
     setIsTaskModalExpanded(false);
     setShowNewTask(true);
@@ -1223,6 +1337,7 @@ export default function App() {
 
   const editTask = (task: Task) => {
     setTaskDraft(task);
+    setTaskExclusiveGpu(task.exclusiveGpu);
     setIsEditingTask(true);
     setIsTaskModalExpanded(false);
     setShowNewTask(true);
@@ -1504,13 +1619,73 @@ export default function App() {
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                   <div className="lg:col-span-12 space-y-3">
                     <div className="bg-white rounded-xl border border-slate-200 shadow-sm flex flex-col h-full overflow-hidden">
-                      <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-                        <div className="flex items-center gap-2">
-                           <Activity className="w-4 h-4 text-blue-600" />
-                           <span className="font-bold text-slate-800 text-sm">正在运行的工作负载</span>
+                      <div className="p-4 border-b border-slate-100 flex items-center justify-between gap-2 bg-slate-50/50">
+                        <div className="flex items-center gap-2 min-w-0">
+                           <Activity className="w-4 h-4 shrink-0 text-blue-600" />
+                           <span className="font-bold text-slate-800 text-sm truncate">正在运行的工作负载</span>
                         </div>
-                        <div className="flex gap-2 text-[10px] font-bold uppercase tracking-widest">
-                          <span className="px-2 py-1 bg-white border border-slate-200 rounded text-slate-400">实时</span>
+                        <div role="group" aria-label="运行任务批量操作" className="ml-auto flex shrink-0 items-center gap-0.5">
+                          <span role="status" className="sr-only sm:not-sr-only sm:mr-2 whitespace-nowrap text-xs text-slate-500 tabular-nums">
+                            {isSubmittingRunningAction ? '正在提交…' : selectedRunningTasks.length > 0 && `已选 ${selectedRunningTasks.length} 项`}
+                          </span>
+                          {(['preempt', 'interrupt', 'mark', 'cancel'] as const).map(action => {
+                            if (action === 'mark') {
+                              const isMarked = allSelectedTasksMarked && selectedRunningTasks.length > 0;
+                              const label = isMarked ? '批量取消标记' : '批量标记';
+                              return (
+                                <button
+                                  key={action}
+                                  type="button"
+                                  disabled={batchActionsDisabled}
+                                  onClick={markSelectedRunningTasks}
+                                  aria-label={label}
+                                  title={label}
+                                  className={runningTaskButtonClass}
+                                >
+                                  <Bookmark className={`size-3.5 ${isMarked ? 'fill-current text-amber-500' : ''}`} />
+                                </button>
+                              );
+                            }
+                            const { icon: Icon, label } = RUNNING_TASK_ACTIONS[action];
+                            const noUrgentTask = action === 'preempt' && !hasWaitingUrgentTask;
+                            return (
+                              <button
+                                key={action}
+                                type="button"
+                                disabled={batchActionsDisabled || noUrgentTask}
+                                aria-label={`批量${label}`}
+                                title={noUrgentTask ? '当前没有等待中的紧急任务' : `批量${label}`}
+                                onClick={() => runBatchTaskAction(action)}
+                                className={`${runningTaskButtonClass} ${action === 'cancel' ? 'hover:text-rose-600' : ''}`}
+                              >
+                                <Icon className="size-3.5" />
+                              </button>
+                            );
+                          })}
+                          <button
+                            type="button"
+                            disabled={batchActionsDisabled}
+                            onClick={clearRunningTaskSelection}
+                            aria-label="清除选择"
+                            title="清除选择"
+                            className={runningTaskButtonClass}
+                          >
+                            <Plus className="size-3.5 rotate-45" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={runningTasks.length === 0 || isSubmittingRunningAction}
+                            onClick={() => {
+                              if (allRunningTasksSelected) clearRunningTaskSelection();
+                              else setSelectedRunningTaskIds(new Set(runningTasks.map(task => task.id)));
+                            }}
+                            aria-label="全选运行中的任务"
+                            aria-pressed={allRunningTasksSelected}
+                            title={allRunningTasksSelected ? '取消全选' : '全选运行中的任务'}
+                            className={`${runningTaskButtonClass} ml-1 ${allRunningTasksSelected ? 'bg-blue-50 text-blue-600' : ''}`}
+                          >
+                            <CheckCircle2 className="size-3.5" />
+                          </button>
                         </div>
                       </div>
                       <div className="flex flex-col gap-2.5 p-4">
@@ -1518,11 +1693,10 @@ export default function App() {
                           <TaskCardInner
                             key={task.id}
                             task={task}
-                            isSelected={selectedTaskId === task.id}
-                            onSelect={() => {
-                              followRunningTaskRef.current = true;
-                              setSelectedTaskId(task.id);
-                            }}
+                            isConsoleTask={selectedTaskId === task.id}
+                            isSelected={selectedRunningTaskIds.has(task.id)}
+                            isBatchBusy={isSubmittingRunningAction}
+                            onSelect={event => selectRunningTask(task.id, event)}
                             onCancel={() => cancelTask(task.id)}
                             onInterrupt={() => interruptTaskToStaged(task)}
                             onPreempt={() => preemptTask(task)}
@@ -2564,13 +2738,32 @@ export default function App() {
 
                       {/* GPU Selection */}
                       <div className="space-y-1.5">
-                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">指定 GPU</label>
-                        <select name="requested_gpu" defaultValue={taskDraft?.requestedGpu ?? ''} className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer">
-                          <option value="">自动分配</option>
-                          {gpus.map(gpu => (
-                            <option key={gpu.id} value={gpu.id}>GPU {gpu.id} ({gpu.name})</option>
-                          ))}
-                        </select>
+                        <label htmlFor="task-requested-gpu" className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">指定 GPU</label>
+                        <div className="flex gap-2">
+                          <select
+                            id="task-requested-gpu"
+                            name="requested_gpu"
+                            defaultValue={taskDraft?.requestedGpu ?? ''}
+                            className="min-w-0 flex-1 bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 transition-colors cursor-pointer"
+                          >
+                            <option value="">自动分配</option>
+                            {gpus.map(gpu => (
+                              <option key={gpu.id} value={gpu.id}>GPU {gpu.id} ({gpu.name})</option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            aria-pressed={taskExclusiveGpu}
+                            title="开启后等待 GPU 空闲，任务运行期间独占该卡"
+                            onClick={() => setTaskExclusiveGpu(value => !value)}
+                            className={`inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${taskExclusiveGpu
+                              ? 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'
+                              : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'}`}
+                          >
+                            {taskExclusiveGpu ? <Lock className="size-3.5" /> : <LockOpen className="size-3.5" />}
+                            独占 GPU
+                          </button>
+                        </div>
                       </div>
 
                       {/* Queue Type */}
@@ -2614,6 +2807,7 @@ export default function App() {
                           className="w-full bg-slate-50 border border-slate-200 rounded-lg px-4 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-blue-500 transition-colors"
                         />
                       </div>
+
                     </>
                   )}
                 </div>
@@ -2965,16 +3159,36 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
   );
 }
 
-  const TaskCardInner = ({ task, isSelected, onSelect, onCancel, onInterrupt, onPreempt, canPreempt, onDuplicate, onEdit, isMarked, toggleMark }: { task: Task; isSelected?: boolean; onSelect?: () => void; onCancel?: () => void; onInterrupt?: () => void; onPreempt?: () => void; canPreempt?: boolean; onDuplicate?: () => void; onEdit?: () => void; isMarked?: boolean; toggleMark?: (e: React.MouseEvent) => void; key?: React.Key }) => {
+function TaskCardInner({
+  task, isConsoleTask, isSelected, isBatchBusy, onSelect,
+  onCancel, onInterrupt, onPreempt, canPreempt, onDuplicate, onEdit, isMarked, toggleMark,
+}: {
+  task: Task;
+  isConsoleTask: boolean;
+  isSelected: boolean;
+  isBatchBusy: boolean;
+  onSelect: (modifiers: TaskSelectionModifiers) => void;
+  onCancel?: () => void;
+  onInterrupt?: () => void;
+  onPreempt?: () => void;
+  canPreempt?: boolean;
+  onDuplicate?: () => void;
+  onEdit?: () => void;
+  isMarked?: boolean;
+  toggleMark?: (event: React.MouseEvent) => void;
+}) {
   const canEdit = Boolean(onEdit);
   const editTitle = task.status === 'pending' || task.status === 'staged' ? '编辑任务' : '编辑记录信息';
 
   return (
     <div
       onClick={onSelect}
+      onMouseDown={event => {
+        if (event.shiftKey || event.ctrlKey || event.metaKey) event.preventDefault();
+      }}
       className={`border rounded-xl p-3.5 transition-all group flex flex-col gap-2.5 cursor-pointer ${
         isSelected
-        ? 'bg-white border-blue-500 ring-1 ring-blue-500 shadow-md transform scale-[1.005]'
+        ? 'bg-white border-blue-500 ring-1 ring-blue-500 shadow-md'
         : isMarked
           ? 'bg-amber-50/40 border-amber-300 shadow-sm hover:border-amber-400 hover:shadow-md'
           : 'bg-white border-slate-200 shadow-sm hover:border-slate-300 hover:shadow-md'
@@ -2982,13 +3196,20 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
     >
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4 shrink-0">
-          <div className={`p-2 rounded-xl border shadow-inner transition-colors ${isSelected ? 'bg-blue-600 text-white border-blue-500' : 'bg-blue-50 text-blue-600 border-blue-100'}`}>
+          <div className={`p-2 rounded-xl border shadow-inner transition-colors ${isConsoleTask ? 'bg-blue-600 text-white border-blue-500' : 'bg-blue-50 text-blue-600 border-blue-100'}`}>
             <Play className="w-4 h-4 fill-current" />
           </div>
           <div className="min-w-0">
             <h4 className="font-bold text-slate-900 leading-tight mb-0.5 truncate flex items-center gap-2 text-[13px]">
-              {task.name}
-              {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-blue-600 animate-pulse" />}
+              <button
+                type="button"
+                aria-pressed={isSelected}
+                title="Ctrl / ⌘ 点选单项，Shift 点选范围"
+                className="truncate text-left"
+              >
+                {task.name}
+              </button>
+              {isConsoleTask && <span className="w-1.5 h-1.5 rounded-full bg-blue-600 animate-pulse" />}
             </h4>
             <div className="flex items-center gap-2 text-[9px] font-bold text-slate-400 uppercase tracking-tighter">
               <span className={`px-1.5 py-0.5 rounded transition-colors ${isSelected ? 'bg-blue-100 text-blue-700' : 'bg-blue-50 text-blue-600'}`}>{task.profile}</span>
@@ -3045,7 +3266,7 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
             )}
               <button
                 title={canPreempt ? "抢占给紧急队列" : "当前没有等待中的紧急任务"}
-                disabled={!canPreempt}
+                disabled={!canPreempt || isBatchBusy}
                 onClick={(e) => {
                     e.stopPropagation();
                     onPreempt?.();
@@ -3060,11 +3281,12 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
               </button>
               <button
                 title="中断到暂存队列"
+                disabled={isBatchBusy}
                 onClick={(e) => {
                   e.stopPropagation();
                   onInterrupt?.();
                 }}
-                className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-all active:scale-90"
+                className="p-1.5 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-all active:scale-90 disabled:opacity-50"
               >
                 <Pause className="w-3.5 h-3.5" />
               </button>
@@ -3081,11 +3303,12 @@ function TaskNotesPill({ notes, className = '' }: { notes?: string; className?: 
               </button>
               <button
                 title="取消任务"
+                disabled={isBatchBusy}
                 onClick={(e) => {
                     e.stopPropagation();
                     onCancel?.();
                   }}
-              className="p-1.5 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-all active:scale-90"
+              className="p-1.5 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-all active:scale-90 disabled:opacity-50"
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>

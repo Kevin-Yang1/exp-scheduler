@@ -9,6 +9,7 @@ import sys
 import time
 
 from fastapi.testclient import TestClient
+import pytest
 
 from exp_scheduler_app.config import SchedulerConfig
 from exp_scheduler_app.database import Database
@@ -165,6 +166,7 @@ def create_task(
     requested_gpu: int | None = None,
     profile_id: int | None = None,
     gpu_memory_budget_mb: int | None = None,
+    exclusive_gpu: bool | None = None,
 ) -> int:
     response = client.post(
         "/api/tasks",
@@ -177,6 +179,7 @@ def create_task(
             "is_urgent": is_urgent,
             "requested_gpu": requested_gpu,
             "gpu_memory_budget_mb": gpu_memory_budget_mb,
+            **({"exclusive_gpu": exclusive_gpu} if exclusive_gpu is not None else {}),
             "profile_id": profile_id,
         },
     )
@@ -432,6 +435,54 @@ def test_two_free_gpus_can_run_two_tasks_in_parallel(tmp_path):
         assert assignments[first_id] != assignments[second_id]
 
 
+@pytest.mark.parametrize("exclusive_first", [True, False])
+def test_exclusive_task_does_not_share_gpu(tmp_path, exclusive_first):
+    provider = FakeGPUProvider([gpu(0)])
+    release = tmp_path / "release-first"
+    first_command = command(
+        "import time\n"
+        "from pathlib import Path\n"
+        f"while not Path({str(release)!r}).exists():\n"
+        "    time.sleep(0.01)\n"
+    )
+    with build_client(tmp_path, provider) as client:
+        client.post("/api/queue/pause").raise_for_status()
+        first_id = create_task(
+            client,
+            first_command,
+            name="first",
+            requested_gpu=0,
+            gpu_memory_budget_mb=8 * 1024,
+            exclusive_gpu=None if exclusive_first else False,
+        )
+        second_id = create_task(
+            client,
+            command("print('second')"),
+            name="second",
+            requested_gpu=0,
+            gpu_memory_budget_mb=8 * 1024,
+            exclusive_gpu=not exclusive_first,
+        )
+        try:
+            client.post("/api/queue/resume").raise_for_status()
+            wait_for(lambda: client.get("/api/tasks").json()["running"])
+
+            # Simulate several idle samples even though the first task is alive.
+            time.sleep(0.3)
+            tasks = client.get("/api/tasks").json()
+            assert [task["id"] for task in tasks["running"]] == [first_id]
+            assert [task["id"] for task in tasks["queued"]] == [second_id]
+        finally:
+            release.touch()
+
+        wait_for(
+            lambda: {
+                task["id"] for task in client.get("/api/tasks").json()["history"]
+                if task["status"] == "succeeded"
+            } == {first_id, second_id}
+        )
+
+
 def test_budgeted_tasks_can_share_scheduler_occupied_gpu(tmp_path):
     provider = FakeGPUProvider([
         gpu(0, idle=True, memory_total_mb=49152, memory_used_mb=500),
@@ -443,6 +494,7 @@ def test_budgeted_tasks_can_share_scheduler_occupied_gpu(tmp_path):
             name="first",
             requested_gpu=0,
             gpu_memory_budget_mb=8 * 1024,
+            exclusive_gpu=False,
         )
 
         wait_for(
@@ -468,6 +520,7 @@ def test_budgeted_tasks_can_share_scheduler_occupied_gpu(tmp_path):
             name="second",
             requested_gpu=0,
             gpu_memory_budget_mb=8 * 1024,
+            exclusive_gpu=False,
         )
 
         second_history = wait_for(
@@ -491,6 +544,7 @@ def test_memory_budget_allows_scheduling_when_default_idle_threshold_would_wait(
             command("import os; print('budget-gpu=' + os.environ['CUDA_VISIBLE_DEVICES'])"),
             name="budgeted",
             gpu_memory_budget_mb=16 * 1024,
+            exclusive_gpu=False,
         )
 
         history_task = wait_for(
@@ -517,6 +571,7 @@ def test_memory_budget_waits_until_free_memory_reaches_budget(tmp_path):
             command("print('budget-ready')"),
             name="budget-wait",
             gpu_memory_budget_mb=budget_mb,
+            exclusive_gpu=False,
         )
 
         time.sleep(0.5)
@@ -549,6 +604,7 @@ def test_legacy_memory_reservation_is_ignored(tmp_path):
         gpu_memory_budget_mb=4096,
     )
     with sqlite3.connect(db_path) as conn:
+        conn.execute("ALTER TABLE tasks DROP COLUMN exclusive_gpu")
         conn.execute("ALTER TABLE tasks ADD COLUMN gpu_memory_reservation_mb INTEGER")
         conn.execute(
             "UPDATE tasks SET gpu_memory_reservation_mb = 4096 WHERE id = ?",
@@ -558,6 +614,7 @@ def test_legacy_memory_reservation_is_ignored(tmp_path):
     with build_client(tmp_path, FakeGPUProvider([])) as client:
         queued_task, = client.get("/api/tasks").json()["queued"]
         assert queued_task["id"] == task["id"]
+        assert queued_task["exclusive_gpu"] is False
         assert "gpu_memory_reservation_mb" not in queued_task
         response = client.put(
             f"/api/tasks/{task['id']}",
@@ -570,6 +627,7 @@ def test_legacy_memory_reservation_is_ignored(tmp_path):
         response.raise_for_status()
         updated = response.json()["task"]
         assert updated["gpu_memory_budget_mb"] == 4096
+        assert updated["exclusive_gpu"] is False
         assert "gpu_memory_reservation_mb" not in updated
 
 
@@ -588,6 +646,7 @@ def test_memory_budget_also_waits_for_consecutive_checks(tmp_path):
             command("print('budget-stable')"),
             name="budget-stable",
             gpu_memory_budget_mb=16 * 1024,
+            exclusive_gpu=False,
         )
 
         provider.set_gpus([
@@ -1786,41 +1845,68 @@ def test_startup_requeues_stale_running_tasks_to_queue_head(tmp_path):
         assert int(current["queue_rank"]) < int(queued_current["queue_rank"])
 
 
-def test_scheduler_shutdown_requeues_running_task_to_queue_head(tmp_path):
+@pytest.mark.parametrize("finish_while_stopped", [False, True])
+def test_scheduler_restart_preserves_running_task(tmp_path, finish_while_stopped):
     config = make_config(tmp_path)
     provider = FakeGPUProvider([gpu(0, idle=True)])
-    app = create_app(config, gpu_provider=provider)
     database = Database(config.db_path)
-    with TestClient(app) as client:
-        first_id = create_task(
-            client,
-            command("import time; print('first running'); time.sleep(30)"),
-            name="first",
-        )
-        second_id = create_task(
-            client,
-            command("print('second')"),
-            name="second",
-        )
+    continue_file = tmp_path / "continue"
+    finish_file = tmp_path / "finish"
+    task_command = command(
+        "import time\n"
+        "from pathlib import Path\n"
+        "print('before restart', flush=True)\n"
+        f"while not Path({str(continue_file)!r}).exists():\n"
+        "    time.sleep(0.01)\n"
+        "print('while stopped', flush=True)\n"
+        f"while not Path({str(finish_file)!r}).exists():\n"
+        "    time.sleep(0.01)\n"
+        "print('finished', flush=True)\n"
+    )
+    try:
+        with TestClient(create_app(config, gpu_provider=provider)) as client:
+            first_id = create_task(client, task_command, name="first")
+            second_id = create_task(
+                client, command("print('second')"), name="second",
+                gpu_memory_budget_mb=1024, exclusive_gpu=False,
+            )
+            first = wait_for(
+                lambda: next(
+                    task for task in client.get("/api/tasks").json()["running"]
+                    if task["id"] == first_id
+                ),
+            )
+            log = Path(first["log_path"])
+            wait_for(lambda: "before restart" in log.read_text().splitlines())
 
-        wait_for(
-            lambda: next(
-                task
-                for task in client.get("/api/tasks").json()["running"]
-                if task["id"] == first_id
-            ),
-            timeout=3,
-        )
+        assert database.get_task(first_id)["status"] == "running"
+        assert database.get_task(first_id)["pid"] == first["pid"]
+        assert database.get_task(second_id)["status"] == "queued"
+        continue_file.touch()
+        wait_for(lambda: "while stopped" in log.read_text().splitlines())
+        if finish_while_stopped:
+            finish_file.touch()
+            result_path = log.with_name(f".{log.name}.exit.json")
+            wait_for(result_path.exists)
 
-    first = database.get_task(first_id)
-    second = database.get_task(second_id)
-    assert first is not None
-    assert second is not None
-    assert first["status"] == "queued"
-    assert first["pid"] is None
-    assert first["assigned_gpu"] is None
-    assert first["attempt_count"] == 1
-    assert int(first["queue_rank"]) < int(second["queue_rank"])
+        with TestClient(create_app(config, gpu_provider=provider)) as client:
+            if not finish_while_stopped:
+                tasks = client.get("/api/tasks").json()
+                assert [(task["id"], task["pid"]) for task in tasks["running"]] == [
+                    (first_id, first["pid"]),
+                ]
+                assert [task["id"] for task in tasks["queued"]] == [second_id]
+                finish_file.touch()
+            wait_for(lambda: database.get_task(first_id)["status"] == "succeeded")
+            wait_for(lambda: database.get_task(second_id)["status"] == "succeeded")
+
+        assert database.get_task(first_id)["attempt_count"] == 1
+        output = log.read_text().splitlines()
+        assert output.count("before restart") == 1
+        assert "while stopped" in output
+    finally:
+        continue_file.touch()
+        finish_file.touch()
 
 
 def test_external_signal_kill_cools_gpu_before_relaunch(tmp_path):

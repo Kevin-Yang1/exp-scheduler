@@ -114,6 +114,7 @@ python "${CODEX_HOME:-$HOME/.codex}/skills/exp-scheduler-gpu-lease/scripts/exp_s
 
 Common task commands:
 
+- `task-create` enables exclusive GPU scheduling by default. Use `--no-exclusive-gpu` with `--memory-budget-mb` to allow sharing.
 - `task-update <task_id> --command ...`: update a queued task with a full task payload, using the same options as `task-create`.
 - `task-delete <task_id>`: delete queued/history task records; running tasks are rejected by the server.
 - `task-cancel <task_id>`: cancel a running task.

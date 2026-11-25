@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -84,7 +84,8 @@ class Database:
                     started_at TEXT,
                     finished_at TEXT,
                     log_path TEXT,
-                    notes TEXT
+                    notes TEXT,
+                    exclusive_gpu INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -99,6 +100,7 @@ class Database:
                     "next_retry_at": "TEXT",
                     "requested_gpu": "INTEGER",
                     "gpu_memory_budget_mb": "INTEGER",
+                    "exclusive_gpu": "INTEGER NOT NULL DEFAULT 0",
                     "queue_name": "TEXT",
                 },
             )
@@ -407,6 +409,7 @@ class Database:
         notes: str | None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
+        exclusive_gpu: bool = True,
         queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
@@ -424,8 +427,8 @@ class Database:
                     name, command, cwd, env, status, queue_rank, assigned_gpu, pid,
                     exit_code, created_at, started_at, finished_at, log_path, notes,
                     profile_id, profile_name, shell_setup, attempt_count, next_retry_at,
-                    requested_gpu, gpu_memory_budget_mb, queue_name
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
+                    requested_gpu, gpu_memory_budget_mb, exclusive_gpu, queue_name
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -441,6 +444,7 @@ class Database:
                     shell_setup,
                     requested_gpu,
                     gpu_memory_budget_mb,
+                    exclusive_gpu,
                     normalized_queue_name,
                 ),
             )
@@ -1325,6 +1329,7 @@ class Database:
         notes: str | None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
+        exclusive_gpu: bool | None = None,
         queue_name: str = NORMAL_QUEUE,
         profile_id: int | None = None,
         profile_name: str | None = None,
@@ -1365,6 +1370,7 @@ class Database:
                     notes = ?,
                     requested_gpu = ?,
                     gpu_memory_budget_mb = ?,
+                    exclusive_gpu = COALESCE(?, exclusive_gpu),
                     queue_name = ?,
                     queue_rank = ?,
                     profile_id = ?,
@@ -1384,6 +1390,7 @@ class Database:
                     notes,
                     requested_gpu,
                     gpu_memory_budget_mb,
+                    exclusive_gpu,
                     normalized_queue_name,
                     queue_rank,
                     profile_id,
@@ -2680,7 +2687,7 @@ class Database:
             raise ValueError(f"任务不存在: {task_id}")
         return task
 
-    def requeue_running_tasks_to_queue_head(self) -> int:
+    def requeue_running_tasks_to_queue_head(self, *, exclude_task_ids: Collection[int] = ()) -> int:
         finished_at = utc_now_iso()
         with self._lock, self._connect() as conn:
             rows = conn.execute(
@@ -2691,6 +2698,7 @@ class Database:
                 ORDER BY COALESCE(started_at, created_at) ASC, id ASC
                 """
             ).fetchall()
+            rows = [row for row in rows if row["id"] not in exclude_task_ids]
             if not rows:
                 return 0
 
@@ -2757,6 +2765,7 @@ class Database:
             gpu_memory_budget_mb=task["gpu_memory_budget_mb"]
             if isinstance(task.get("gpu_memory_budget_mb"), int)
             else None,
+            exclusive_gpu=bool(task["exclusive_gpu"]),
             queue_name=str(task.get("queue_name") or NORMAL_QUEUE),
             profile_id=task["profile_id"] if isinstance(task["profile_id"], int) else None,
             profile_name=task["profile_name"]
@@ -2899,6 +2908,7 @@ class Database:
                 if "gpu_memory_budget_mb" in keys and row["gpu_memory_budget_mb"] is not None
                 else None
             ),
+            "exclusive_gpu": bool(row["exclusive_gpu"]) if "exclusive_gpu" in keys else False,
             "queue_name": (
                 self._normalize_queue_name(row["queue_name"])
                 if "queue_name" in keys

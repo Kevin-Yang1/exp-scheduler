@@ -3,14 +3,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import errno
 import logging
 import os
 from pathlib import Path
-import pty
 import re
 import signal
-import subprocess
 import sys
 import traceback
 from typing import Callable
@@ -21,6 +18,7 @@ from .database import Database, NORMAL_QUEUE, STAGED_QUEUE, URGENT_QUEUE
 from .events import EventBroker
 from .gpu import GPUInfo, query_gpus
 from .profile_discovery import discover_installed_environments
+from .task_runner import POLL_SECONDS, TaskRun, read_control, write_control
 from .terminal import (
     DEFAULT_TERMINAL_COLUMNS,
     DEFAULT_TERMINAL_ROWS,
@@ -30,9 +28,9 @@ from .terminal import (
     TerminalSubscriber,
     compact_progress_log_file,
     encode_terminal_text,
+    normalize_terminal_size,
     read_text,
     read_text_tail,
-    set_terminal_window_size,
 )
 
 
@@ -73,12 +71,15 @@ def queue_display_name(queue_name: str) -> str:
 class ProcessHandle:
     task_id: int
     gpu_id: int
-    process: subprocess.Popen[bytes]
+    process: TaskRun
     log_path: Path
     attempt_count: int
     terminal_session: TerminalSession
+    exclusive_gpu: bool
+    log_offset: int
     stop_reason: str | None = None
     requeue_to_queue_name: str | None = None
+    stop_task: asyncio.Task[None] | None = None
 
 
 class SchedulerService:
@@ -113,18 +114,19 @@ class SchedulerService:
     async def startup(self) -> None:
         self.database.init()
         self._load_persisted_scheduler_settings()
-        requeued = self.database.requeue_running_tasks_to_queue_head()
+        self._stop_event.clear()
+        self._restore_running_tasks()
+        requeued = self.database.requeue_running_tasks_to_queue_head(exclude_task_ids=self._running)
         if requeued:
             LOGGER.info("Requeued %s stale running tasks to queue head", requeued)
-        self._stop_event.clear()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop(), name="scheduler-loop")
         await self._record_operation(
             level="info",
             action="service_started",
             entity_type="scheduler",
             title="调度服务已启动",
-            detail=f"服务启动完成，恢复排队任务 {requeued} 个。",
-            metadata={"requeued": requeued},
+            detail=f"服务启动完成，接管运行任务 {len(self._running)} 个，恢复排队任务 {requeued} 个。",
+            metadata={"reattached": len(self._running), "requeued": requeued},
         )
         await self.events.publish("service_started", {"requeued": requeued})
 
@@ -136,17 +138,16 @@ class SchedulerService:
                 await self._scheduler_task
             except asyncio.CancelledError:
                 pass
-        await self._interrupt_running_tasks()
-        if self._watchers:
-            await asyncio.gather(*self._watchers.values(), return_exceptions=True)
-        if self._terminal_sessions:
-            await asyncio.gather(
-                *[
-                    self._close_terminal_session(session, exit_payload=None)
-                    for session in list(self._terminal_sessions.values())
-                ],
-                return_exceptions=True,
-            )
+        tasks = [*self._watchers.values()]
+        tasks.extend(handle.stop_task for handle in self._running.values() if handle.stop_task is not None)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for session in list(self._terminal_sessions.values()):
+            self._close_terminal_session(session, exit_payload=None)
+        self._watchers.clear()
+        self._running.clear()
+        self._terminal_sessions.clear()
         await self._record_operation(
             level="info",
             action="service_stopped",
@@ -255,6 +256,7 @@ class SchedulerService:
         queue_name: str | None = None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
+        exclusive_gpu: bool = True,
         profile_id: int | None = None,
         depends_on_ids: list[int] | None = None,
     ) -> dict[str, object]:
@@ -290,6 +292,7 @@ class SchedulerService:
             notes=notes,
             requested_gpu=normalized_requested_gpu,
             gpu_memory_budget_mb=normalized_gpu_memory_budget_mb,
+            exclusive_gpu=exclusive_gpu,
             queue_name=final_queue_name,
             profile_id=profile_id,
             profile_name=profile_name,
@@ -461,6 +464,7 @@ class SchedulerService:
         queue_name: str | None = None,
         requested_gpu: int | None = None,
         gpu_memory_budget_mb: int | None = None,
+        exclusive_gpu: bool | None = None,
         profile_id: int | None = None,
         depends_on_ids: list[int] | None = None,
     ) -> dict[str, object]:
@@ -498,6 +502,7 @@ class SchedulerService:
                 notes=notes,
                 requested_gpu=normalized_requested_gpu,
                 gpu_memory_budget_mb=normalized_gpu_memory_budget_mb,
+                exclusive_gpu=exclusive_gpu,
                 queue_name=final_queue_name,
                 profile_id=profile_id,
                 profile_name=profile_name,
@@ -711,7 +716,7 @@ class SchedulerService:
                 handle
                 for handle in self._running.values()
                 if (gpu_ids is None or handle.gpu_id in gpu_ids)
-                and handle.process.poll() is None
+                and handle.process.task_alive()
             ]
             for handle in handles:
                 handle.stop_reason = "interrupt"
@@ -1095,7 +1100,8 @@ class SchedulerService:
             if session is None or session.closed:
                 raise ValueError("运行中的任务终端不可用")
             subscriber, snapshot = session.subscribe(
-                snapshot_bytes=None if full_snapshot else TASK_TERMINAL_SNAPSHOT_BYTES
+                snapshot_bytes=None if full_snapshot else TASK_TERMINAL_SNAPSHOT_BYTES,
+                end_offset=self._running[task_id].log_offset,
             )
         return task, subscriber, snapshot
 
@@ -1127,7 +1133,9 @@ class SchedulerService:
             if session is None or session.closed:
                 raise ValueError("运行中的任务终端不可用")
             try:
-                session.resize(cols=cols, rows=rows)
+                cols, rows = normalize_terminal_size(cols=cols, rows=rows)
+                write_control(session.log_path, "size", {"cols": cols, "rows": rows})
+                session.cols, session.rows = cols, rows
             except OSError as exc:
                 raise ValueError("运行中的任务终端不可用") from exc
 
@@ -1175,14 +1183,26 @@ class SchedulerService:
                 for task in self.database.list_queued_tasks()
                 if self._is_task_ready_for_launch(task)
             ]
-            self._refresh_gpu_ready_counts(payload, queued_tasks)
+            # Recheck ownership after sampling, since another tick can launch a task.
+            occupied_gpu_ids = {handle.gpu_id for handle in self._running.values()}
+            exclusive_gpu_ids = {
+                handle.gpu_id for handle in self._running.values() if handle.exclusive_gpu
+            }
+            candidates = [
+                {**gpu, "scheduler_occupied": True, "is_idle": False}
+                if gpu["index"] in occupied_gpu_ids
+                else gpu
+                for gpu in payload
+                if gpu["index"] not in exclusive_gpu_ids
+            ]
+            self._refresh_gpu_ready_counts(candidates, queued_tasks)
             if self.database.get_queue_paused():
                 return
             if not queued_tasks:
                 return
             available = [
                 gpu
-                for gpu in payload
+                for gpu in candidates
                 if gpu["globally_enabled"]
                 and not self._is_gpu_in_external_kill_cooldown(int(gpu["index"]))
             ]
@@ -1469,19 +1489,11 @@ class SchedulerService:
         log_path = self._log_path_for_task(task_id, next_attempt)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "ab")
-        master_fd, slave_fd = pty.openpty()
-        terminal_cols, terminal_rows = set_terminal_window_size(
-            slave_fd,
-            cols=DEFAULT_TERMINAL_COLUMNS,
-            rows=DEFAULT_TERMINAL_ROWS,
-        )
         terminal_session = TerminalSession(
             task_id=task_id,
-            master_fd=master_fd,
+            master_fd=-1,
             log_path=log_path,
             log_file=log_file,
-            cols=terminal_cols,
-            rows=terminal_rows,
         )
         self._append_terminal_bytes(
             terminal_session,
@@ -1508,16 +1520,9 @@ class SchedulerService:
         launch_command = self._build_launch_command(task)
 
         try:
-            process = subprocess.Popen(
-                ["bash", "-lc", launch_command],
-                cwd=cwd,
-                env=env,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                start_new_session=True,
-                close_fds=True,
-                text=False,
+            process = TaskRun.prepare(
+                log_path, command=launch_command, cwd=cwd, env=env,
+                cols=terminal_session.cols, rows=terminal_session.rows,
             )
         except Exception as exc:
             self._append_terminal_bytes(
@@ -1528,9 +1533,7 @@ class SchedulerService:
                 terminal_session,
                 encode_terminal_text("".join(traceback.format_exception(exc))),
             )
-            self._close_master_fd(terminal_session)
             log_file.close()
-            os.close(slave_fd)
             failed_task = self.database.mark_task_launch_failed(
                 task_id=task_id,
                 log_path=str(log_path),
@@ -1556,36 +1559,22 @@ class SchedulerService:
             )
             await self.events.publish("task_failed_to_launch", {"task_id": task_id})
             return
-        finally:
-            try:
-                os.close(slave_fd)
-            except OSError:
-                pass
-
-        running_task = self.database.mark_task_running(
-            task_id=task_id,
-            gpu_id=gpu_id,
-            pid=process.pid,
-            log_path=str(log_path),
-        )
-        terminal_session.reader_task = asyncio.create_task(
-            self._read_terminal_output(terminal_session),
-            name=f"terminal-reader-{task_id}",
-        )
-        handle = ProcessHandle(
-            task_id=task_id,
-            gpu_id=gpu_id,
-            process=process,
-            log_path=log_path,
-            attempt_count=int(running_task.get("attempt_count") or next_attempt),
-            terminal_session=terminal_session,
-        )
-        self._running[task_id] = handle
-        self._terminal_sessions[task_id] = terminal_session
-        self._watchers[task_id] = asyncio.create_task(
-            self._watch_process(handle),
-            name=f"watch-task-{task_id}",
-        )
+        try:
+            running_task = self.database.mark_task_running(
+                task_id=task_id,
+                gpu_id=gpu_id,
+                pid=process.pid,
+                log_path=str(log_path),
+            )
+        except BaseException:
+            process.release(start=False)
+            log_file.close()
+            raise
+        self._track_running_task(running_task, process, terminal_session)
+        try:
+            process.release(start=True)
+        except BrokenPipeError:
+            LOGGER.warning("Task runner exited before starting task %s", task_id)
         await self._record_operation(
             level="success",
             action="task_started",
@@ -1613,14 +1602,54 @@ class SchedulerService:
             },
         )
 
+    def _restore_running_tasks(self) -> None:
+        for task in self.database.list_running_tasks():
+            pid = task["pid"]
+            log_path = task["log_path"]
+            if not isinstance(pid, int) or not isinstance(log_path, str):
+                continue
+            path = Path(log_path)
+            process = TaskRun.recover(path, pid)
+            if process is None:
+                continue
+            session = TerminalSession(
+                task_id=int(task["id"]), master_fd=-1, log_path=path, log_file=path.open("ab"),
+            )
+            handle = self._track_running_task(task, process, session)
+            if handle.stop_reason and process.task_alive():
+                self._start_process_stop_ladder(handle, name=f"restore-stop-{handle.task_id}")
+
+    def _track_running_task(
+        self, task: dict[str, object], process: TaskRun, session: TerminalSession,
+    ) -> ProcessHandle:
+        task_id = int(task["id"])
+        stop = read_control(session.log_path, "stop")
+        handle = ProcessHandle(
+            task_id=task_id,
+            gpu_id=int(task["assigned_gpu"]),
+            process=process,
+            log_path=session.log_path,
+            attempt_count=int(task["attempt_count"]),
+            terminal_session=session,
+            exclusive_gpu=bool(task["exclusive_gpu"]),
+            log_offset=session.log_file.tell(),
+            stop_reason=stop.get("reason"),
+            requeue_to_queue_name=stop.get("queue"),
+        )
+        self._running[task_id] = handle
+        self._terminal_sessions[task_id] = session
+        self._watchers[task_id] = asyncio.create_task(
+            self._watch_process(handle), name=f"watch-task-{task_id}",
+        )
+        return handle
+
     async def _watch_process(self, handle: ProcessHandle) -> None:
         task_id = handle.task_id
         session = handle.terminal_session
         final_exit_payload: dict[str, object] | None = None
         try:
-            exit_code = await asyncio.to_thread(handle.process.wait)
-            if session.reader_task is not None:
-                await session.reader_task
+            await self._tail_task_log(handle)
+            exit_code = handle.process.exit_code()
             if handle.stop_reason == "preempt":
                 requeue_queue_name = handle.requeue_to_queue_name or NORMAL_QUEUE
                 self._append_terminal_bytes(
@@ -1794,15 +1823,19 @@ class SchedulerService:
                 "exit_code": exit_code,
             }
         finally:
-            await self._close_terminal_session(
-                session,
-                exit_payload=final_exit_payload,
-            )
+            self._close_terminal_session(session, exit_payload=final_exit_payload)
+            if final_exit_payload is not None:
+                handle.process.cleanup()
+            if handle.stop_task is not None:
+                handle.stop_task.cancel()
             async with self._lock:
                 self._running.pop(task_id, None)
                 self._terminal_sessions.pop(task_id, None)
                 self._watchers.pop(task_id, None)
-                self._mark_gpu_recently_released(handle.gpu_id)
+                if final_exit_payload is not None and all(
+                    other.gpu_id != handle.gpu_id for other in self._running.values()
+                ):
+                    self._mark_gpu_recently_released(handle.gpu_id)
             await self._trigger_immediate_schedule()
 
     async def _requeue_interrupted_task(
@@ -1888,11 +1921,11 @@ class SchedulerService:
         gpu_payload: list[dict[str, object]],
         queued_tasks: list[dict[str, object]],
     ) -> None:
-        budget_values: set[int] = set()
+        budget_requirements: set[tuple[int, bool]] = set()
         for task in queued_tasks:
             budget_mb = task.get("gpu_memory_budget_mb")
             if isinstance(budget_mb, int):
-                budget_values.add(budget_mb)
+                budget_requirements.add((budget_mb, bool(task.get("exclusive_gpu"))))
         satisfied_keys: set[tuple[int, str]] = set()
         observed_recently_released_gpu_ids: set[int] = set()
         recently_released_gpu_ids = set(self._recently_released_gpu_ids)
@@ -1905,17 +1938,19 @@ class SchedulerService:
                 observed_recently_released_gpu_ids.add(gpu_id)
             if not bool(gpu.get("globally_enabled")):
                 continue
-            if bool(gpu.get("is_idle")):
+            is_idle = bool(gpu.get("is_idle"))
+            if is_idle:
                 satisfied_keys.add((gpu_id, "idle"))
-            for budget_mb in budget_values:
-                if self._gpu_has_budget_capacity(gpu, budget_mb):
-                    satisfied_keys.add((gpu_id, self._budget_readiness_key(budget_mb)))
+            for budget_mb, exclusive_gpu in budget_requirements:
+                if (is_idle or not exclusive_gpu) and self._gpu_has_budget_capacity(gpu, budget_mb):
+                    key = self._budget_readiness_key(budget_mb, exclusive_gpu=exclusive_gpu)
+                    satisfied_keys.add((gpu_id, key))
         previous_counts = self._gpu_ready_counts
         required_checks = self._required_gpu_ready_checks()
         refreshed_counts: dict[tuple[int, str], int] = {}
         for key in satisfied_keys:
             count = previous_counts.get(key, 0) + 1
-            if key[0] in recently_released_gpu_ids:
+            if key[0] in observed_recently_released_gpu_ids:
                 count = max(count, required_checks)
             refreshed_counts[key] = count
         self._gpu_ready_counts = refreshed_counts
@@ -1971,8 +2006,8 @@ class SchedulerService:
         task: dict[str, object],
         gpu: dict[str, object],
         *,
-        planned_free_mb: dict[int, int] | None = None,
-        exclusive_gpus: set[int] | None = None,
+        planned_free_mb: dict[int, int],
+        exclusive_gpus: set[int],
     ) -> bool:
         key = self._readiness_key_for_task(task, gpu)
         if key is None:
@@ -1998,11 +2033,15 @@ class SchedulerService:
         ):
             return None
         budget_mb = task.get("gpu_memory_budget_mb")
+        exclusive_gpu = bool(task.get("exclusive_gpu"))
+        is_idle = bool(gpu.get("is_idle"))
+        if exclusive_gpu and not is_idle:
+            return None
         if isinstance(budget_mb, int):
             if self._gpu_has_budget_capacity(gpu, budget_mb):
-                return (gpu_id, self._budget_readiness_key(budget_mb))
+                return (gpu_id, self._budget_readiness_key(budget_mb, exclusive_gpu=exclusive_gpu))
             return None
-        if bool(gpu.get("is_idle")):
+        if is_idle:
             return (gpu_id, "idle")
         return None
 
@@ -2018,27 +2057,16 @@ class SchedulerService:
         task: dict[str, object],
         gpu: dict[str, object],
         *,
-        planned_free_mb: dict[int, int] | None,
-        exclusive_gpus: set[int] | None,
+        planned_free_mb: dict[int, int],
+        exclusive_gpus: set[int],
     ) -> bool:
         gpu_id = int(gpu["index"])
-        if exclusive_gpus is not None and gpu_id in exclusive_gpus:
+        if gpu_id in exclusive_gpus:
             return False
         budget_mb = task.get("gpu_memory_budget_mb")
-        if isinstance(budget_mb, int):
-            free_mb = (
-                planned_free_mb.get(gpu_id, int(gpu.get("memory_free_mb") or 0))
-                if planned_free_mb is not None
-                else int(gpu.get("memory_free_mb") or 0)
-            )
-            return free_mb >= budget_mb
-        if not bool(gpu.get("is_idle")):
-            return False
-        if planned_free_mb is None:
-            return True
-        return planned_free_mb.get(gpu_id, int(gpu.get("memory_free_mb") or 0)) == int(
-            gpu.get("memory_free_mb") or 0
-        )
+        if not isinstance(budget_mb, int) or task.get("exclusive_gpu"):
+            return planned_free_mb[gpu_id] == int(gpu["memory_free_mb"])
+        return planned_free_mb[gpu_id] >= budget_mb
 
     def _apply_planned_gpu_assignment(
         self,
@@ -2050,11 +2078,10 @@ class SchedulerService:
     ) -> None:
         gpu_id = int(gpu["index"])
         budget_mb = task.get("gpu_memory_budget_mb")
-        if isinstance(budget_mb, int):
-            free_mb = planned_free_mb.get(gpu_id, int(gpu.get("memory_free_mb") or 0))
-            planned_free_mb[gpu_id] = max(0, free_mb - budget_mb)
-            return
-        exclusive_gpus.add(gpu_id)
+        if not isinstance(budget_mb, int) or task.get("exclusive_gpu"):
+            exclusive_gpus.add(gpu_id)
+        else:
+            planned_free_mb[gpu_id] -= budget_mb
 
     def _is_gpu_physically_idle(self, gpu: dict[str, object]) -> bool:
         if "physically_idle" in gpu:
@@ -2065,58 +2092,29 @@ class SchedulerService:
             and not bool(gpu.get("scheduler_occupied"))
         )
 
-    def _budget_readiness_key(self, budget_mb: int) -> str:
-        return f"budget:{budget_mb}"
+    def _budget_readiness_key(self, budget_mb: int, *, exclusive_gpu: bool) -> str:
+        return f"idle:budget:{budget_mb}" if exclusive_gpu else f"budget:{budget_mb}"
 
     def _required_gpu_ready_checks(self) -> int:
         return max(1, int(self.config.gpu_idle_required_checks))
 
-    async def _interrupt_running_tasks(self) -> None:
-        async with self._lock:
-            handles = list(self._running.values())
-            for handle in handles:
-                handle.stop_reason = "interrupt"
-            self._signal_live_process_groups(handles, signal.SIGINT)
-        if handles:
-            await asyncio.sleep(TERMINATE_GRACE_SECONDS)
-            self._signal_live_process_groups(handles, signal.SIGTERM)
-            await asyncio.sleep(TERMINATE_GRACE_SECONDS)
-            self._signal_live_process_groups(handles, signal.SIGKILL)
-
     def _start_process_stop_ladder(self, handle: ProcessHandle, *, name: str) -> None:
-        self._signal_process_group(handle.process.pid, signal.SIGINT)
-        asyncio.create_task(self._escalate_process_stop(handle.task_id), name=name)
+        write_control(
+            handle.log_path, "stop",
+            {"reason": handle.stop_reason, "queue": handle.requeue_to_queue_name},
+        )
+        if handle.stop_task is not None:
+            handle.stop_task.cancel()
+        handle.process.send_signal(signal.SIGINT)
+        handle.stop_task = asyncio.create_task(self._escalate_process_stop(handle), name=name)
 
-    async def _escalate_process_stop(self, task_id: int) -> None:
-        await asyncio.sleep(TERMINATE_GRACE_SECONDS)
-        async with self._lock:
-            handle = self._running.get(task_id)
-            if handle is None or handle.process.poll() is not None:
-                return
-            self._signal_process_group(handle.process.pid, signal.SIGTERM)
-        await asyncio.sleep(TERMINATE_GRACE_SECONDS)
-        async with self._lock:
-            handle = self._running.get(task_id)
-            if handle is None or handle.process.poll() is not None:
-                return
-            self._signal_process_group(handle.process.pid, signal.SIGKILL)
-
-    def _signal_live_process_groups(
-        self,
-        handles: list[ProcessHandle],
-        sig: signal.Signals,
-    ) -> None:
-        for handle in handles:
-            if handle.process.poll() is None:
-                self._signal_process_group(handle.process.pid, sig)
-
-    def _signal_process_group(self, pid: int | None, sig: signal.Signals) -> None:
-        if pid is None:
-            return
-        try:
-            os.killpg(pid, sig)
-        except ProcessLookupError:
-            return
+    async def _escalate_process_stop(self, handle: ProcessHandle) -> None:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            await asyncio.sleep(TERMINATE_GRACE_SECONDS)
+            async with self._lock:
+                if self._running.get(handle.task_id) is not handle or not handle.process.task_alive():
+                    return
+                handle.process.send_signal(sig)
 
     def _log_path_for_task(self, task_id: int, attempt_count: int) -> Path:
         return self.config.log_dir / f"task_{task_id}_attempt_{attempt_count}.log"
@@ -2818,6 +2816,7 @@ class SchedulerService:
             "requested_gpu": task.get("requested_gpu"),
             "assigned_gpu": task.get("assigned_gpu"),
             "gpu_memory_budget_mb": task.get("gpu_memory_budget_mb"),
+            "exclusive_gpu": task.get("exclusive_gpu"),
             "queue_name": task.get("queue_name"),
             "queue_rank": task.get("queue_rank"),
             "profile_id": task.get("profile_id"),
@@ -2904,63 +2903,44 @@ class SchedulerService:
         env.setdefault("PYTHONUNBUFFERED", "1")
         return env
 
-    async def _read_terminal_output(self, session: TerminalSession) -> None:
-        while True:
-            try:
-                data = await asyncio.to_thread(
-                    os.read,
-                    session.master_fd,
-                    TERMINAL_CHUNK_BYTES,
-                )
-            except OSError as exc:
-                if exc.errno in {errno.EIO, errno.EBADF}:
-                    break
-                LOGGER.warning(
-                    "Failed to read PTY output for task %s: %s",
-                    session.task_id,
-                    exc,
-                )
-                break
-            if not data:
-                break
-            self._append_terminal_bytes(session, data)
+    async def _tail_task_log(self, handle: ProcessHandle) -> None:
+        session = handle.terminal_session
+        with session.log_path.open("rb", buffering=0) as log:
+            log.seek(handle.log_offset)
+            while True:
+                running = handle.process.active()
+                data = log.read(TERMINAL_CHUNK_BYTES)
+                if data:
+                    handle.log_offset += len(data)
+                    session.publish_bytes(data)
+                    await asyncio.sleep(0)
+                elif running:
+                    await asyncio.sleep(POLL_SECONDS)
+                else:
+                    return
 
-    async def _close_terminal_session(
+    def _close_terminal_session(
         self,
         session: TerminalSession,
         *,
         exit_payload: dict[str, object] | None,
     ) -> None:
-        if exit_payload is not None and not session.closed:
+        if exit_payload is not None:
             session.publish_exit(exit_payload)
-        elif exit_payload is None:
+        else:
             session.closed = True
             for subscriber in list(session.subscribers):
                 subscriber.control_queue.put_nowait(("disconnect", None))
             session.subscribers.clear()
-        self._close_master_fd(session)
-        if session.reader_task is not None and session.reader_task is not asyncio.current_task():
-            await asyncio.gather(session.reader_task, return_exceptions=True)
-            session.reader_task = None
-        if not session.log_file.closed:
-            session.log_file.flush()
-            session.log_file.close()
-        try:
-            compact_progress_log_file(session.log_path)
-        except OSError:
-            LOGGER.warning("Failed to compact progress log for task %s", session.task_id, exc_info=True)
+        session.log_file.close()
+        if exit_payload is not None:
+            try:
+                compact_progress_log_file(session.log_path)
+            except OSError:
+                LOGGER.warning("Failed to compact progress log for task %s", session.task_id, exc_info=True)
 
     def _append_terminal_bytes(self, session: TerminalSession, data: bytes) -> None:
         session.append_bytes(data)
-
-    def _close_master_fd(self, session: TerminalSession) -> None:
-        if session.master_fd < 0:
-            return
-        try:
-            os.close(session.master_fd)
-        except OSError:
-            pass
-        session.master_fd = -1
 
     def _sanitize_scheduler_python_env(self, env: dict[str, str]) -> dict[str, str]:
         sanitized = dict(env)

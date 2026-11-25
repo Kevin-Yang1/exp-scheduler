@@ -148,6 +148,8 @@ def task_payload(args: argparse.Namespace) -> dict[str, Any]:
         "profile_id": args.profile_id,
         "depends_on": depends_on_ids(args),
     }
+    if args.exclusive_gpu is not None:
+        payload["exclusive_gpu"] = args.exclusive_gpu
     return payload
 
 
@@ -509,6 +511,11 @@ def add_task_payload_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--urgent", action="store_true", help="Add task to urgent queue")
     parser.add_argument("--requested-gpu", type=int, help="Pin task to a physical GPU ID")
     parser.add_argument("--memory-budget-mb", type=int, help="GPU memory budget in MB")
+    parser.add_argument(
+        "--exclusive-gpu",
+        action=argparse.BooleanOptionalAction,
+        help="Require exclusive GPU scheduling (enabled by default for new tasks)",
+    )
     parser.add_argument("--profile-id", type=int, help="Environment profile ID")
     parser.add_argument("--depends-on", type=int, action="append", help="Dependency task ID; repeatable")
 

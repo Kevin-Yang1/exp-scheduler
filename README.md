@@ -3,7 +3,7 @@
 GPU 实验任务调度器。它会持续观察服务器上的 GPU 空闲情况，把你提交的命令按队列顺序自动运行，并提供一个适合通过 SSH 隧道访问的 Web 界面。
 
 ## 特性
-- 单任务独占单卡调度
+- 新任务默认独占单卡，可按任务开启显存预算共享
 - 支持每个任务单独指定 GPU，默认自动分配
 - 支持设置全局可调度 GPU 白名单，默认全部可用且可在页面实时修改
 - 支持 agent 通过 GPU lease 接口临时占用指定 GPU，不影响其他 GPU 调度
@@ -20,6 +20,7 @@ GPU 实验任务调度器。它会持续观察服务器上的 GPU 空闲情况�
 - 资源监控面板：GPU 使用率与显存、CPU 核心负载、内存 / Swap、磁盘容量与实时读写，服务端持续采集并保留最近 7 天历史
 - htop 式进程工作台：搜索、过滤、排序、进程树、详情及单个 / 批量发送进程信号
 - 每个任务独立日志，运行中任务以只读终端实时查看，历史任务保留纯文本日志视图
+- 调度服务重启后继续跟踪原有任务进程、GPU 占用和终端日志
 
 ## 安装
 
@@ -93,7 +94,7 @@ log_dir = "/home/ykw/.local/share/exp-scheduler/logs"
 
 ## 迁移状态和日志目录
 
-不要在任务运行中迁移目录。停止调度器会中断正在运行的任务，所以建议先在页面里暂停调度，等待运行中的任务结束，再继续下面步骤。SQLite 可能会产生 `scheduler.db-wal`、`scheduler.db-shm` 这类附属文件，因此要在服务停止后复制整个状态目录。
+任务仍在运行时会继续向原日志目录写入。迁移前请先在页面里暂停调度，等运行任务结束后再停止服务。SQLite 可能会产生 `scheduler.db-wal`、`scheduler.db-shm` 这类附属文件，因此要在服务停止后复制整个状态目录。
 
 如果要把：
 
@@ -296,6 +297,7 @@ WorkingDirectory=/SSD1/ykw/exp-scheduler
 ExecStart=/SSD1/ykw/exp-scheduler/.venv/bin/exp-scheduler serve
 Restart=on-failure
 RestartSec=5
+KillMode=process
 Environment=PYTHONUNBUFFERED=1
 Environment="PATH=/SSD1/ykw/exp-scheduler/.venv/bin:/home/ykw/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
 
@@ -305,6 +307,8 @@ EOF
 ```
 
 如果仓库路径不是 `/SSD1/ykw/exp-scheduler`，需要修改 `WorkingDirectory`、`ExecStart` 和 `PATH` 里的 `.venv/bin` 路径。如果 `nvitop` 安装在其他 conda 路径，也需要把对应的 `bin` 目录加入 `PATH`，否则 GPU 监控页会提示找不到 `nvitop`。
+
+`KillMode=process` 让 systemd 停止服务时只向调度器主进程发送终止信号，任务可在服务重启期间继续执行。若要同时停止任务，请先在页面中取消任务，或使用“暂停调度”里的停止运行任务选项。升级时，旧版本启动的任务仍由旧调度器持有终端，请等这些任务结束后再首次重启并加载新服务配置。
 
 启用并启动：
 
@@ -429,7 +433,10 @@ http://127.0.0.1:17861
 - `命令`：实际运行的 shell 命令，和你在终端中执行的命令保持一致。
 - `运行环境`：选择已经导入的 conda/venv profile，或填写任务自己的 shell setup。
 - `指定 GPU`：可选；不填时由调度器自动选择可用 GPU。
-- `显存预算`（可选）。GPU 空闲显存连续达到或超过预算时，任务可以启动。留空时使用默认空闲阈值。
+- `独占 GPU`。新任务默认开启，等 GPU 空闲后启动，任务结束前调度器不会在同一张卡上启动其他任务。升级时已有任务沿用原调度方式，编辑排队或暂存任务时可开启独占。
+- `显存预算`（可选）。填写后要求 GPU 剩余显存达到预算。关闭独占并填写预算时，任务可按剩余显存使用正在运行共享任务的 GPU。留空时按默认空闲阈值等待。
+
+通过 API 创建任务时，`exclusive_gpu` 默认为 `true`。编辑任务时省略该字段会沿用已保存的值。
 
 任务队列页可以新增、编辑、重排、取消、重新入队和批量删除任务。队列中的删除表示取消任务；历史记录中的删除表示删除历史记录。
 
